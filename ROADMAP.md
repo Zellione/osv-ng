@@ -7,12 +7,12 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-Phase 0 is complete as of 2026-09-07. Phase 1's five isolated prototypes passed
-their automated core paths, and ADRs accept GTK4, GStreamer, SQLCipher, and
-brokered authenticated media transport as the initial directions. The project
-entered Phase 2 on 2026-09-07 with the manual and representative-media checks
-below explicitly postponed. They remain required evidence before the affected
-UI, playback, and Flatpak behavior can be treated as release-ready.
+Phase 0 and Phase 2 are complete as of 2026-09-07. Phase 1's five isolated
+prototypes passed their automated core paths, and ADRs accept GTK4, GStreamer,
+SQLCipher, and brokered authenticated media transport as the initial directions.
+Phase 1's manual and representative-media checks below remain explicitly
+postponed. They are required evidence before the affected UI, playback, and
+Flatpak behavior can be treated as release-ready.
 
 ## Product outcome
 
@@ -569,7 +569,7 @@ in all cases before Phase 17 release qualification.
 
 **Goal:** Make every subsequent phase reproducible and reviewable.
 
-**Progress (started 2026-09-07)**
+**Completed 2026-09-07**
 
 - Added the root Cargo workspace with the approved eight production/support
   crates and two least-authority helper binaries. Phase 1 prototypes remain
@@ -611,14 +611,20 @@ in all cases before Phase 17 release qualification.
   built offline, installed the application and both helpers, and ran all three
   installed binaries. Its temporary ID and empty application entry point are
   explicitly not release packaging or UI/media/portal evidence.
+- GitHub Actions run
+  [34161201789](https://github.com/Zellione/osv-ng/actions/runs/34161201789)
+  passed all five jobs from a clean checkout: workspace format/lint/tests,
+  advisory audit, dependency policy, ASan/LeakSanitizer fuzz smoke, and the
+  offline Flatpak bootstrap. The first remote run exposed an omitted GNOME
+  Platform installation; the workflow now installs the matching Platform and
+  SDK explicitly. LeakSanitizer ran with a temporary Yama `ptrace_scope=0` on
+  the ephemeral runner, and the job restored restricted mode afterward.
 
-**Remaining work**
+**Deferred follow-up in consuming phases**
 
 - Apply the property, temporary-vault, and cross-process crash harnesses to each
   persistent operation as its production implementation is introduced.
-- Exercise the initial CI, including LeakSanitizer and Flatpak jobs, on the
-  remote host. Add targeted sanitizer/fuzz coverage with each parser or FFI
-  boundary.
+- Add targeted sanitizer/fuzz coverage with each parser or FFI boundary.
 - Replace the temporary Flatpak ID and stub with product metadata, permissions,
   and functional GTK/media checks only after those decisions and components
   exist; the Phase 2 workspace packaging gate must remain offline.
