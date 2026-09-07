@@ -1,0 +1,70 @@
+app-id: io.github.osv_ng.Phase1
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: osv-flatpak-smoke
+
+finish-args:
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  - --talk-name=org.freedesktop.portal.Desktop
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  build-args:
+    - --share=network
+
+modules:
+  - name: sqlcipher
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --enable-shared
+      - --disable-tcl
+      - --disable-load-extension
+      - --with-tempstore=yes
+    build-options:
+      cflags: -O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown
+      ldflags: -lcrypto
+    post-install:
+      - mv /app/bin/sqlite3 /app/bin/sqlcipher
+    sources:
+      - type: archive
+        url: https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.18.0.tar.gz
+        sha256: 1df02d1b346fa27feaf2da2cb2c0d8209e788248e461ec288718aa5d3e9643e5
+
+  - name: osv-flatpak-smoke
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/osv-flatpak-smoke/cargo
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/osv-flatpak-smoke /app/bin/osv-flatpak-smoke
+      - install -Dm644 io.github.osv_ng.Phase1.desktop /app/share/applications/io.github.osv_ng.Phase1.desktop
+      - install -Dm644 io.github.osv_ng.Phase1.metainfo.xml /app/share/metainfo/io.github.osv_ng.Phase1.metainfo.xml
+      - install -Dm644 io.github.osv_ng.Phase1.svg /app/share/icons/hicolor/scalable/apps/io.github.osv_ng.Phase1.svg
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - target
+
+  - name: osv-gstreamer-seek-prototype
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/osv-gstreamer-seek-prototype/cargo
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/osv-gstreamer-seek-prototype /app/bin/osv-gstreamer-seek-prototype
+      - mkdir -p /app/share/osv-phase1
+      - gst-launch-1.0 -q -e oggmux name=mux ! filesink location=/app/share/osv-phase1/fixture.ogv videotestsrc num-buffers=300 pattern=ball ! video/x-raw,framerate=30/1,width=640,height=360 ! theoraenc ! queue ! mux. audiotestsrc num-buffers=431 wave=sine ! audioconvert ! vorbisenc ! queue ! mux.
+    sources:
+      - type: dir
+        path: ../gstreamer-seek
+        skip:
+          - target

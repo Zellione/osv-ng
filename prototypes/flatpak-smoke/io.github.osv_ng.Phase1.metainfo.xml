@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.osv_ng.Phase1</id>
+  <name>osv-ng Phase 1</name>
+  <summary>Feasibility probe for the osv-ng application stack</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <launchable type="desktop-id">io.github.osv_ng.Phase1.desktop</launchable>
+  <description>
+    <p>Exercises GTK, Wayland, portals, GStreamer, PipeWire, SQLCipher, helper launch, and theming.</p>
+  </description>
+  <releases>
+    <release version="0.1.0" date="2026-09-07"/>
+  </releases>
+</component>

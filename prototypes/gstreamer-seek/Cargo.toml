@@ -1,0 +1,15 @@
+[package]
+name = "osv-gstreamer-seek-prototype"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gstreamer = "0.25.3"
+gstreamer-app = "0.25.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,23 @@
+/* Non-sensitive sample theme for the Phase 1 CSS-loading experiment. */
+window {
+  background: #10141d;
+  color: #eef3ff;
+}
+
+.osv-gallery {
+  padding: 18px;
+}
+
+.osv-gallery > child {
+  margin: 7px;
+  border-radius: 10px;
+  outline: 2px solid transparent;
+}
+
+.osv-gallery > child:selected {
+  outline-color: #8db6ff;
+}
+
+.osv-gallery > child:focus-visible {
+  outline-color: #ffffff;
+}

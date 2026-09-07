@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=osv-ng Phase 1
+Exec=osv-flatpak-smoke
+Icon=io.github.osv_ng.Phase1
+Categories=Utility;
