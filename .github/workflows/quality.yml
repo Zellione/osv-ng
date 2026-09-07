@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
       - name: Check formatting
@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Install cargo-audit
@@ -52,7 +52,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal
       - name: Install cargo-deny
@@ -68,7 +68,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned nightly
         run: rustup toolchain install nightly-2026-09-06 --profile minimal
       - name: Install cargo-fuzz
@@ -89,7 +89,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Flatpak tooling
         run: |
           sudo apt-get update
@@ -97,7 +97,7 @@ jobs:
       - name: Install the pinned SDK
         run: |
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-          flatpak install --user --noninteractive flathub org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.rust-stable//25.08
+          flatpak install --user --noninteractive flathub org.gnome.Platform//50 org.gnome.Sdk//50 org.freedesktop.Sdk.Extension.rust-stable//25.08
       - name: Build and test offline inside the SDK
         run: flatpak-builder --force-clean --disable-rofiles-fuse .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml
       - name: Run the installed bootstrap binaries
