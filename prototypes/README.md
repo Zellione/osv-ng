@@ -4,6 +4,9 @@ These experiments are intentionally independent of the future Phase 2 Cargo
 workspace. The commands below describe the current Arch Linux development host;
 they are not yet the stable-release support policy.
 
+The root [README](../README.md) is the primary setup, build, run, and test guide.
+This file retains the prototype-specific prerequisite breakdown for reference.
+
 ## Arch Linux packages
 
 Install the build toolchain and minimum native dependencies:

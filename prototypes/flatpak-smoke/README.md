@@ -23,7 +23,7 @@ From the repository root:
 
 ```sh
 flatpak-builder --force-clean --user --install \
-  /tmp/osv-flatpak-build \
+  .flatpak-build \
   prototypes/flatpak-smoke/io.github.osv_ng.Phase1.yml
 flatpak run io.github.osv_ng.Phase1 --self-test
 flatpak run io.github.osv_ng.Phase1
