@@ -1,0 +1,4 @@
+/target/
+**/target/
+/.flatpak-build/
+/.flatpak-builder/

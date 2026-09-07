@@ -1,0 +1,18 @@
+[package]
+name = "osv-media-boundary-prototype"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+chacha20poly1305 = "0.11.0"
+getrandom = "0.4.3"
+gstreamer = "0.25.3"
+gstreamer-app = "0.25.2"
+nix = { version = "0.30.1", features = ["process", "resource", "user"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -7,8 +7,11 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-No implementation stack is final until the Phase 1 prototypes pass. The
-expected stack is Rust, GTK4, GStreamer, SQLCipher, and Flatpak on Wayland.
+Phase 0 is complete as of 2026-09-07. Phase 1 is in progress: its five isolated
+prototypes have passed their automated core paths, and ADRs now accept GTK4,
+GStreamer, SQLCipher, and brokered authenticated media transport as the initial
+directions. Manual interaction and representative-media checks listed below
+remain open. Prototype code does not establish the Phase 2 production workspace.
 
 ## Product outcome
 
@@ -48,8 +51,8 @@ The first stable release will provide:
 |---|---|---|
 | Language | Rust | Memory-safe application core; C FFI remains at GTK, SQLCipher, GStreamer, and codec boundaries. |
 | Platform | Modern Linux and Flatpak; Wayland tested | Platform code may use Linux facilities such as `mlock`, `madvise`, `prctl`, `memfd`, Landlock, seccomp, Unix sockets, and file-descriptor passing. |
-| UI | GTK4/gtk-rs candidate, no mandatory libadwaita | The app can use accessible native widgets and GSK custom rendering while owning its theme and layout. |
-| Media | GStreamer and system codecs candidate | Avoid rebuilding the codec ecosystem; validate Flatpak codec availability and licensing. |
+| UI | GTK4/gtk-rs, no mandatory libadwaita | The app can use accessible native widgets and GSK custom rendering while owning its theme and layout. |
+| Media | GStreamer and system/runtime codecs | Avoid rebuilding the codec ecosystem; release review must validate Flatpak codec availability and licensing. |
 | Catalog | SQLCipher | Use a relational schema and encrypted pages/journals instead of designing an encrypted database. |
 | Originals | One opaque encrypted object per imported media item | Independent backup, deletion, integrity checking, and failure domains. Large objects remain internally chunked for seeking. |
 | Derived data | Separate encrypted thumbnail/poster objects | Derived data is replaceable and does not bloat the catalog. |
@@ -126,7 +129,7 @@ pathnames, or general vault access. The archive helper similarly receives one
 archive descriptor and emits a bounded, validated listing or selected entry
 stream.
 
-Phase 1 must compare two practical boundaries:
+Phase 1 compared two practical boundaries:
 
 1. The helper decrypts using an object DEK. This minimizes plaintext copies but
    exposes one object's key to codec-adjacent code.
@@ -134,10 +137,12 @@ Phase 1 must compare two practical boundaries:
    into the helper. This keeps keys away from codecs but creates an IPC
    plaintext and backpressure problem.
 
-Select the design with the smaller auditable trusted computing base. In both
-cases, apply `no_new_privs`, descriptor allowlisting, parent non-dumpability,
-resource limits, network denial, and feasible Landlock/seccomp restrictions.
-Hardware decode and Flatpak must be tested rather than assumed compatible.
+ADR 0009 selects the trusted broker: it authenticates/decrypts bounded chunks
+and streams plaintext to a media worker that receives no key. Phase 7 finalizes
+the transport and must apply `no_new_privs`, descriptor allowlisting, parent
+non-dumpability, resource limits, network denial, and feasible Landlock/seccomp
+restrictions. Hardware decode and Flatpak must be tested rather than assumed
+compatible.
 
 ## Vault directory and formats
 
@@ -446,13 +451,33 @@ stable known-answer vectors and independent-tool verification where possible.
 
 **Goal:** Establish reviewable contracts before code fixes accidental formats.
 
+**Progress (2026-09-07)**
+
+- Added the ADR process and records for Rust, the initially proposed SQLCipher
+  catalog, independently encrypted objects, vault locking, offline backup, and
+  parser isolation. The exact helper transport was deliberately deferred to
+  Phase 1.
+- Added the threat model with assets, actors, trust boundaries, required
+  controls, evidence gates, accepted leakage, and security-claim vocabulary.
+- Added the first-release feature glossary, security-relevant user journeys,
+  and data-classification/handling rules.
+- Added persistent/IPC format review and dependency/licensing checklists.
+- Reviewed the documents against the exit criteria below. Open implementation
+  choices are bounded Phase 1 experiment questions and do not change prototype
+  boundaries; security claims use the defined guarantee, best-effort, accepted
+  leakage, and out-of-scope categories.
+
 **Deliverables**
 
-- ADR template and ADRs for language, catalog, object-store shape, concurrency,
-  supported backup model, and codec/archive isolation goal.
-- Threat-model document derived from this roadmap.
-- Feature glossary, first-release user journeys, and data classification.
-- Format-review and dependency-licensing checklists.
+- [ADR template and index](docs/adr/README.md), with ADRs for language, catalog,
+  object-store shape, concurrency, supported backup model, and codec/archive
+  isolation goal.
+- [Threat-model document](docs/threat-model.md) derived from this roadmap.
+- [Feature glossary](docs/product/glossary.md),
+  [first-release user journeys](docs/product/user-journeys.md), and
+  [data classification](docs/product/data-classification.md).
+- [Format-review](docs/checklists/format-review.md) and
+  [dependency-licensing](docs/checklists/dependency-licensing.md) checklists.
 
 **Exit criteria**
 
@@ -463,6 +488,46 @@ stable known-answer vectors and independent-tool verification where possible.
 ### Phase 1 — Feasibility prototypes and stack confirmation
 
 **Goal:** Retire high-risk assumptions before building the product.
+
+**Progress (2026-09-07)**
+
+- Implemented all five prototypes under `prototypes/` and documented the Arch
+  packages and Flatpak runtimes required to build and exercise them.
+- Accepted GTK4/gtk-rs without mandatory libadwaita in ADR 0007. Release-mode
+  native-Wayland runs populated 10k/100k models in 1.94/20.22 ms. Continuous
+  scrolling at 240 Hz produced p95 frame intervals of 4.18/4.17 ms and
+  steady-state RSS of approximately 155/162 MiB.
+- Accepted GStreamer in ADR 0008. An application-fed Theora/Vorbis stream
+  completed three random seeks in about 0.9-1.8 ms on the host with bounded
+  queues, audio, cancellation, and both fake and native output paths.
+- Compared object-key and brokered media workers with versioned bounded IPC,
+  frame transport, worker-owned audio, hard resource limits, and injected
+  restart. A 35.2 MiB synthetic fixture took 9.620/9.615 seconds respectively;
+  ADR 0009 selects the broker so codecs receive no object key. Automated tests
+  reject malformed initialization, object bounds, and response lengths.
+- Accepted SQLCipher in ADR 0002. The raw-key WAL crash/recovery harness found
+  no randomized plaintext canary in disk artifacts, recovered after SIGKILL,
+  passed cipher/SQLite integrity checks, verified memory-only temp storage and
+  wrong-key failure. Across five 10k-row runs, median create/query/checkpoint
+  times were 8.45/6.19/4.29 ms with memory security on and 6.92/4.62/4.00 ms off.
+- Built and installed the GNOME 50 Flatpak with pinned SQLCipher 4.18.0. Its
+  self-test passed Wayland, helper launch, raw-key SQLCipher, sandbox audio, and
+  application-fed seekable A/V with three seeks. Permissions are limited to
+  Wayland, PulseAudio-compatible audio, DRI, and the desktop portal bus name.
+- Recorded runtime codec families, VA/Vulkan hardware candidates, plugin
+  licenses, and runtime-license caveats in the Flatpak prototype inventory.
+
+**Open Phase 1 checks**
+
+- Manually verify GTK keyboard/focus and accessibility behavior, user CSS, and
+  movement between outputs with different scale factors.
+- Measure seek latency, buffering, software fallback, and successful hardware
+  negotiation using representative large H.264/H.265/VP9/AV1 media. Synthetic
+  registry discovery alone does not satisfy this check.
+- Collect repeated helper CPU/RSS/latency samples; current media-boundary
+  numbers are feasibility samples, not benchmark distributions.
+- Interactively verify the Flatpak portal and visible theming. Replace temporary
+  networked Cargo builds with vendored/checksummed sources in Phase 2.
 
 **Prototypes**
 

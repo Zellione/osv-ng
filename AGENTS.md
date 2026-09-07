@@ -35,7 +35,7 @@
 - Decoder/archive helpers receive only the minimum object-scoped authority. They must never receive the vault master key or unrestricted vault-directory access.
 
 ## Repository State and Workflow
-- Currently there is no source tree, Cargo workspace, build/test/lint configuration, Flatpak manifest, or CI. Do not invent commands or assume tools exist; inspect manifests first.
+- Currently there is no production source tree, root Cargo workspace, Flatpak manifest, or CI. Phase 1 experiments are isolated under `prototypes/` and may carry local manifests and commands; do not treat them as Phase 2 project policy. Inspect manifests before running commands.
 - Phase 2 must add the exact supported format, lint, test, single-test, audit, fuzz, and Flatpak verification commands to this file after they work locally.
 - Document phase progression in `ROADMAP.md` as work advances: keep phase status, delivered scope, verification results, deviations, and follow-up work current in the same change that implements them.
 - Develop security and storage behavior test-first. Include fault-injection tests for every multi-step persistent operation.
