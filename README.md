@@ -4,10 +4,67 @@
 GTK4, GStreamer, SQLCipher, native Wayland, and Flatpak are the accepted initial
 stack.
 
-The repository is currently in Phase 1. It contains feasibility prototypes and
-a Flatpak smoke application, not the production vault application or its future
-Cargo workspace. See [ROADMAP.md](ROADMAP.md) for phase status, architecture,
-security invariants, and the remaining feasibility checks.
+The repository is currently in Phase 2. It contains the production Cargo
+workspace bootstrap plus the archived Phase 1 feasibility prototypes and
+Flatpak smoke application. The postponed manual Phase 1 checks remain required
+before release qualification; see [ROADMAP.md](ROADMAP.md) for their status and
+the current Phase 2 work.
+
+## Build and test the Phase 2 workspace
+
+The initial minimum supported Rust version (MSRV) is 1.98. Install the pinned
+policy tools:
+
+```sh
+(cd /tmp && cargo install cargo-audit --version 0.22.2 --locked)
+(cd /tmp && cargo install cargo-deny --version 0.20.2 --locked)
+(cd /tmp && cargo install cargo-fuzz --version 0.13.2 --locked)
+rustup toolchain install nightly-2026-09-06 --profile minimal
+```
+
+Then run the production workspace gates from the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+cargo audit
+cargo deny check advisories bans licenses sources
+cargo audit --file fuzz/Cargo.lock
+cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml \
+  check advisories bans licenses sources
+ASAN_OPTIONS=detect_leaks=0 \
+  cargo +nightly-2026-09-06 fuzz run secret-canary -- -max_total_time=20
+```
+
+The Flatpak manifest uses a generated, checksum-pinned source list and disables
+networking inside its build sandbox. Policy tool installation is kept separate
+from project dependency resolution.
+
+Verify the workspace inside the Flatpak SDK without build-time networking:
+
+```sh
+flatpak-builder --force-clean --disable-rofiles-fuse \
+  .flatpak-phase2 \
+  build-aux/flatpak/io.github.osv_ng.Phase2.yml
+flatpak-builder --run .flatpak-phase2 \
+  build-aux/flatpak/io.github.osv_ng.Phase2.yml osv-app
+flatpak-builder --run .flatpak-phase2 \
+  build-aux/flatpak/io.github.osv_ng.Phase2.yml /app/libexec/osv-media-worker
+flatpak-builder --run .flatpak-phase2 \
+  build-aux/flatpak/io.github.osv_ng.Phase2.yml /app/libexec/osv-archive-worker
+```
+
+This is a workspace bootstrap gate, not distributable application packaging.
+The temporary Flatpak ID grants no runtime permissions and does not decide the
+release application ID.
+
+The workspace currently establishes crate boundaries and shared test-support
+primitives; it is not yet a functional vault application. Development and
+diagnostic rules are in [docs/development-policy.md](docs/development-policy.md),
+and direct dependency decisions are in
+[docs/dependencies.md](docs/dependencies.md).
 
 ## Supported development environment
 
@@ -68,7 +125,7 @@ is preferred. Codec availability and licensing vary by runtime and jurisdiction;
 the observed Phase 1 inventory is in
 [codec-coverage.md](prototypes/flatpak-smoke/codec-coverage.md).
 
-## Build and run the Phase 1 application
+## Build and run the Phase 1 prototype application
 
 Build and install the current smoke application from the repository root:
 
