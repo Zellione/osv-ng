@@ -272,10 +272,13 @@ dependencies = [
 name = "osv-storage"
 version = "0.1.0"
 dependencies = [
+ "chacha20poly1305",
  "libc",
  "osv-crypto",
  "osv-domain",
  "osv-test-support",
+ "proptest",
+ "sha2",
 ]
 
 [[package]]

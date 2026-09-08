@@ -1,2 +1,4 @@
 /artifacts/
 /target/
+/corpus/*/*
+!/corpus/*/.gitkeep

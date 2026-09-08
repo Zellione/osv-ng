@@ -1,5 +1,13 @@
 //! Durable vault-header storage and credential rewrap recovery.
 
+mod object;
+
+pub use object::{
+    DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MAX_LOGICAL_LEN, MIN_CHUNK_SIZE, OBJECT_FORMAT_VERSION,
+    OBJECT_HEADER_LEN, ObjectDescriptor, ObjectError, ObjectId, ObjectPreamble, ObjectReader,
+    ObjectRole, PUBLISH_POINTS, PublishFaultInjector, PublishPoint, WrappedObjectKey,
+};
+
 use std::{
     error::Error,
     fmt,
@@ -219,6 +227,64 @@ impl UnlockedVault {
     pub const fn security_status(&self) -> SecurityStatus {
         self.security_status
     }
+
+    /// Streams, verifies, and durably publishes one independently encrypted object.
+    pub fn publish_object(
+        &self,
+        source: &mut impl Read,
+        logical_len: u64,
+        role: ObjectRole,
+    ) -> Result<ObjectDescriptor, ObjectError> {
+        object::publish_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            source,
+            logical_len,
+            role,
+            DEFAULT_CHUNK_SIZE,
+            &mut SystemRandom,
+            &mut object::NoPublishFaults,
+        )
+    }
+
+    /// Injectable publication variant for persistence and deterministic-vector tests.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_object_with(
+        &self,
+        source: &mut impl Read,
+        logical_len: u64,
+        role: ObjectRole,
+        chunk_size: u32,
+        random: &mut impl RandomSource,
+        faults: &mut impl PublishFaultInjector,
+    ) -> Result<ObjectDescriptor, ObjectError> {
+        object::publish_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            source,
+            logical_len,
+            role,
+            chunk_size,
+            random,
+            faults,
+        )
+    }
+
+    /// Opens an object only after unwrapping its catalog representation and
+    /// authenticating its immutable header against this vault and descriptor.
+    pub fn open_object(
+        &self,
+        descriptor: &ObjectDescriptor,
+    ) -> Result<ObjectReader<File>, ObjectError> {
+        object::open_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            descriptor,
+        )
+    }
 }
 
 fn unlock_header(
@@ -399,6 +465,13 @@ mod platform {
         os::{fd::FromRawFd, unix::ffi::OsStrExt},
     };
 
+    fn dynamic_name(name: &str) -> io::Result<CString> {
+        if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+    }
+
     pub(super) fn open_directory(path: &Path) -> io::Result<File> {
         let path = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -442,6 +515,31 @@ mod platform {
         }
     }
 
+    pub(super) fn create_dynamic_directory_at(parent: &File, name: &str) -> io::Result<()> {
+        let name = dynamic_name(name)?;
+        if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn open_dynamic_directory_at(parent: &File, name: &str) -> io::Result<File> {
+        let name = dynamic_name(name)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+    }
+
     pub(super) fn open_at(directory: &File, name: &str, create: bool) -> io::Result<File> {
         let name = CString::new(name).expect("fixed file name");
         let flags = libc::O_NOFOLLOW
@@ -470,6 +568,76 @@ mod platform {
             }
             Ok(file)
         }
+    }
+
+    pub(super) fn open_dynamic_at(
+        directory: &File,
+        name: &str,
+        create: bool,
+        writable: bool,
+    ) -> io::Result<File> {
+        let name = dynamic_name(name)?;
+        let flags = libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if create {
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL
+            } else if writable {
+                libc::O_RDWR | libc::O_NONBLOCK
+            } else {
+                libc::O_RDONLY | libc::O_NONBLOCK
+            };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_nlink != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "object is not a singly linked regular file",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn rename_between(
+        old_directory: &File,
+        old: &str,
+        new_directory: &File,
+        new: &str,
+    ) -> io::Result<()> {
+        let old = dynamic_name(old)?;
+        let new = dynamic_name(new)?;
+        if unsafe {
+            libc::renameat2(
+                old_directory.as_raw_fd(),
+                old.as_ptr(),
+                new_directory.as_raw_fd(),
+                new.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn same_file(first: &File, second: &File) -> io::Result<bool> {
+        fn identity(file: &File) -> io::Result<(libc::dev_t, libc::ino_t)> {
+            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok((metadata.st_dev, metadata.st_ino))
+        }
+
+        Ok(identity(first)? == identity(second)?)
     }
 
     pub(super) fn rename_at(directory: &File, old: &str, new: &str) -> io::Result<()> {
@@ -785,5 +953,190 @@ mod tests {
         );
         assert!(!path.join(NEW_HEADER_NAME).exists());
         assert!(!path.join(BACKUP_HEADER_NAME).exists());
+    }
+
+    struct FailPublishAt(PublishPoint);
+    impl PublishFaultInjector for FailPublishAt {
+        fn should_fail(&mut self, point: PublishPoint) -> bool {
+            point == self.0
+        }
+    }
+
+    fn tree_contains(path: &Path, needle: &[u8]) -> bool {
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                if tree_contains(&entry.path(), needle) {
+                    return true;
+                }
+            } else {
+                let bytes = fs::read(entry.path()).unwrap();
+                if bytes.windows(needle.len()).any(|window| window == needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn publishes_all_roles_with_opaque_private_paths_and_reopens() {
+        let (_parent, path) = fixture_path("objects");
+        let password = Password::new(b"secret").unwrap();
+        let vault =
+            UnlockedVault::create_with_rng(&path, &password, None, params(), &mut Sequence(1))
+                .unwrap();
+        let plaintext = b"phase four plaintext media canary".repeat(400);
+        let mut descriptors = Vec::new();
+        for (index, role) in [
+            ObjectRole::Original,
+            ObjectRole::Thumbnail,
+            ObjectRole::Poster,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            descriptors.push(
+                vault
+                    .publish_object_with(
+                        &mut &plaintext[..],
+                        plaintext.len() as u64,
+                        role,
+                        MIN_CHUNK_SIZE,
+                        &mut Sequence(40 + index as u8 * 50),
+                        &mut object::NoPublishFaults,
+                    )
+                    .unwrap(),
+            );
+        }
+        drop(vault);
+        assert!(!tree_contains(&path, &plaintext[..64]));
+        let vault = UnlockedVault::unlock(&path, &password, None).unwrap();
+        for descriptor in &descriptors {
+            let mut reader = vault.open_object(descriptor).unwrap();
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).unwrap();
+            assert_eq!(actual, plaintext);
+        }
+        for entry in ["objects", "derived", "staging"] {
+            assert_eq!(
+                fs::metadata(path.join(entry)).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn publication_faults_return_no_reference_and_leave_no_plaintext() {
+        let plaintext = b"publication fault plaintext canary".repeat(300);
+        for (index, point) in PUBLISH_POINTS.into_iter().enumerate() {
+            let (_parent, path) = fixture_path(&format!("publish-fault-{index}"));
+            let password = Password::new(b"secret").unwrap();
+            let vault =
+                UnlockedVault::create_with_rng(&path, &password, None, params(), &mut Sequence(1))
+                    .unwrap();
+            let result = vault.publish_object_with(
+                &mut &plaintext[..],
+                plaintext.len() as u64,
+                ObjectRole::Original,
+                MIN_CHUNK_SIZE,
+                &mut Sequence(80),
+                &mut FailPublishAt(point),
+            );
+            assert!(matches!(result, Err(ObjectError::InjectedFault(actual)) if actual == point));
+            assert!(!tree_contains(&path, &plaintext[..64]));
+        }
+    }
+
+    struct SubstituteStaging {
+        path: PathBuf,
+        triggered: bool,
+    }
+
+    impl PublishFaultInjector for SubstituteStaging {
+        fn should_fail(&mut self, point: PublishPoint) -> bool {
+            if point == PublishPoint::CiphertextVerified && !self.triggered {
+                self.triggered = true;
+                fs::rename(&self.path, self.path.with_extension("saved")).unwrap();
+                fs::write(&self.path, [0_u8; OBJECT_HEADER_LEN]).unwrap();
+            }
+            false
+        }
+    }
+
+    #[test]
+    fn substituted_staging_path_never_returns_a_descriptor() {
+        let (_parent, path) = fixture_path("substituted-staging");
+        let password = Password::new(b"secret").unwrap();
+        let vault =
+            UnlockedVault::create_with_rng(&path, &password, None, params(), &mut Sequence(1))
+                .unwrap();
+        let id = ObjectId::from_bytes(std::array::from_fn(|index| 80 + index as u8));
+        let staging_path = path
+            .join("staging")
+            .join(object::filename(id, ".osvo.part"));
+        let plaintext = vec![5; 5000];
+        let result = vault.publish_object_with(
+            &mut &plaintext[..],
+            plaintext.len() as u64,
+            ObjectRole::Original,
+            MIN_CHUNK_SIZE,
+            &mut Sequence(80),
+            &mut SubstituteStaging {
+                path: staging_path,
+                triggered: false,
+            },
+        );
+        assert!(matches!(result, Err(ObjectError::PublishedIdentityChanged)));
+    }
+
+    #[test]
+    fn failed_object_open_does_not_create_namespaces() {
+        let (_parent, path) = fixture_path("read-only-open");
+        let password = Password::new(b"secret").unwrap();
+        let vault =
+            UnlockedVault::create_with_rng(&path, &password, None, params(), &mut Sequence(1))
+                .unwrap();
+        let descriptor = ObjectDescriptor::from_catalog(
+            ObjectId::from_bytes([7; 16]),
+            ObjectRole::Original,
+            0,
+            OBJECT_FORMAT_VERSION,
+            WrappedObjectKey::parse(&[0; 72]).unwrap(),
+        )
+        .unwrap();
+        assert!(!path.join("objects").exists());
+        assert!(vault.open_object(&descriptor).is_err());
+        assert!(!path.join("objects").exists());
+    }
+
+    #[test]
+    fn final_publication_never_replaces_an_existing_object() {
+        let (_parent, path) = fixture_path("no-replace");
+        let password = Password::new(b"secret").unwrap();
+        let vault =
+            UnlockedVault::create_with_rng(&path, &password, None, params(), &mut Sequence(1))
+                .unwrap();
+        let id = ObjectId::from_bytes(std::array::from_fn(|index| 80 + index as u8));
+        let shard = path.join("objects").join(object::shard(id));
+        fs::create_dir_all(&shard).unwrap();
+        fs::set_permissions(path.join("objects"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shard, fs::Permissions::from_mode(0o700)).unwrap();
+        let target = shard.join(object::filename(id, ".osvo"));
+        fs::write(&target, b"existing ciphertext").unwrap();
+        let plaintext = vec![6; 5000];
+        assert!(
+            vault
+                .publish_object_with(
+                    &mut &plaintext[..],
+                    plaintext.len() as u64,
+                    ObjectRole::Original,
+                    MIN_CHUNK_SIZE,
+                    &mut Sequence(80),
+                    &mut object::NoPublishFaults,
+                )
+                .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"existing ciphertext");
     }
 }
