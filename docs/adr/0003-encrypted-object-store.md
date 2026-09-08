@@ -22,8 +22,9 @@ authenticated XChaCha20-Poly1305 chunks. Associated data binds format version,
 vault ID, object ID, role, chunk sequence/count, and immutable header identity.
 
 Publish objects durably before committing catalog references. Authenticate a
-chunk fully before releasing its plaintext. Exact byte layouts, limits, nonce
-derivation, and test vectors remain Phase 3/4 decisions.
+chunk fully before releasing its plaintext. The version-one byte layout, limits,
+nonce derivation, publication protocol, and test fixture are finalized in
+`docs/formats/osvo-v1.md`.
 
 ## Consequences
 

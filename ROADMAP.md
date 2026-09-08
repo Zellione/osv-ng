@@ -7,8 +7,8 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-Phases 0 and 2 are complete as of 2026-09-07, and Phase 3 is complete as of
-2026-09-08. Phase 1's five isolated
+Phases 0 and 2 are complete as of 2026-09-07, and Phases 3 and 4 are complete as
+of 2026-09-08. Phase 1's five isolated
 prototypes passed their automated core paths, and ADRs accept GTK4, GStreamer,
 SQLCipher, and brokered authenticated media transport as the initial directions.
 Phase 1's manual and representative-media checks below remain explicitly
@@ -788,6 +788,85 @@ in all cases before Phase 17 release qualification.
 
 **Goal:** Persist arbitrary byte streams as independently encrypted, seekable
 objects.
+
+**Status:** Complete as of 2026-09-08.
+
+**Delivered scope**
+
+- The final version-one `.osvo` contract is recorded in
+  `docs/formats/osvo-v1.md`: fixed canonical framing, encrypted immutable
+  header, checked 4 KiB-8 MiB power-of-two chunks, a 16 TiB logical bound,
+  exact file-length rules, compatibility policy, and a stable deterministic
+  fixture.
+- Every object receives a random opaque 128-bit ID, random 256-bit DEK, and
+  random nonce prefix. Header and chunk XChaCha20-Poly1305 associated data bind
+  format/suite, vault, object, role, sequence/count, plaintext length, and the
+  immutable header identity. Header/chunk nonce domains are disjoint and chunk
+  sequence nonces are deterministic under the per-object prefix.
+- DEKs are wrapped under the vault's purpose-separated object-wrapping key in a
+  fixed 72-byte catalog representation bound to vault, object, role, and format.
+  The catalog reconstruction API validates public limits before opening files.
+- The bounded publisher accepts an exact declared source length, writes only
+  encrypted bytes to an exclusively created owner-only staging file, syncs it,
+  independently authenticates every chunk, then publishes with a no-replace
+  rename and syncs both affected directories before returning its descriptor.
+- Original, thumbnail, and poster roles use separate descriptor-relative,
+  no-follow namespaces with random-ID sharding. Existing structural components
+  must be real directories and object opens require singly linked regular files.
+- One authenticated `Read + Seek` implementation supports sequential and random
+  access. It allocates at most one validated chunk, decrypts into wipe-on-release
+  memory, and never copies a chunk to its caller before tag verification.
+
+**Verification recorded 2026-09-08**
+
+- Workspace format, all-target/all-feature tests, and warnings-as-errors Clippy
+  pass. `osv-storage` has 27 unit/property tests plus subprocess kill matrices
+  for all seven credential-rewrap and all seven object-publication boundaries.
+- Coverage includes empty, one-byte, exact-boundary, multi-chunk, and 16 MiB+
+  round trips; sequential/seek equivalence; checked offset properties; declared
+  source mismatch; short reads/writes; nonce domain separation; wrapped-key
+  context substitution; header/chunk mutation; cross-vault/object/role use;
+  chunk swap; truncation; private opaque paths; and plaintext artifact scans.
+- The allocation-free `object-preamble` fuzz target completed 26,487,948 ASan
+  executions in 21 seconds without a finding. A curated seed corpus is retained
+  separately from ignored runtime corpus evolution. The separate fuzz workspace
+  formats and checks successfully.
+- Workspace and fuzz `cargo audit` report no known vulnerability. Both Cargo
+  graphs pass `cargo deny` advisories, bans, licenses, and sources policy.
+- The checksum-pinned offline Flatpak manifest passed its complete release test
+  and build gate; the installed app, media-worker, and archive-worker stubs all
+  execute successfully in the sandbox.
+
+**Independent review and remediation**
+
+- GPT-6 Astra approved the cryptographic format and requested implementation
+  changes before accepting the gate. It identified staging-path substitution,
+  incomplete decrypted-header lock accounting, an ordinary-stack excess-source
+  byte, transient coexistence of two full chunk buffers, and filesystem mutation
+  during nominal reads.
+- Publication now verifies the writer inode directly and, after rename, proves
+  that the expected role/shard/final path reaches that same inode. Reader status
+  includes header and wrapping-key owners, the excess-source probe uses secure
+  memory, old chunk storage is released before allocating the next full chunk,
+  and open-only traversal never creates directories. Regression tests cover each
+  remediation, encrypted-header tampering, trailing bytes, and no-replace
+  collisions. The reviewer re-inspected these changes before final acceptance.
+
+**Deviations and follow-up**
+
+- Phase 4 can guarantee only that publication returns no catalog reference
+  before object durability because Phase 5 owns the encrypted catalog. Phase 6
+  will compose that descriptor with a catalog transaction and remove abandoned
+  staging/final ciphertext discovered after interruption.
+- The authenticated reader protects its internal chunk owner. Later broker/UI
+  code remains responsible for using secure destination owners and reporting
+  opaque decoder/driver allocation limits; ordinary `Read` callers control the
+  memory they supply.
+- Public-preamble fuzzing does not yet exercise authenticated header/chunk state,
+  and persistence hooks model interruption boundaries rather than every syscall
+  errno. Retain deterministic authenticated-parser mutations and add targeted
+  lock-failure, symlink/directory substitution, key-aware fuzz, and syscall-fault
+  coverage when the shared storage test infrastructure lands.
 
 **Deliverables**
 
