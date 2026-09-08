@@ -1,7 +1,6 @@
 use std::{error::Error, fmt, io};
 
 /// Catalog failures deliberately omit SQL values, keys, and paths.
-#[derive(Debug)]
 pub enum CatalogError {
     AlreadyExists,
     InvalidInput(&'static str),
@@ -10,8 +9,14 @@ pub enum CatalogError {
     IntegrityFailed,
     NotFound,
     Conflict,
-    Sql(rusqlite::Error),
+    Sql(Option<rusqlite::ErrorCode>),
     Io(io::Error),
+}
+
+impl fmt::Debug for CatalogError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 impl fmt::Display for CatalogError {
@@ -35,7 +40,6 @@ impl fmt::Display for CatalogError {
 impl Error for CatalogError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Sql(error) => Some(error),
             Self::Io(error) => Some(error),
             _ => None,
         }
@@ -44,13 +48,11 @@ impl Error for CatalogError {
 
 impl From<rusqlite::Error> for CatalogError {
     fn from(error: rusqlite::Error) -> Self {
-        if matches!(
-            error.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::ConstraintViolation)
-        ) {
+        let code = error.sqlite_error_code();
+        if matches!(code, Some(rusqlite::ErrorCode::ConstraintViolation)) {
             Self::Conflict
         } else {
-            Self::Sql(error)
+            Self::Sql(code)
         }
     }
 }

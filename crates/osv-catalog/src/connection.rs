@@ -5,12 +5,12 @@ use std::{
     time::Duration,
 };
 
-use osv_crypto::{SecretBytes, SecretKey};
+use osv_crypto::{LockStatus, SecretBytes, SecretKey, SecurityStatus};
 use rusqlite::{Connection, OpenFlags, config::DbConfig, ffi};
 
 use crate::{
     CatalogError, MigrationFaultInjector, NoMigrationFault, Result,
-    repository::CatalogTransaction,
+    repository::{CatalogReader, CatalogTransaction},
     schema::{migrate, validate_migration_record},
 };
 
@@ -44,6 +44,7 @@ pub struct Catalog {
     pub(crate) connection: Connection,
     mode: CatalogMode,
     path: PathBuf,
+    security_status: SecurityStatus,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -144,12 +145,13 @@ impl Catalog {
             }
         };
         let connection = Connection::open_with_flags(path, flags)?;
-        apply_raw_key(&connection, key)?;
+        let raw_key_status = apply_raw_key(&connection, key)?;
         configure(&connection, mode, config)?;
         Ok(Self {
             connection,
             mode,
             path: path.to_owned(),
+            security_status: SecurityStatus::new(key.lock_status().combine(raw_key_status)),
         })
     }
 
@@ -170,6 +172,17 @@ impl Catalog {
             return Err(CatalogError::InvalidInput("read-only transaction"));
         }
         CatalogTransaction::begin(&mut self.connection)
+    }
+
+    #[must_use]
+    pub const fn reader(&self) -> CatalogReader<'_> {
+        CatalogReader::new(&self.connection)
+    }
+
+    /// Security status of the caller-owned key and transient raw-key encoding.
+    #[must_use]
+    pub const fn security_status(&self) -> SecurityStatus {
+        self.security_status
     }
 
     pub fn integrity_check(&self) -> Result<IntegrityReport> {
@@ -241,7 +254,7 @@ fn validate_catalog_file(path: &Path) -> Result<()> {
 }
 
 #[allow(unsafe_code)]
-fn apply_raw_key(connection: &Connection, key: &SecretKey<32>) -> Result<()> {
+fn apply_raw_key(connection: &Connection, key: &SecretKey<32>) -> Result<LockStatus> {
     // SQLCipher's raw-key syntax is x'<64 hex digits>'. Build it in locked,
     // non-dumpable, wipe-on-drop memory rather than an ordinary String.
     let mut raw = SecretBytes::zeroed(67)?;
@@ -264,9 +277,9 @@ fn apply_raw_key(connection: &Connection, key: &SecretKey<32>) -> Result<()> {
         )
     };
     if result == ffi::SQLITE_OK {
-        Ok(())
+        Ok(raw.lock_status())
     } else {
-        Err(CatalogError::Sql(rusqlite::Error::SqliteFailure(
+        Err(CatalogError::from(rusqlite::Error::SqliteFailure(
             ffi::Error::new(result),
             None,
         )))
@@ -319,6 +332,7 @@ mod scale_tests {
     use rusqlite::params;
 
     use super::{Catalog, CatalogMode};
+    use crate::repository::SEARCH_SQL;
 
     #[test]
     fn connection_policy_and_schema_identity_fail_closed() {
@@ -389,29 +403,29 @@ mod scale_tests {
             transaction.commit().unwrap();
             let inserted = started.elapsed();
             let queried = Instant::now();
-            let matches: i64 = catalog
-                .connection
-                .query_row(
-                    "SELECT count(*) FROM media_search WHERE media_search MATCH 'needle'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
+            let matches = catalog.reader().search_media("needle", 10_000).unwrap();
             let query = queried.elapsed();
-            assert_eq!(matches, target / 100);
+            assert_eq!(
+                matches.len(),
+                usize::try_from(target / 100).expect("benchmark result count fits usize")
+            );
             eprintln!(
-                "phase5_catalog_benchmark rows={target} insert_ms={} indexed_query_ms={}",
+                "phase5_catalog_benchmark rows={target} insert_ms={} ranked_query_ms={}",
                 inserted.as_millis(),
                 query.as_millis()
             );
             previous = target;
         }
-        let plan: String = catalog.connection.query_row(
-            "EXPLAIN QUERY PLAN SELECT rowid FROM media_search WHERE media_search MATCH 'needle'",
-            [],
-            |row| row.get(3),
-        ).unwrap();
-        assert!(plan.contains("VIRTUAL TABLE INDEX"));
+        let explain = format!("EXPLAIN QUERY PLAN {SEARCH_SQL}");
+        let mut statement = catalog.connection.prepare(&explain).unwrap();
+        let plan = statement
+            .query_map(params!["needle", 10_000], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("VIRTUAL TABLE INDEX")));
+        assert!(!plan.iter().any(|step| step.contains("USE TEMP B-TREE")));
+        drop(statement);
         catalog.checkpoint_for_offline_backup().unwrap();
         catalog.close().unwrap();
     }

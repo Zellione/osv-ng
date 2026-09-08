@@ -37,6 +37,13 @@ schema work. It keeps cipher full-memory security enabled and applies WAL,
 defensive mode, untrusted-schema mode, disabled double-quoted strings, and
 disabled writable `ATTACH` behavior.
 
+Catalog opening reports the combined page-lock status of the caller-owned key
+and transient raw-key encoding. Database failures retain only nonsensitive error
+codes: formatting and error chains never expose SQLCipher messages that may
+contain malformed search fragments. Read-only connections expose a repository
+view for object, hierarchy, and search queries without beginning a write
+transaction.
+
 ## Consequences
 
 - SQLite transactions, constraints, indexes, and recovery can be reused.
@@ -67,8 +74,10 @@ live WAL, and forced crashes at every migration boundary. Database, WAL,
 shared-memory, temporary artifacts, and catalog-related open descriptors had no
 canary hits; recovery, wrong-key rejection, page-corruption rejection, cipher
 integrity, SQLite integrity, and foreign-key integrity passed. An indexed
-release benchmark passed at 10k, 100k, and 1m media rows. The complete packaged
-workspace test gate passed inside GNOME 50.
+release benchmark passed at 10k, 100k, and 1m media rows through the public
+ranked-search API. A subprocess lowered its memory-lock limit after creating a
+locked caller key and verified that transient raw-key lock failure is reported
+as degraded. The complete packaged workspace test gate passed inside GNOME 50.
 
 SQLCipher and SQLite still own opaque decrypted page/cache allocations. Full
 memory security is enabled, but the application cannot promise those allocations

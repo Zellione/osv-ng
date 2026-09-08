@@ -9,7 +9,7 @@ use osv_catalog::{
     Catalog, CatalogConfig, CatalogError, CatalogMode, Child, GalleryId, MediaClass, MediaId,
     MigrationFaultInjector, MigrationPoint, NewGallery, NewMedia, NewObject, ObjectState, Result,
 };
-use osv_crypto::SecretKey;
+use osv_crypto::{LockStatus, SecretKey};
 use osv_storage::{ObjectDescriptor, ObjectId, ObjectRole, WrappedObjectKey};
 use osv_test_support::{SecretCanary, TempVault};
 
@@ -85,16 +85,56 @@ fn encrypted_catalog_round_trip_policy_and_wrong_key() {
         }
     );
     assert!(catalog.path_is_redacted_in_debug());
+    assert!(matches!(
+        catalog.security_status().page_locks(),
+        LockStatus::Locked | LockStatus::Degraded
+    ));
+    assert!(catalog.security_status().has_opaque_library_transients());
     catalog.close().unwrap();
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
     assert!(Catalog::open(&path, &key(8), &VAULT_ID, CatalogMode::ReadOnly).is_err());
-    Catalog::open(&path, &catalog_key, &VAULT_ID, CatalogMode::ReadOnly)
-        .unwrap()
-        .close()
+    let catalog = Catalog::open(&path, &catalog_key, &VAULT_ID, CatalogMode::ReadOnly).unwrap();
+    let reader = catalog.reader();
+    assert_eq!(reader.search_media("café", 10).unwrap()[0].id, media);
+    assert_eq!(
+        reader.object(ObjectId::from_bytes([1; 16])).unwrap().state,
+        ObjectState::Ready
+    );
+    catalog.close().unwrap();
+}
+
+#[test]
+fn malformed_search_errors_redact_query_text_and_sources() {
+    use std::error::Error as _;
+
+    let directory = temp();
+    let path = directory.path().join("catalog.db");
+    let catalog_key = key(0x19);
+    let mut catalog = Catalog::create(&path, &catalog_key, &VAULT_ID, 1).unwrap();
+    add_media(&mut catalog, 0x19, "search.png");
+    let canary = "OSV_PRIVATE_QUERY_6dd73a";
+    let query = format!("{canary}:term");
+    let error = catalog.reader().search_media(&query, 10).unwrap_err();
+    assert!(!format!("{error:?}").contains(canary));
+    assert!(!error.to_string().contains(canary));
+    assert!(error.source().is_none());
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn degraded_raw_key_lock_status_is_reported() {
+    use std::process::Command;
+
+    let directory = temp();
+    let status = Command::new(env!("CARGO_BIN_EXE_osv-catalog-crash-fixture"))
+        .arg(directory.path())
+        .arg("security-status-degraded")
+        .status()
         .unwrap();
+    assert!(status.success());
 }
 
 #[test]
@@ -173,6 +213,12 @@ fn hierarchy_is_ordered_and_cycles_are_rejected() {
         vec![Child::Gallery(b), Child::Media(media)]
     );
     transaction.commit().unwrap();
+    catalog.close().unwrap();
+    let catalog = Catalog::open(&path, &catalog_key, &VAULT_ID, CatalogMode::ReadOnly).unwrap();
+    assert_eq!(
+        catalog.reader().gallery_children(a, 10).unwrap(),
+        vec![Child::Gallery(b), Child::Media(media)]
+    );
 }
 
 struct FailAt(MigrationPoint);

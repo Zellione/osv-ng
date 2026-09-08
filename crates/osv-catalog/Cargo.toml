@@ -16,6 +16,7 @@ path = "src/bin/osv-catalog-crash-fixture.rs"
 required-features = ["test-fixtures"]
 
 [dependencies]
+libc.workspace = true
 osv-crypto.workspace = true
 osv-storage.workspace = true
 rusqlite.workspace = true

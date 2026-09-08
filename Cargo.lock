@@ -247,6 +247,7 @@ dependencies = [
 name = "osv-catalog"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "osv-crypto",
  "osv-storage",
  "osv-test-support",

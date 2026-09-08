@@ -17,8 +17,33 @@ pub struct SearchResult {
     pub favorite: bool,
 }
 
+pub(crate) const SEARCH_SQL: &str = "SELECT media.id,media.media_class,media.favorite FROM media_search JOIN media ON media.rowid=media_search.rowid WHERE media_search MATCH ?1 ORDER BY rank LIMIT ?2";
+
 pub struct CatalogTransaction<'connection> {
     transaction: Transaction<'connection>,
+}
+
+/// Read-only repository view available for both reader and writer connections.
+pub struct CatalogReader<'connection> {
+    connection: &'connection Connection,
+}
+
+impl<'connection> CatalogReader<'connection> {
+    pub(crate) const fn new(connection: &'connection Connection) -> Self {
+        Self { connection }
+    }
+
+    pub fn object(&self, id: ObjectId) -> Result<StoredObject> {
+        read_object(self.connection, id)
+    }
+
+    pub fn gallery_children(&self, parent: GalleryId, maximum: u32) -> Result<Vec<Child>> {
+        read_gallery_children(self.connection, parent, maximum)
+    }
+
+    pub fn search_media(&self, query: &str, maximum: u32) -> Result<Vec<SearchResult>> {
+        read_search_media(self.connection, query, maximum)
+    }
 }
 
 impl CatalogTransaction<'_> {
@@ -49,16 +74,7 @@ impl CatalogTransaction<'_> {
     }
 
     pub fn object(&self, id: ObjectId) -> Result<StoredObject> {
-        let row = self.transaction.query_row(
-            "SELECT id,role,logical_size,format_generation,wrapped_dek,locator,state FROM objects WHERE id=?1",
-            [id.as_bytes().as_slice()],
-            |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Vec<u8>>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?)),
-        ).optional()?.ok_or(CatalogError::NotFound)?;
-        Ok(StoredObject {
-            descriptor: parse_descriptor(row.0, row.1, row.2, row.3, row.4)?,
-            locator: row.5,
-            state: ObjectState::parse(row.6)?,
-        })
+        read_object(&self.transaction, id)
     }
 
     pub fn insert_media(&self, media: &NewMedia<'_>) -> Result<()> {
@@ -163,31 +179,7 @@ impl CatalogTransaction<'_> {
     }
 
     pub fn gallery_children(&self, parent: GalleryId, maximum: u32) -> Result<Vec<Child>> {
-        if maximum == 0 || maximum > MAX_QUERY_RESULTS {
-            return Err(CatalogError::InvalidInput("gallery result limit"));
-        }
-        let mut statement = self.transaction.prepare(
-            "SELECT child_kind,media_id,gallery_id FROM gallery_children WHERE parent_gallery_id=?1 ORDER BY position LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            params![parent.as_bytes().as_slice(), i64::from(maximum)],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                ))
-            },
-        )?;
-        rows.map(|row| {
-            let (kind, media, gallery) = row?;
-            match (kind, media, gallery) {
-                (1, Some(id), None) => Ok(Child::Media(MediaId::parse(id)?)),
-                (2, None, Some(id)) => Ok(Child::Gallery(GalleryId::parse(id)?)),
-                _ => Err(CatalogError::IntegrityFailed),
-            }
-        })
-        .collect()
+        read_gallery_children(&self.transaction, parent, maximum)
     }
 
     fn gallery_reaches(&self, root: GalleryId, sought: GalleryId) -> Result<bool> {
@@ -226,32 +218,83 @@ impl CatalogTransaction<'_> {
     }
 
     pub fn search_media(&self, query: &str, maximum: u32) -> Result<Vec<SearchResult>> {
-        validate_text(query, MAX_SEARCH_BYTES, false, "search query")?;
-        if maximum == 0 || maximum > MAX_QUERY_RESULTS {
-            return Err(CatalogError::InvalidInput("search result limit"));
-        }
-        let mut statement = self.transaction.prepare(
-            "SELECT media.id,media.media_class,media.favorite FROM media_search JOIN media ON media.rowid=media_search.rowid WHERE media_search MATCH ?1 ORDER BY rank,media.id LIMIT ?2"
-        )?;
-        let rows = statement.query_map(params![query, i64::from(maximum)], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })?;
-        rows.map(|row| {
-            let (id, class, favorite) = row?;
-            Ok(SearchResult {
-                id: MediaId::parse(id)?,
-                class: MediaClass::parse(class)?,
-                favorite,
-            })
-        })
-        .collect()
+        read_search_media(&self.transaction, query, maximum)
     }
 
     pub fn commit(self) -> Result<()> {
         self.transaction.commit().map_err(CatalogError::from)
     }
+}
+
+fn read_object(connection: &Connection, id: ObjectId) -> Result<StoredObject> {
+    let row = connection.query_row(
+        "SELECT id,role,logical_size,format_generation,wrapped_dek,locator,state FROM objects WHERE id=?1",
+        [id.as_bytes().as_slice()],
+        |row| Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Vec<u8>>(4)?,row.get::<_,String>(5)?,row.get::<_,i64>(6)?)),
+    ).optional()?.ok_or(CatalogError::NotFound)?;
+    Ok(StoredObject {
+        descriptor: parse_descriptor(row.0, row.1, row.2, row.3, row.4)?,
+        locator: row.5,
+        state: ObjectState::parse(row.6)?,
+    })
+}
+
+fn read_gallery_children(
+    connection: &Connection,
+    parent: GalleryId,
+    maximum: u32,
+) -> Result<Vec<Child>> {
+    if maximum == 0 || maximum > MAX_QUERY_RESULTS {
+        return Err(CatalogError::InvalidInput("gallery result limit"));
+    }
+    let mut statement = connection.prepare(
+        "SELECT child_kind,media_id,gallery_id FROM gallery_children WHERE parent_gallery_id=?1 ORDER BY position LIMIT ?2",
+    )?;
+    let rows = statement.query_map(
+        params![parent.as_bytes().as_slice(), i64::from(maximum)],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let (kind, media, gallery) = row?;
+        match (kind, media, gallery) {
+            (1, Some(id), None) => Ok(Child::Media(MediaId::parse(id)?)),
+            (2, None, Some(id)) => Ok(Child::Gallery(GalleryId::parse(id)?)),
+            _ => Err(CatalogError::IntegrityFailed),
+        }
+    })
+    .collect()
+}
+
+fn read_search_media(
+    connection: &Connection,
+    query: &str,
+    maximum: u32,
+) -> Result<Vec<SearchResult>> {
+    validate_text(query, MAX_SEARCH_BYTES, false, "search query")?;
+    if maximum == 0 || maximum > MAX_QUERY_RESULTS {
+        return Err(CatalogError::InvalidInput("search result limit"));
+    }
+    let mut statement = connection.prepare(SEARCH_SQL)?;
+    let rows = statement.query_map(params![query, i64::from(maximum)], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (id, class, favorite) = row?;
+        Ok(SearchResult {
+            id: MediaId::parse(id)?,
+            class: MediaClass::parse(class)?,
+            favorite,
+        })
+    })
+    .collect()
 }

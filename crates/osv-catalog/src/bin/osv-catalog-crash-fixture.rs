@@ -8,7 +8,7 @@ use osv_catalog::{
     Catalog, CatalogConfig, MediaClass, MediaId, MigrationFaultInjector, MigrationPoint, NewMedia,
     NewObject, ObjectState,
 };
-use osv_crypto::SecretKey;
+use osv_crypto::{LockStatus, SecretKey};
 use osv_storage::{ObjectDescriptor, ObjectId, ObjectRole, WrappedObjectKey};
 
 fn main() {
@@ -26,6 +26,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = Path::new(&directory).join("catalog.db");
     let mut bytes = [0x55; 32];
     let key = SecretKey::take(&mut bytes)?;
+    if boundary == "security-status-degraded" {
+        if key.lock_status() != LockStatus::Locked {
+            return Err("fixture catalog key was not page-locked before lowering the limit".into());
+        }
+        disable_memlock()?;
+        let catalog = Catalog::create(&path, &key, &[0x66; 16], 1)?;
+        if catalog.security_status().page_locks() != LockStatus::Degraded {
+            return Err("catalog did not report degraded raw-key page locking".into());
+        }
+        catalog.close()?;
+        return Ok(());
+    }
     if boundary.starts_with("migration-") {
         let mut injector = PauseAt(boundary);
         let _catalog = Catalog::create_with(
@@ -72,6 +84,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     io::stdin().read_exact(&mut byte)?;
     drop(catalog);
     Ok(())
+}
+
+#[allow(unsafe_code)]
+fn disable_memlock() -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid `rlimit` for this short-lived fixture process.
+    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 struct PauseAt(String);

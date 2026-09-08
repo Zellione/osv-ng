@@ -12,7 +12,7 @@ mod types;
 
 pub use connection::{Catalog, CatalogConfig, CatalogMode, IntegrityReport};
 pub use error::{CatalogError, Result};
-pub use repository::{CatalogTransaction, SearchResult};
+pub use repository::{CatalogReader, CatalogTransaction, SearchResult};
 pub use schema::{MigrationFaultInjector, MigrationPoint, NoMigrationFault, SCHEMA_VERSION};
 pub use types::{
     Child, GalleryId, MediaClass, MediaId, NewDerivedObject, NewGallery, NewMedia, NewObject,
