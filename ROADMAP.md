@@ -7,11 +7,12 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-Phase 0 is complete as of 2026-09-07. Phase 1 is in progress: its five isolated
-prototypes have passed their automated core paths, and ADRs now accept GTK4,
-GStreamer, SQLCipher, and brokered authenticated media transport as the initial
-directions. Manual interaction and representative-media checks listed below
-remain open. Prototype code does not establish the Phase 2 production workspace.
+Phase 0 and Phase 2 are complete as of 2026-09-07. Phase 1's five isolated
+prototypes passed their automated core paths, and ADRs accept GTK4, GStreamer,
+SQLCipher, and brokered authenticated media transport as the initial directions.
+Phase 1's manual and representative-media checks below remain explicitly
+postponed. They are required evidence before the affected UI, playback, and
+Flatpak behavior can be treated as release-ready.
 
 ## Product outcome
 
@@ -517,7 +518,7 @@ stable known-answer vectors and independent-tool verification where possible.
 - Recorded runtime codec families, VA/Vulkan hardware candidates, plugin
   licenses, and runtime-license caveats in the Flatpak prototype inventory.
 
-**Open Phase 1 checks**
+**Postponed Phase 1 checks (still required)**
 
 - Manually verify GTK keyboard/focus and accessibility behavior, user CSS, and
   movement between outputs with different scale factors.
@@ -528,6 +529,12 @@ stable known-answer vectors and independent-tool verification where possible.
   numbers are feasibility samples, not benchmark distributions.
 - Interactively verify the Flatpak portal and visible theming. Replace temporary
   networked Cargo builds with vendored/checksummed sources in Phase 2.
+
+These checks were postponed by project direction on 2026-09-07 so repository
+bootstrap could begin. This is a scheduling decision, not a successful result
+or a weakening of an exit criterion. Complete and record them before the first
+feature depending on the relevant behavior exits its implementation phase, and
+in all cases before Phase 17 release qualification.
 
 **Prototypes**
 
@@ -561,6 +568,66 @@ stable known-answer vectors and independent-tool verification where possible.
 ### Phase 2 — Repository and quality bootstrap
 
 **Goal:** Make every subsequent phase reproducible and reviewable.
+
+**Completed 2026-09-07**
+
+- Added the root Cargo workspace with the approved eight production/support
+  crates and two least-authority helper binaries. Phase 1 prototypes remain
+  isolated and are not workspace members.
+- Set Rust 1.98 as the initial MSRV, matching the stable Arch toolchain verified
+  at bootstrap. The MSRV may be raised only deliberately, with a roadmap entry
+  and verification on the new minimum; dependency additions must continue to
+  resolve and test at that version.
+- Enabled workspace-wide Rust 2024, Clippy `all` at deny level, and
+  deny-by-default unsafe Rust. A future crate that needs an exception must opt
+  out explicitly and document the smallest unsafe module's safety contract.
+- Added the initial fault-injection boundary and redacted secret-canary helpers
+  in `osv-test-support`, plus owner-only temporary vault directories and
+  property tests for artifact scanning. A cross-process harness now kills a
+  child at each reported persistence boundary and verifies the resulting disk
+  state from the parent. Root format, lint, test, single-test, advisory-audit,
+  and dependency-policy commands are documented in `AGENTS.md` and pass locally.
+- Documented logging, diagnostics, unsafe/FFI, dependency, and CI trust
+  policies. Added read-only GitHub Actions jobs for the verified workspace and
+  advisory/dependency gates; the checkout action and installed tool versions
+  are pinned.
+- Added a separate, pinned fuzz workspace and CI smoke job. Its first target
+  checks the canary scanner under libFuzzer and AddressSanitizer; a local
+  six-second run completed about 3.28 million executions without a target
+  failure. The managed local runner cannot provide LeakSanitizer's `ptrace`
+  access, so that result excludes leak detection and the limitation is recorded
+  in the development policy. The CI job temporarily relaxes Yama only on its
+  ephemeral VM, enables leak detection, and restores restricted mode afterward.
+  This proves the harness only, not coverage of persistent or IPC formats that
+  do not exist yet.
+- Generated a compact Flatpak source manifest from the root lockfile using a
+  pinned revision of the official generator. Flatpak Builder fetches each crate
+  by checksum before entering the sandbox; release tests and builds then pass
+  with Cargo offline, without checking roughly 24 MiB of raw upstream source
+  into this repository. The separate fuzz job remains network-resolved in CI
+  and is governed by its pinned lockfile and dependency policy.
+- Added a permission-free Phase 2 Flatpak bootstrap manifest using the accepted
+  GNOME 50 SDK and Rust extension. It passed all release-mode workspace tests,
+  built offline, installed the application and both helpers, and ran all three
+  installed binaries. Its temporary ID and empty application entry point are
+  explicitly not release packaging or UI/media/portal evidence.
+- GitHub Actions run
+  [34161201789](https://github.com/Zellione/osv-ng/actions/runs/34161201789)
+  passed all five jobs from a clean checkout: workspace format/lint/tests,
+  advisory audit, dependency policy, ASan/LeakSanitizer fuzz smoke, and the
+  offline Flatpak bootstrap. The first remote run exposed an omitted GNOME
+  Platform installation; the workflow now installs the matching Platform and
+  SDK explicitly. LeakSanitizer ran with a temporary Yama `ptrace_scope=0` on
+  the ephemeral runner, and the job restored restricted mode afterward.
+
+**Deferred follow-up in consuming phases**
+
+- Apply the property, temporary-vault, and cross-process crash harnesses to each
+  persistent operation as its production implementation is introduced.
+- Add targeted sanitizer/fuzz coverage with each parser or FFI boundary.
+- Replace the temporary Flatpak ID and stub with product metadata, permissions,
+  and functional GTK/media checks only after those decisions and components
+  exist; the Phase 2 workspace packaging gate must remain offline.
 
 **Deliverables**
 

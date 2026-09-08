@@ -2,3 +2,4 @@
 **/target/
 /.flatpak-build/
 /.flatpak-builder/
+/.flatpak-phase2/

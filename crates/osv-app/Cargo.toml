@@ -1,0 +1,18 @@
+[package]
+name = "osv-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+osv-catalog.workspace = true
+osv-domain.workspace = true
+osv-import.workspace = true
+osv-media.workspace = true
+osv-storage.workspace = true
+
+[lints]
+workspace = true

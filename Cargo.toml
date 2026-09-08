@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/osv-app",
+    "crates/osv-catalog",
+    "crates/osv-crypto",
+    "crates/osv-domain",
+    "crates/osv-import",
+    "crates/osv-media",
+    "crates/osv-storage",
+    "crates/osv-test-support",
+    "helpers/osv-archive-worker",
+    "helpers/osv-media-worker",
+]
+exclude = [
+    "fuzz",
+    "prototypes/flatpak-smoke",
+    "prototypes/gstreamer-seek",
+    "prototypes/gtk-gallery",
+    "prototypes/media-boundary",
+    "prototypes/sqlcipher",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.0"
+license = "MIT"
+repository = "https://github.com/zellione/osv-ng"
+
+[workspace.dependencies]
+osv-catalog = { path = "crates/osv-catalog", version = "=0.1.0" }
+osv-crypto = { path = "crates/osv-crypto", version = "=0.1.0" }
+osv-domain = { path = "crates/osv-domain", version = "=0.1.0" }
+osv-import = { path = "crates/osv-import", version = "=0.1.0" }
+osv-media = { path = "crates/osv-media", version = "=0.1.0" }
+osv-storage = { path = "crates/osv-storage", version = "=0.1.0" }
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.dev]
+debug = 1
+
+[profile.test]
+debug = 1
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "debuginfo"

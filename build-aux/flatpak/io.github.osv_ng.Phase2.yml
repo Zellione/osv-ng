@@ -1,0 +1,36 @@
+app-id: io.github.osv_ng.Phase2
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: osv-app
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/osv-ng/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: osv-ng
+    buildsystem: simple
+    build-commands:
+      - mv cargo/config cargo/config.toml
+      - cargo test --release --workspace --all-targets --all-features --locked --offline
+      - cargo build --release --workspace --locked --offline
+      - install -Dm755 target/release/osv-app /app/bin/osv-app
+      - install -Dm755 target/release/osv-media-worker /app/libexec/osv-media-worker
+      - install -Dm755 target/release/osv-archive-worker /app/libexec/osv-archive-worker
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .flatpak-build
+          - .flatpak-builder
+          - .flatpak-phase2
+          - .git
+          - fuzz
+          - prototypes
+          - target
+      - cargo-sources.json
