@@ -1,7 +1,34 @@
 # Dependency record
 
-Direct dependencies in the Phase 2 workspace are recorded here alongside the
+Direct dependencies in the production workspace are recorded here alongside the
 review checklist. Transitive versions remain pinned by the root `Cargo.lock`.
+
+## Phase 3 cryptographic and Linux dependencies
+
+- `argon2` 0.5.3 provides the RustCrypto Argon2id implementation. Default
+  features are disabled; its zeroization feature is enabled, and the project
+  supplies a wipe-on-drop, non-dumpable working matrix rather than using the
+  convenience heap allocation.
+- `chacha20poly1305` 0.10.1 provides RustCrypto XChaCha20-Poly1305 authenticated
+  encryption. Default features are disabled and only allocation support is
+  enabled. A direct `poly1305` 0.8.0 declaration enables zeroization for its
+  transitive authenticator state.
+- `hkdf` 0.12.4 and `sha2` 0.10.9 provide RustCrypto HKDF-SHA-256 key
+  separation.
+- `getrandom` 0.3.4 is the sole production CSPRNG backend and is wrapped by an
+  exact-fill project interface.
+- `zeroize` 1.9.0 supplies compiler-resistant wipe operations with default
+  features disabled; its derive macro is deliberately not included.
+- `libc` 0.2.189 exposes Linux memory, descriptor-relative filesystem, resource
+  limit, and dumpability syscalls within narrowly allowed unsafe adapters.
+
+These direct crates are `MIT OR Apache-2.0`. Their versions, features, sources,
+MSRV, and known advisories were reviewed through package metadata, the lockfile,
+`cargo audit`, and `cargo deny`. The cryptographic graph also requires
+`subtle` 2.6.1 under BSD-3-Clause; that permissive license is explicitly added
+to both dependency-policy files. Upgrade review must rerun project vectors, the
+rewrap kill matrix, unsafe-boundary review, advisory audit, and dependency
+policy gates.
 
 ## `proptest` 1.11
 

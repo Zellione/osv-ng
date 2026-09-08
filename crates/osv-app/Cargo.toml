@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 osv-catalog.workspace = true
+osv-crypto.workspace = true
 osv-domain.workspace = true
 osv-import.workspace = true
 osv-media.workspace = true
