@@ -7,8 +7,22 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "osv-catalog-crash-fixture"
+path = "src/bin/osv-catalog-crash-fixture.rs"
+required-features = ["test-fixtures"]
+
 [dependencies]
-osv-domain.workspace = true
+osv-crypto.workspace = true
+osv-storage.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }
 
 [lints]
 workspace = true

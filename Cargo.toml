@@ -42,6 +42,7 @@ osv-import = { path = "crates/osv-import", version = "=0.1.0" }
 osv-media = { path = "crates/osv-media", version = "=0.1.0" }
 osv-storage = { path = "crates/osv-storage", version = "=0.1.0" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["modern_sqlite", "sqlcipher"] }
 sha2 = "0.10.9"
 zeroize = { version = "1.8.2", default-features = false }
 

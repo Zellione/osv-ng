@@ -20,8 +20,22 @@ opening, authenticated pages, WAL recovery/checkpointing, memory-only temporary
 storage, and absence of plaintext canaries in all disk artifacts. The user's
 password is never passed directly to SQLCipher. No extension loading is allowed.
 
-Arch and Flatpak execution are documented by the prototypes. Schema and query
-APIs are intentionally deferred to Phase 5.
+Phase 5 uses `rusqlite` 0.40.2 with its system `sqlcipher` feature. Arch links
+the distribution library. Flatpak builds the checksum-pinned SQLCipher 4.18.0
+source as `libsqlcipher.so.0`, with an explicit SONAME and `sqlcipher.pc`, so a
+generic platform `libsqlite3` cannot satisfy the dependency accidentally. The
+Flatpak build enables FTS5 and memory-only temporary storage and compiles out
+loadable extensions.
+
+The application calls SQLCipher's binary key API through one documented FFI
+function. SQLCipher's `x'<hex>'` raw-key encoding is assembled in locked,
+non-dumpable, wipe-on-drop memory, so the derived catalog key is neither treated
+as a password nor rendered into an ordinary Rust string. Connection setup then
+verifies `cipher_version`, memory-only temp storage, and foreign keys before any
+schema work. It keeps cipher full-memory security enabled and applies WAL,
+`synchronous=FULL`, authenticated pages, secure deletion, bounded waits,
+defensive mode, untrusted-schema mode, disabled double-quoted strings, and
+disabled writable `ATTACH` behavior.
 
 ## Consequences
 
@@ -48,7 +62,16 @@ SQLite integrity checks, verified `temp_store=MEMORY`, rejected a wrong key,
 and found no canary in database-related disk artifacts. The installed Flatpak
 also opened its pinned SQLCipher 4.18.0 build with a raw key.
 
-Repeated benchmarks, larger catalogs, OS/library memory inspection, and the
-complete Phase 5 crash matrix remain required. Any plaintext disk artifact or
+Phase 5 repeated the canary scan through ordinary commits, a forced crash with a
+live WAL, and forced crashes at every migration boundary. Database, WAL,
+shared-memory, temporary artifacts, and catalog-related open descriptors had no
+canary hits; recovery, wrong-key rejection, page-corruption rejection, cipher
+integrity, SQLite integrity, and foreign-key integrity passed. An indexed
+release benchmark passed at 10k, 100k, and 1m media rows. The complete packaged
+workspace test gate passed inside GNOME 50.
+
+SQLCipher and SQLite still own opaque decrypted page/cache allocations. Full
+memory security is enabled, but the application cannot promise those allocations
+are page-locked or directly wipe-observable. Any plaintext disk artifact or
 unrecoverable WAL behavior reverses this decision; no catalog code may silently
 weaken the plaintext-storage invariant.
