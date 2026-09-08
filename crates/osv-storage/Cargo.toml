@@ -7,9 +7,21 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "osv-rewrap-crash-fixture"
+path = "src/bin/osv-rewrap-crash-fixture.rs"
+required-features = ["test-fixtures"]
+
 [dependencies]
+libc.workspace = true
 osv-crypto.workspace = true
 osv-domain.workspace = true
+
+[dev-dependencies]
+osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }
 
 [lints]
 workspace = true

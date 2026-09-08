@@ -7,7 +7,8 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-Phase 0 and Phase 2 are complete as of 2026-09-07. Phase 1's five isolated
+Phases 0 and 2 are complete as of 2026-09-07, and Phase 3 is complete as of
+2026-09-08. Phase 1's five isolated
 prototypes passed their automated core paths, and ADRs accept GTK4, GStreamer,
 SQLCipher, and brokered authenticated media transport as the initial directions.
 Phase 1's manual and representative-media checks below remain explicitly
@@ -175,8 +176,42 @@ sharing feature changes that policy.
 
 ### Plaintext vault header
 
-The exact byte layout will be specified and test-vector-backed before Phase 3
-is complete. It may expose only what is required to unlock and version a vault:
+Version 1 is a fixed 256-byte little-endian structure:
+
+| Offset | Size | Meaning |
+|---:|---:|---|
+| 0 | 8 | Magic `OSVVAULT` |
+| 8 | 2 | Vault format version (`1`) |
+| 10 | 2 | Header length (`256`) |
+| 12 | 2 | Credential-input encoding version (`1`) |
+| 14 | 1 | Master-key-wrap suite (`1`, XChaCha20-Poly1305) |
+| 15 | 1 | Feature flags (bit 0 means keyfile required; all others mandatory-unknown) |
+| 16 | 16 | Immutable random vault ID |
+| 32 | 4 | Argon2id memory in KiB |
+| 36 | 4 | Argon2id iterations |
+| 40 | 4 | Argon2id parallelism |
+| 44 | 16 | Random Argon2id salt |
+| 60 | 24 | Random XChaCha20-Poly1305 nonce |
+| 84 | 32 | Encrypted master key |
+| 116 | 16 | Authentication tag |
+| 132 | 124 | Reserved authenticated bytes, all zero in version 1 |
+
+The wrap associated data is bytes `0..84` followed by `132..256`; the
+ciphertext and tag are excluded. Parsing requires exactly 256 bytes, rejects
+nonzero reserved bytes and unknown flag bits, and validates Argon2id bounds
+before allocating KDF memory. Accepted version-1 costs are 8 KiB through 1 GiB,
+1-10 iterations, and 1-16 lanes, with at least 8 KiB per lane. New vaults use
+64 MiB, three iterations, and one lane unless the caller selects another
+validated value.
+
+Credential encoding is the literal domain `osv-ng credential input`, one byte
+of encoding version, a little-endian `u64` password length and password bytes,
+then a little-endian `u64` keyfile length and keyfile bytes. Each component is
+capped at 1 MiB. Purpose keys use HKDF-SHA-256 over the master key with the
+fixed information prefix `osv-ng subkey\0v1\0`, the 16-byte vault ID, and one
+of `catalog`, `object-wrapping`, or `internal`.
+
+The header may expose only what is required to unlock and version a vault:
 
 - Magic, format version, and fixed header length.
 - Immutable random vault ID.
@@ -649,6 +684,88 @@ in all cases before Phase 17 release qualification.
 ### Phase 3 — Crypto, secure memory, and vault header
 
 **Goal:** Create and unlock an empty vault without catalog or media shortcuts.
+
+**Status:** Complete as of 2026-09-08, including independent security review.
+
+**Delivered**
+
+- `osv-crypto` now owns page-isolated Linux `mmap` allocations that are wiped
+  before release, marked `MADV_DONTDUMP`, and best-effort `mlock`ed. Whole-page
+  allocation gives every owner independent page-lock accounting; callers can
+  observe a truthful aggregate locked/degraded status. Secret bytes, strings,
+  fixed keys, passwords, master keys, and derived-key groups redact debug
+  output.
+- The workspace-wide unsafe-code denial remains in force. Narrowly annotated
+  Linux adapters contain the raw-pointer/syscall boundary for secure mappings,
+  dump hardening, and descriptor-relative filesystem operations.
+- An exact-fill `getrandom` CSPRNG adapter, bounded Argon2id credential
+  encoding, XChaCha20-Poly1305 master-key wrapping, HKDF-SHA-256 purpose
+  separation, fixed header parser, and deterministic project vectors are in
+  place. Argon2id runs in a project-owned non-dumpable, wipe-on-drop mapping;
+  failed authentication wipes partially decrypted key state.
+- Security status separately reports project-owned page locking and the
+  presence of bounded HKDF/HMAC library stack temporaries whose page locking
+  and complete wiping cannot be claimed. XChaCha and Poly1305 zeroization
+  features are enabled, and process dump hardening bounds the remaining opaque-
+  library limitation.
+- `osv-storage` can exclusively create and authenticate an empty vault through
+  owner-only, `O_NOFOLLOW` and descriptor-relative operations. Header file and
+  directory durability are established with file/directory/parent `fsync`.
+- Credential changes write and sync `vault.header.new`, preserve
+  `vault.header.prev`, atomically rename and sync each namespace transition,
+  then remove and sync the backup. Unlock accepts the backup after interruption
+  but marks those credentials as recovery-only so they cannot roll back a
+  newer current header.
+- Creation failures never unlink through a replaceable filesystem name. They
+  may intentionally leave an empty private directory or a durable header for
+  later explicit recovery rather than risk deleting substituted data.
+- All three shipped process entry points, plus vault create/unlock entry points,
+  set `RLIMIT_CORE` to zero and clear Linux dumpability before handling secrets.
+  Failure is fatal and logged without underlying path or secret data.
+
+**Verification recorded 2026-09-08**
+
+- Workspace format, warnings-as-errors Clippy, and all-target/all-feature tests
+  pass. Phase 3 adds 23 crypto/storage unit tests and a subprocess crash test
+  that kills rewrap at all seven persistence boundaries.
+- Tests cover composed Argon2id/XChaCha20-Poly1305 and HKDF project vectors,
+  wrong password/keyfile, authenticated-field tampering, truncation, unknown
+  versions/features, oversized KDF cost, randomness and allocation failures,
+  wipe-before-unmap, permissions, exclusive creation, symlink rejection,
+  unchanged purpose keys after rewrap, and absence of credential/key canaries
+  from the durable header. A dedicated fixed-size header-parser fuzz target
+  exercises arbitrary input without invoking Argon2; its ASan smoke completed
+  21,701,544 executions in 21 seconds without a finding.
+- `cargo audit` reports no known vulnerability, and `cargo deny check
+  advisories bans licenses sources` passes after recording the cryptographic
+  dependency set and its required BSD-3-Clause `subtle` transitive license.
+- The regenerated checksum-pinned Flatpak source list passes the complete
+  offline Phase 2 release test/build gate, and all three installed hardened
+  process stubs execute successfully inside the sandbox.
+
+**Independent review and remediation**
+
+- A GPT-6 Astra independent review initially rejected the gate after reproducing
+  two data-loss paths: same-handle retry after an interrupted rewrap, and
+  creation-error cleanup through a substituted directory name. It also found a
+  false locked-status result, blocking FIFO header opens, and unreported opaque
+  HKDF/HMAC temporaries.
+- Rewrap handles now become recovery-only immediately after the first namespace
+  transition; retry-after-failure is included at every fault point. Creation
+  errors perform no deletion. Header reads are nonblocking and require a singly
+  linked regular file. Lock aggregation covers credentials and KDF transients,
+  and opaque library temporaries have a separate visible status. Poly1305
+  zeroization is explicitly enabled.
+- The reviewer re-inspected the remediation, reran the 23 focused unit tests and
+  seven-boundary subprocess crash test, found no remaining blocker, and approved
+  the Phase 3 gate with the nonblocking follow-ups below.
+
+**Deferred follow-up**
+
+- Retain the opaque-library warning in the future vault UI. Add more independent
+  primitive vectors, allocation/syscall fault injection, longer sanitizer/fuzz
+  campaigns, and user-facing cleanup of incomplete creation artifacts as the
+  relevant services and UI arrive.
 
 **Deliverables**
 

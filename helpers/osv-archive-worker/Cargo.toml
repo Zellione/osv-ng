@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+osv-crypto.workspace = true
 osv-import.workspace = true
 
 [lints]

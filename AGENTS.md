@@ -35,6 +35,8 @@
 - Decoder/archive helpers receive only the minimum object-scoped authority. They must never receive the vault master key or unrestricted vault-directory access.
 
 ## Repository State and Workflow
+- Create and switch to a dedicated phase branch before starting implementation
+  work for each roadmap phase.
 - The Phase 2 production workspace is rooted at `Cargo.toml`. Phase 1 experiments remain isolated under `prototypes/` and are not workspace policy. Inspect prototype manifests before running their commands.
 - Supported production-workspace commands currently verified locally are `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --workspace --all-targets --all-features`, `cargo test -p osv-test-support tests::secret_canary_debug_is_redacted -- --exact`, `cargo audit`, and `cargo deny check advisories bans licenses sources`.
 - The separate fuzz workspace is formatted with `cargo fmt --manifest-path fuzz/Cargo.toml -- --check`, then checked with `cargo audit --file fuzz/Cargo.lock` and `cargo deny --manifest-path fuzz/Cargo.toml --config fuzz/deny.toml check advisories bans licenses sources`. Its locally verified ASan smoke command is `ASAN_OPTIONS=detect_leaks=0 cargo +nightly-2026-09-06 fuzz run secret-canary -- -max_total_time=20`; this validates the harness, not persistent-format coverage.
