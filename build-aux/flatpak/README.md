@@ -1,10 +1,18 @@
 # Phase 2 Flatpak workspace bootstrap
 
-This manifest verifies the production Cargo workspace and helper layout inside
-the accepted GNOME SDK. `io.github.osv_ng.Phase2` is a temporary bootstrap ID,
+This manifest verifies the production Cargo workspace, system-linked SQLCipher,
+and helper layout inside the accepted GNOME SDK. `io.github.osv_ng.Phase2` is a temporary bootstrap ID,
 not the release application ID. It installs no desktop metadata and grants no
 runtime permissions. Select and record the product ID before adding release
 metadata or treating the manifest as distributable packaging.
+
+SQLCipher 4.18.0 is checksum-pinned and built as a shared `/app` library with
+extension loading disabled and memory-only temporary storage. `rusqlite` uses
+its `sqlcipher` feature to discover that library through pkg-config; Arch uses
+the distribution `sqlcipher` package by the same mechanism. Upstream's build
+defaults to SQLite library names, so the module gives the pinned shared object
+an explicit `libsqlcipher.so.0` SONAME and installs `sqlcipher.pc`; this prevents
+accidental linkage or runtime resolution to the platform's plaintext SQLite.
 
 `cargo-sources.json` contains checksum-pinned crates generated from the root
 lockfile. Flatpak Builder downloads and verifies those sources before entering

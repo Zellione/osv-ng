@@ -3,6 +3,8 @@ name: Quality
 on:
   pull_request:
   push:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -20,6 +22,35 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Build pinned SQLCipher
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output sqlcipher-4.18.0.tar.gz \
+            https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.18.0.tar.gz
+          echo '1df02d1b346fa27feaf2da2cb2c0d8209e788248e461ec288718aa5d3e9643e5  sqlcipher-4.18.0.tar.gz' | sha256sum --check --strict
+          tar --extract --file sqlcipher-4.18.0.tar.gz
+          cd sqlcipher-4.18.0
+          CFLAGS='-O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown' \
+          LDFLAGS='-lcrypto -Wl,-soname,libsqlcipher.so.0' \
+            ./configure \
+              --prefix=/usr/local \
+              --disable-static \
+              --enable-shared \
+              --disable-tcl \
+              --disable-load-extension \
+              --with-tempstore=yes \
+              --fts5
+          make --jobs 2
+          sudo make install
+          sudo mv /usr/local/bin/sqlite3 /usr/local/bin/sqlcipher
+          sudo mv /usr/local/lib/libsqlite3.so.3.53.4 /usr/local/lib/libsqlcipher.so.0.8.6
+          sudo ln --symbolic libsqlcipher.so.0.8.6 /usr/local/lib/libsqlcipher.so.0
+          sudo ln --symbolic libsqlcipher.so.0 /usr/local/lib/libsqlcipher.so
+          sudo rm /usr/local/lib/libsqlite3.so /usr/local/lib/libsqlite3.so.0
+          sudo mv /usr/local/lib/pkgconfig/sqlite3.pc /usr/local/lib/pkgconfig/sqlcipher.pc
+          sudo sed --in-place 's/-lsqlite3/-lsqlcipher/' /usr/local/lib/pkgconfig/sqlcipher.pc
+          sudo ldconfig
       - name: Check formatting
         run: |
           cargo +1.98.0 fmt --all -- --check

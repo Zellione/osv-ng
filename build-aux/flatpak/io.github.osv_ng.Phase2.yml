@@ -13,6 +13,31 @@ build-options:
     CARGO_NET_OFFLINE: 'true'
 
 modules:
+  - name: sqlcipher
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --enable-shared
+      - --disable-tcl
+      - --disable-load-extension
+      - --with-tempstore=yes
+      - --fts5
+    build-options:
+      cflags: -O2 -DSQLITE_HAS_CODEC -DSQLITE_EXTRA_INIT=sqlcipher_extra_init -DSQLITE_EXTRA_SHUTDOWN=sqlcipher_extra_shutdown
+      ldflags: -lcrypto -Wl,-soname,libsqlcipher.so.0
+    post-install:
+      - mv /app/bin/sqlite3 /app/bin/sqlcipher
+      - mv /app/lib/libsqlite3.so.3.53.4 /app/lib/libsqlcipher.so.0.8.6
+      - ln -sf libsqlcipher.so.0.8.6 /app/lib/libsqlcipher.so.0
+      - ln -sf libsqlcipher.so.0 /app/lib/libsqlcipher.so
+      - rm /app/lib/libsqlite3.so /app/lib/libsqlite3.so.0
+      - mv /app/lib/pkgconfig/sqlite3.pc /app/lib/pkgconfig/sqlcipher.pc
+      - sed -i 's/-lsqlite3/-lsqlcipher/' /app/lib/pkgconfig/sqlcipher.pc
+    sources:
+      - type: archive
+        url: https://github.com/sqlcipher/sqlcipher/archive/refs/tags/v4.18.0.tar.gz
+        sha256: 1df02d1b346fa27feaf2da2cb2c0d8209e788248e461ec288718aa5d3e9643e5
+
   - name: osv-ng
     buildsystem: simple
     build-commands:

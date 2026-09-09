@@ -888,6 +888,91 @@ objects.
 
 **Goal:** Persist encrypted metadata with relational integrity and migrations.
 
+**Completed 2026-09-09**
+
+- Added an in-process SQLCipher catalog through `rusqlite` 0.40.2's system
+  `sqlcipher` feature. Arch resolves the distribution SQLCipher; Flatpak builds
+  pinned SQLCipher 4.18.0 with FTS5, `TEMP_STORE=2`, loadable extensions omitted,
+  and an explicit `libsqlcipher.so.0` identity so plaintext SQLite cannot satisfy
+  the link accidentally.
+- Raw 256-bit catalog keys use SQLCipher's binary key API. Its required raw-key
+  encoding is assembled only in locked, non-dumpable, wipe-on-drop storage.
+  Connection setup verifies SQLCipher and memory-only temp storage before schema
+  work, then enables full cipher memory security, foreign keys, WAL,
+  `synchronous=FULL`, secure deletion, recursive triggers, bounded busy waits,
+  defensive/untrusted-schema modes, and disabled writable attachments and
+  double-quoted string literals.
+- Added a strict, normalized schema for vault/migration state, objects and
+  wrapped DEKs, media facts/fingerprints/favorites, derived objects, ordered
+  nested galleries, tags, catalog preferences, versioned saved-search ASTs, and
+  operation journals. FTS5 content indexes and triggers keep searchable media
+  fields inside the encrypted catalog.
+- Added typed opaque IDs and repository transactions for durable-object records,
+  media/derived relations, ordered gallery children, cycle rejection, tags,
+  favorites, bounded FTS queries, descriptor reconstruction, rollback, and
+  clean checkpoints. A separate read-only repository view serves object,
+  hierarchy, and search queries without attempting a write transaction.
+  Forward-only migrations are checksum-recorded and atomic; unknown versions
+  and altered migration records fail closed.
+- Added cipher/SQLite/foreign-key integrity primitives and a checkpoint primitive
+  for the supported closed-vault offline backup workflow.
+
+**Verification recorded 2026-09-09**
+
+- Workspace format, warnings-as-errors Clippy, and all-target/all-feature tests
+  pass. The catalog suite has eleven integration/crash tests, a connection-policy
+  test, and one explicit scale benchmark. It covers constraints and bounds,
+  exact Unicode uniqueness, Unicode FTS, ordered children, multi-level cycles,
+  transaction rollback, descriptor round trips, wrong keys, authenticated page
+  corruption, exact-prefix error redaction, forced raw-key page-lock degradation,
+  and repository queries after read-only reopen.
+- Deterministic migration faults and real subprocess kills at all three migration
+  boundaries recover to the complete schema. A separate post-commit SIGKILL
+  recovers its live WAL. Database, WAL, shared-memory, temporary files, and open
+  catalog descriptors produced zero plaintext-canary hits before and after clean
+  checkpoint.
+- The release benchmark verified FTS virtual-index selection at 10k, 100k, and
+  1m media rows through the public ranked-search API. Cumulative insert times
+  were 399 ms, 3.877 s, and 58.476 s; ranked queries returning 100, 1,000, and
+  10,000 rows took 1 ms, 16 ms, and 164 ms on the development host. The query
+  plan uses the FTS virtual index without a temporary sorting B-tree. These are
+  host samples, not portable latency guarantees.
+- `cargo audit` found no known vulnerability and `cargo deny` passed advisories,
+  bans, licenses, and sources. Native linkage resolves `libsqlcipher.so.0`. The
+  checksum-pinned offline Flatpak release test/build gate passed against the
+  packaged library, and all three installed stubs execute in the sandbox.
+
+**Deviations and follow-up**
+
+- Phase 5 establishes catalog transactions but does not compose them with Phase
+  4 object publication. Phase 6 owns vault locking, durable-object-before-catalog
+  orchestration, operation recovery, path-race containment, and orphan cleanup.
+- The backup primitive checkpoints and truncates WAL state; v1 deliberately
+  supports only a closed/locked whole-directory copy, not SQLite's live backup
+  API.
+- FTS expressions are currently a bounded repository primitive. Phase 11 owns
+  the versioned structured-query parser, Unicode case/normalization UX policy,
+  saved-search operations, result cancellation, and application-owned decrypted
+  model wiping.
+- SQLCipher/SQLite allocations remain opaque. Full cipher memory security is on.
+  The catalog reports the aggregate lock status of the caller's catalog key and
+  project-owned raw-key encoding, but cannot report opaque library allocations.
+
+**Independent review and remediation**
+
+- GPT-6 Astra found that retained `rusqlite` errors could expose malformed FTS
+  query fragments through debug output and error chains, read-only connections
+  had no repository query interface, the transient raw-key allocation's lock
+  status was discarded, and the initial benchmark timed only an FTS count.
+- Catalog errors now retain only a nonsensitive SQLite error code and redact
+  both `Debug` and sources. Regression tests use the exact malformed-query
+  prefix SQLCipher includes in its diagnostic and force transient raw-key
+  page-lock failure in a subprocess.
+  `CatalogReader` supports queries in both connection modes, catalog security
+  status preserves raw-key lock degradation, and the scale benchmark exercises
+  the public ranked query. The reviewer-requested issues were fixed without
+  weakening the documented Phase 6 and Phase 11 boundaries.
+
 **Deliverables**
 
 - Audited SQLCipher build/link strategy for Arch and Flatpak.
