@@ -20,6 +20,14 @@ such as `rsync`. A restored copy is treated as untrusted and runs normal open an
 recovery validation. Live filesystem copies and network-filesystem semantics are
 not supported in v1.
 
+The Phase 6 service makes that state machine-checkable: clean writer close
+durably records a nonsensitive clean marker after checkpoint and teardown;
+writer open records dirty before recovery or mutation. Its offline copy helper
+takes the exclusive lock, requires the clean marker, follows no symlinks, copies
+only directories and singly linked regular files with restrictive exclusive
+creation, and syncs the completed tree. Interrupted destinations are preserved,
+must be treated as incomplete, and receive normal restore/open validation.
+
 ## Consequences
 
 - Backup uses common tools and opaque ciphertext only.
@@ -38,6 +46,6 @@ backup protocol would need a consistent-generation manifest and is deferred.
 
 ## Validation and reversal
 
-Phase 6 must test complete and interrupted copies, missing objects, stale
-sidecars, and cold restore. A future live-backup design requires a superseding
-ADR and explicit generation consistency.
+Phase 6 tested complete and interrupted copies, busy and dirty source rejection,
+missing objects, and cold restore. A future live-backup design requires a
+superseding ADR and explicit generation consistency.

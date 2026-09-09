@@ -9,6 +9,7 @@ members = [
     "crates/osv-media",
     "crates/osv-storage",
     "crates/osv-test-support",
+    "crates/osv-vault",
     "helpers/osv-archive-worker",
     "helpers/osv-media-worker",
 ]
@@ -41,6 +42,7 @@ osv-domain = { path = "crates/osv-domain", version = "=0.1.0" }
 osv-import = { path = "crates/osv-import", version = "=0.1.0" }
 osv-media = { path = "crates/osv-media", version = "=0.1.0" }
 osv-storage = { path = "crates/osv-storage", version = "=0.1.0" }
+osv-vault = { path = "crates/osv-vault", version = "=0.1.0" }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["modern_sqlite", "sqlcipher"] }
 sha2 = "0.10.9"

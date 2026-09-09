@@ -136,7 +136,7 @@ impl Catalog {
         config: CatalogConfig,
     ) -> Result<Self> {
         validate_catalog_file(path)?;
-        let flags = match mode {
+        let mut flags = match mode {
             CatalogMode::ReadOnly => {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
             }
@@ -144,6 +144,18 @@ impl Catalog {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
             }
         };
+        // SQLite rejects `/proc/self/fd/<directory>/catalog.db` as a symlink
+        // when NOFOLLOW is set even though only the intermediate procfs entry is
+        // a symlink. That form is already anchored by a live directory handle;
+        // ordinary paths still require SQLite's final-component protection.
+        let proc_fd_anchored = path
+            .components()
+            .take(4)
+            .map(|component| component.as_os_str())
+            .eq(["/", "proc", "self", "fd"].map(std::ffi::OsStr::new));
+        if !proc_fd_anchored {
+            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        }
         let connection = Connection::open_with_flags(path, flags)?;
         let raw_key_status = apply_raw_key(&connection, key)?;
         configure(&connection, mode, config)?;

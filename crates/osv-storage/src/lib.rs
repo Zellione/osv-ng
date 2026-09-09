@@ -3,9 +3,10 @@
 mod object;
 
 pub use object::{
-    DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MAX_LOGICAL_LEN, MIN_CHUNK_SIZE, OBJECT_FORMAT_VERSION,
-    OBJECT_HEADER_LEN, ObjectDescriptor, ObjectError, ObjectId, ObjectPreamble, ObjectReader,
-    ObjectRole, PUBLISH_POINTS, PublishFaultInjector, PublishPoint, WrappedObjectKey,
+    CiphertextInventory, CiphertextObject, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MAX_LOGICAL_LEN,
+    MIN_CHUNK_SIZE, OBJECT_FORMAT_VERSION, OBJECT_HEADER_LEN, ObjectDescriptor, ObjectError,
+    ObjectId, ObjectPreamble, ObjectReader, ObjectRole, PUBLISH_POINTS, PublishFaultInjector,
+    PublishPoint, WrappedObjectKey,
 };
 
 use std::{
@@ -119,8 +120,18 @@ impl UnlockedVault {
         password: &Password,
         keyfile: Option<&SecretBytes>,
     ) -> Result<Self, VaultError> {
-        harden_process()?;
         let directory = platform::open_directory(path)?;
+        Self::unlock_from_directory(directory, password, keyfile)
+    }
+
+    /// Unlocks an already anchored directory handle. Intended for the vault
+    /// service, which must acquire its process lock before deriving secrets.
+    pub fn unlock_from_directory(
+        directory: File,
+        password: &Password,
+        keyfile: Option<&SecretBytes>,
+    ) -> Result<Self, VaultError> {
+        harden_process()?;
         let current = read_header(&directory, HEADER_NAME)
             .and_then(|header| unlock_header(header, password, keyfile));
         let (header, master_key, kdf_status, source) = match current {
@@ -149,6 +160,28 @@ impl UnlockedVault {
             security_status,
             source,
         })
+    }
+
+    /// Duplicates the anchored vault-directory authority for trusted service code.
+    pub fn try_clone_directory(&self) -> io::Result<File> {
+        self.directory.try_clone()
+    }
+
+    #[must_use]
+    pub fn object_locator(id: ObjectId, role: ObjectRole) -> String {
+        object::object_locator(id, role)
+    }
+
+    pub fn ciphertext_inventory(&self) -> Result<CiphertextInventory, ObjectError> {
+        object::inventory(&self.directory)
+    }
+
+    pub fn remove_ciphertext(&self, id: ObjectId, role: ObjectRole) -> Result<bool, ObjectError> {
+        object::remove_object(&self.directory, id, role)
+    }
+
+    pub fn remove_staging_ciphertext(&self, id: ObjectId) -> Result<bool, ObjectError> {
+        object::remove_staging(&self.directory, id)
     }
 
     /// Atomically replaces credential wrapping without changing the master key.
@@ -462,8 +495,16 @@ mod platform {
     use super::*;
     use std::{
         ffi::{CString, OsStr},
+        fs,
         os::{fd::FromRawFd, unix::ffi::OsStrExt},
     };
+
+    pub(super) fn directory_names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
+        let path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+        fs::read_dir(path)?
+            .map(|entry| entry.map(|value| value.file_name()))
+            .collect()
+    }
 
     fn dynamic_name(name: &str) -> io::Result<CString> {
         if name.is_empty() || name == "." || name == ".." || name.as_bytes().contains(&b'/') {
@@ -660,6 +701,15 @@ mod platform {
 
     pub(super) fn unlink_at(directory: &File, name: &str) -> io::Result<()> {
         let name = CString::new(name).expect("fixed file name");
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    pub(super) fn unlink_dynamic_at(directory: &File, name: &str) -> io::Result<()> {
+        let name = dynamic_name(name)?;
         if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } == 0 {
             Ok(())
         } else {

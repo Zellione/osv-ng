@@ -20,6 +20,12 @@ mode takes an exclusive lock. Reader mode takes a shared lock. Multiple readers
 may coexist; a writer and any other opener may not. Release the lock last after
 writer checkpoint/close and secret-state teardown.
 
+The Linux implementation opens an owner-only, singly linked regular
+`vault.lock` through an anchored vault-directory descriptor and uses
+nonblocking `flock`. Writers durably mark the file dirty before recovery or
+mutation and clean only after repair, SQLCipher checkpoint/close, and secret
+teardown. Readers open it read-only and never change vault state.
+
 Network filesystems, lock upgrades, concurrent writers, and fairness guarantees
 are outside the first release.
 
@@ -41,6 +47,6 @@ safe read-only tooling.
 
 ## Validation and reversal
 
-Phase 6 must prove reader/reader success and reader/writer plus writer/writer
-exclusion across processes, including crashes. Broader concurrency requires a
-new persistence model and superseding ADR.
+Phase 6 proved reader/reader success and reader/writer plus writer/writer
+exclusion across independent processes, including lock release after process
+kill. Broader concurrency requires a new persistence model and superseding ADR.

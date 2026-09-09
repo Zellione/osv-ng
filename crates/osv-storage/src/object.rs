@@ -61,12 +61,28 @@ impl fmt::Debug for ObjectId {
 }
 
 /// Authenticated namespace role; role substitution always fails authentication.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum ObjectRole {
     Original = 1,
     Thumbnail = 2,
     Poster = 3,
+}
+
+/// Opaque ciphertext identity found during an anchored maintenance scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CiphertextObject {
+    pub id: ObjectId,
+    pub role: ObjectRole,
+}
+
+/// Names recognized during a maintenance scan. Unexpected entries are counted
+/// but never followed or removed automatically.
+#[derive(Debug, Default)]
+pub struct CiphertextInventory {
+    pub objects: Vec<CiphertextObject>,
+    pub staging_ids: Vec<ObjectId>,
+    pub unexpected_entries: usize,
 }
 
 impl ObjectRole {
@@ -874,6 +890,166 @@ fn role_directory_open(vault: &File, role: ObjectRole) -> Result<File, ObjectErr
     match child_name {
         Some(name) => platform::open_dynamic_directory_at(&root, name).map_err(Into::into),
         None => Ok(root),
+    }
+}
+
+pub(crate) fn object_locator(id: ObjectId, role: ObjectRole) -> String {
+    let (root, child) = role.namespace();
+    match child {
+        Some(child) => format!("{root}/{child}/{}/{}", shard(id), filename(id, ".osvo")),
+        None => format!("{root}/{}/{}", shard(id), filename(id, ".osvo")),
+    }
+}
+
+pub(crate) fn remove_object(
+    vault: &File,
+    id: ObjectId,
+    role: ObjectRole,
+) -> Result<bool, ObjectError> {
+    let namespace = match role_directory_open(vault, role) {
+        Ok(value) => value,
+        Err(ObjectError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let shard = match platform::open_dynamic_directory_at(&namespace, &shard(id)) {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let name = filename(id, ".osvo");
+    match platform::open_dynamic_at(&shard, &name, false, false) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    platform::unlink_dynamic_at(&shard, &name)?;
+    shard.sync_all()?;
+    Ok(true)
+}
+
+pub(crate) fn inventory(vault: &File) -> Result<CiphertextInventory, ObjectError> {
+    let mut result = CiphertextInventory::default();
+    for role in [
+        ObjectRole::Original,
+        ObjectRole::Thumbnail,
+        ObjectRole::Poster,
+    ] {
+        let namespace = match role_directory_open(vault, role) {
+            Ok(value) => value,
+            Err(ObjectError::Io(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for shard_entry in platform::directory_names(&namespace)? {
+            let Some(shard_name) = shard_entry.to_str() else {
+                result.unexpected_entries += 1;
+                continue;
+            };
+            if shard_name.len() != 2 || decode_hex(shard_name.as_bytes()).is_none() {
+                result.unexpected_entries += 1;
+                continue;
+            }
+            let shard_directory = match platform::open_dynamic_directory_at(&namespace, shard_name)
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    result.unexpected_entries += 1;
+                    continue;
+                }
+            };
+            for file_entry in platform::directory_names(&shard_directory)? {
+                let Some(name) = file_entry.to_str() else {
+                    result.unexpected_entries += 1;
+                    continue;
+                };
+                let Some(stem) = name.strip_suffix(".osvo") else {
+                    result.unexpected_entries += 1;
+                    continue;
+                };
+                let Some(id) = parse_object_id(stem) else {
+                    result.unexpected_entries += 1;
+                    continue;
+                };
+                if shard(id) != shard_name
+                    || platform::open_dynamic_at(&shard_directory, name, false, false).is_err()
+                {
+                    result.unexpected_entries += 1;
+                    continue;
+                }
+                result.objects.push(CiphertextObject { id, role });
+            }
+        }
+    }
+    let staging = match platform::open_dynamic_directory_at(vault, "staging") {
+        Ok(value) => Some(value),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(staging) = staging {
+        for entry in platform::directory_names(&staging)? {
+            let Some(name) = entry.to_str() else {
+                result.unexpected_entries += 1;
+                continue;
+            };
+            let Some(stem) = name.strip_suffix(".osvo.part") else {
+                result.unexpected_entries += 1;
+                continue;
+            };
+            let Some(id) = parse_object_id(stem) else {
+                result.unexpected_entries += 1;
+                continue;
+            };
+            if platform::open_dynamic_at(&staging, name, false, false).is_err() {
+                result.unexpected_entries += 1;
+                continue;
+            }
+            result.staging_ids.push(id);
+        }
+    }
+    Ok(result)
+}
+
+pub(crate) fn remove_staging(vault: &File, id: ObjectId) -> Result<bool, ObjectError> {
+    let staging = match platform::open_dynamic_directory_at(vault, "staging") {
+        Ok(value) => value,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let name = filename(id, ".osvo.part");
+    match platform::open_dynamic_at(&staging, &name, false, false) {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    platform::unlink_dynamic_at(&staging, &name)?;
+    staging.sync_all()?;
+    Ok(true)
+}
+
+fn parse_object_id(value: &str) -> Option<ObjectId> {
+    if value.len() != OBJECT_ID_LEN * 2 {
+        return None;
+    }
+    let decoded = decode_hex(value.as_bytes())?;
+    Some(ObjectId(decoded.try_into().ok()?))
+}
+
+fn decode_hex(value: &[u8]) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Some(hex_nibble(pair[0])? << 4 | hex_nibble(pair[1])?))
+        .collect()
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
     }
 }
 

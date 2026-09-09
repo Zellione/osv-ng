@@ -994,6 +994,68 @@ objects.
 **Goal:** Combine catalog and objects without pretending they share a
 transaction.
 
+**Completed 2026-09-09**
+
+- Added the `osv-vault` composition crate. Writer imports durably publish and
+  authenticate ciphertext before beginning the catalog transaction. Deletion
+  and derived replacement atomically remove wrapped DEKs and metadata while
+  recording encrypted cleanup intents, then unlink and sync ciphertext. The
+  recovery records are bounded, redacted, versioned by operation/state, and
+  replayed idempotently.
+- Writer startup repairs pending cleanup, removes recognized abandoned staging
+  and final ciphertext, and scans every catalog object. Missing files,
+  authenticated corruption, and locator mismatches are reported with opaque
+  identities and marked damaged; unknown names, symlinks, hard links, and
+  malformed namespaces are reported but never followed or removed.
+- Added a lifetime `flock` protocol on an owner-only, singly linked regular
+  lock file. Readers take shared locks and never mutate vault state; writers
+  take exclusive locks before credential derivation. Catalog access uses a
+  live directory descriptor through `/proc/self/fd`, while final catalog names,
+  object traversal, maintenance, deletion, and backup reject symlinks and
+  non-regular entries.
+- Clean writer close repairs outstanding work, checkpoints/truncates SQLCipher
+  WAL state, releases secret-bearing storage, durably marks the vault clean,
+  and releases the lock last. Writer crashes leave a durable dirty marker.
+  Offline backup requires an exclusive lock and a clean marker, recursively
+  copies only directories and singly linked regular files with exclusive
+  owner-only creation, syncs every file and directory, and preserves incomplete
+  destinations for restore diagnostics.
+
+**Verification recorded 2026-09-09**
+
+- Workspace formatting, warnings-as-errors Clippy, and all-target/all-feature
+  tests pass. Phase 6 adds twelve service and subprocess tests.
+  Independent processes prove reader/reader success and reader/writer plus
+  writer/writer exclusion, including lock release after `SIGKILL`.
+- Real subprocess kills at each import, deletion, derived-replacement, and
+  recovery composition boundary prove
+  convergence to either the old or new catalog state, removal of encrypted
+  journals, and removal of unreferenced ciphertext. Phase 4's seven-boundary
+  publication crash matrix and Phase 5's migration/WAL crash tests continue to
+  cover the lower filesystem and SQLCipher boundaries composed here.
+- Tests cover successful import/read, read-only rejection, derived replacement,
+  deletion after key removal, idempotent cleanup, orphan and staging recovery,
+  missing and corrupt originals, restrictive-permission failure, an `ENOSPC`
+  I/O path, complete cold backup/restore, interrupted copy rejection, busy
+  backup rejection, and dirty-marker recovery. At no tested boundary does a
+  catalog reference precede durable object publication.
+- Production and fuzz dependency graphs pass `cargo audit` and `cargo deny`.
+  The checksum-pinned offline Flatpak release test/build gate passes with the
+  new crate, and all three installed stubs execute successfully in the sandbox.
+
+**Deviations and follow-up**
+
+- `flock`, `/proc/self/fd` anchoring, and the current backup walker are Linux
+  mechanisms, consistent with the first-release platform scope. Network
+  filesystems remain unsupported as established in ADR 0004.
+- Maintenance authenticates referenced objects sequentially and can be costly
+  for a large vault. Phase 8 should expose progress/cancellation without
+  weakening startup cleanup. Unknown filesystem artifacts require explicit
+  user action rather than heuristic deletion.
+- The clean offline copy is intentionally not a live snapshot. A destination
+  left by interruption is never resumed in place; remove it explicitly or pick
+  a new destination after reviewing diagnostics.
+
 **Deliverables**
 
 - Import publication, deletion, derived replacement, metadata transactions,

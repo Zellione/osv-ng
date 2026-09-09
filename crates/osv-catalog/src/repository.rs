@@ -17,6 +17,35 @@ pub struct SearchResult {
     pub favorite: bool,
 }
 
+/// Encrypted recovery intent. Payload interpretation belongs to the vault service.
+pub struct JournalEntry {
+    pub id: [u8; 16],
+    pub operation_kind: u8,
+    pub state: u8,
+    pub payload: Vec<u8>,
+    pub updated_at_ms: i64,
+}
+
+/// Minimum authority needed to remove ciphertext after its wrapped DEK is gone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupObject {
+    pub id: ObjectId,
+    pub role: ObjectRole,
+}
+
+impl std::fmt::Debug for JournalEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JournalEntry")
+            .field("id", &"[OPAQUE]")
+            .field("operation_kind", &self.operation_kind)
+            .field("state", &self.state)
+            .field("payload", &"[REDACTED]")
+            .field("updated_at_ms", &self.updated_at_ms)
+            .finish()
+    }
+}
+
 pub(crate) const SEARCH_SQL: &str = "SELECT media.id,media.media_class,media.favorite FROM media_search JOIN media ON media.rowid=media_search.rowid WHERE media_search MATCH ?1 ORDER BY rank LIMIT ?2";
 
 pub struct CatalogTransaction<'connection> {
@@ -43,6 +72,14 @@ impl<'connection> CatalogReader<'connection> {
 
     pub fn search_media(&self, query: &str, maximum: u32) -> Result<Vec<SearchResult>> {
         read_search_media(self.connection, query, maximum)
+    }
+
+    pub fn all_objects(&self) -> Result<Vec<StoredObject>> {
+        read_all_objects(self.connection)
+    }
+
+    pub fn operation_journal(&self) -> Result<Vec<JournalEntry>> {
+        read_operation_journal(self.connection)
     }
 }
 
@@ -217,6 +254,102 @@ impl CatalogTransaction<'_> {
         Ok(())
     }
 
+    pub fn set_object_state(&self, id: ObjectId, state: ObjectState) -> Result<()> {
+        let changed = self.transaction.execute(
+            "UPDATE objects SET state=?2 WHERE id=?1",
+            params![id.as_bytes().as_slice(), state as i64],
+        )?;
+        if changed == 0 {
+            return Err(CatalogError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn insert_operation(
+        &self,
+        id: [u8; 16],
+        operation_kind: u8,
+        state: u8,
+        payload: &[u8],
+        updated_at_ms: i64,
+    ) -> Result<()> {
+        if !(1..=32).contains(&operation_kind)
+            || !(1..=32).contains(&state)
+            || payload.len() > 65_536
+            || updated_at_ms < 0
+        {
+            return Err(CatalogError::InvalidInput("operation journal"));
+        }
+        self.transaction.execute(
+            "INSERT INTO operation_journal(id,operation_kind,state,object_id,payload,updated_at_ms) VALUES(?1,?2,?3,NULL,?4,?5)",
+            params![id.as_slice(), i64::from(operation_kind), i64::from(state), payload, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_operation(&self, id: [u8; 16]) -> Result<()> {
+        self.transaction
+            .execute("DELETE FROM operation_journal WHERE id=?1", [id.as_slice()])?;
+        Ok(())
+    }
+
+    /// Deletes media metadata and every associated object row in one transaction.
+    /// The returned descriptors remain usable only for ciphertext cleanup.
+    pub fn delete_media(&self, media: MediaId) -> Result<Vec<CleanupObject>> {
+        let mut statement = self.transaction.prepare(
+            "SELECT o.id,o.role FROM objects o WHERE o.id=(SELECT original_object_id FROM media WHERE id=?1) OR o.id IN(SELECT object_id FROM derived_objects WHERE media_id=?1) ORDER BY o.role,o.id",
+        )?;
+        let rows = statement.query_map([media.as_bytes().as_slice()], cleanup_object_from_row)?;
+        let objects: Vec<_> = rows.collect::<std::result::Result<_, _>>()?;
+        drop(statement);
+        if objects.is_empty() {
+            return Err(CatalogError::NotFound);
+        }
+        self.transaction.execute(
+            "DELETE FROM media WHERE id=?1",
+            [media.as_bytes().as_slice()],
+        )?;
+        for object in &objects {
+            self.transaction.execute(
+                "DELETE FROM objects WHERE id=?1",
+                [object.id.as_bytes().as_slice()],
+            )?;
+        }
+        Ok(objects)
+    }
+
+    /// Replaces all derived objects of the same role for a media item atomically.
+    pub fn replace_derived(
+        &self,
+        object: NewObject<'_>,
+        derived: NewDerivedObject,
+    ) -> Result<Vec<CleanupObject>> {
+        let role = object.descriptor.role();
+        if !matches!(role, ObjectRole::Thumbnail | ObjectRole::Poster)
+            || derived.object_id != object.descriptor.id()
+        {
+            return Err(CatalogError::InvalidInput("derived replacement"));
+        }
+        let mut statement = self.transaction.prepare(
+            "SELECT o.id,o.role FROM objects o JOIN derived_objects d ON d.object_id=o.id WHERE d.media_id=?1 AND o.role=?2 ORDER BY o.id",
+        )?;
+        let rows = statement.query_map(
+            params![derived.media_id.as_bytes().as_slice(), role as i64],
+            cleanup_object_from_row,
+        )?;
+        let old: Vec<_> = rows.collect::<std::result::Result<_, _>>()?;
+        drop(statement);
+        for prior in &old {
+            self.transaction.execute(
+                "DELETE FROM objects WHERE id=?1",
+                [prior.id.as_bytes().as_slice()],
+            )?;
+        }
+        self.insert_object(object)?;
+        self.insert_derived_object(derived)?;
+        Ok(old)
+    }
+
     pub fn search_media(&self, query: &str, maximum: u32) -> Result<Vec<SearchResult>> {
         read_search_media(&self.transaction, query, maximum)
     }
@@ -237,6 +370,59 @@ fn read_object(connection: &Connection, id: ObjectId) -> Result<StoredObject> {
         locator: row.5,
         state: ObjectState::parse(row.6)?,
     })
+}
+
+fn stored_object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredObject> {
+    let id = row.get::<_, Vec<u8>>(0)?;
+    let role = row.get::<_, i64>(1)?;
+    let size = row.get::<_, i64>(2)?;
+    let version = row.get::<_, i64>(3)?;
+    let wrapped = row.get::<_, Vec<u8>>(4)?;
+    let descriptor = parse_descriptor(id, role, size, version, wrapped)
+        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let state = ObjectState::parse(row.get(6)?).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(StoredObject {
+        descriptor,
+        locator: row.get(5)?,
+        state,
+    })
+}
+
+fn cleanup_object_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CleanupObject> {
+    let id: Vec<u8> = row.get(0)?;
+    Ok(CleanupObject {
+        id: ObjectId::from_bytes(id.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?),
+        role: crate::types::parse_role(row.get(1)?).map_err(|_| rusqlite::Error::InvalidQuery)?,
+    })
+}
+
+fn read_all_objects(connection: &Connection) -> Result<Vec<StoredObject>> {
+    let mut statement = connection.prepare(
+        "SELECT id,role,logical_size,format_generation,wrapped_dek,locator,state FROM objects ORDER BY id",
+    )?;
+    let rows = statement.query_map([], stored_object_from_row)?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(CatalogError::from)
+}
+
+fn read_operation_journal(connection: &Connection) -> Result<Vec<JournalEntry>> {
+    let mut statement = connection.prepare(
+        "SELECT id,operation_kind,state,payload,updated_at_ms FROM operation_journal ORDER BY updated_at_ms,id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let id: Vec<u8> = row.get(0)?;
+        Ok(JournalEntry {
+            id: id.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?,
+            operation_kind: u8::try_from(row.get::<_, i64>(1)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            state: u8::try_from(row.get::<_, i64>(2)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
+            payload: row.get(3)?,
+            updated_at_ms: row.get(4)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(CatalogError::from)
 }
 
 fn read_gallery_children(

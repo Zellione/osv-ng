@@ -1,0 +1,33 @@
+[package]
+name = "osv-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+test-fixtures = []
+
+[[bin]]
+name = "osv-vault-lock-fixture"
+path = "src/bin/osv-vault-lock-fixture.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "osv-vault-crash-fixture"
+path = "src/bin/osv-vault-crash-fixture.rs"
+required-features = ["test-fixtures"]
+
+[dependencies]
+libc.workspace = true
+osv-catalog.workspace = true
+osv-crypto.workspace = true
+osv-storage.workspace = true
+
+[dev-dependencies]
+osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }
+
+[lints]
+workspace = true
