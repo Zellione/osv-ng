@@ -50,7 +50,7 @@ Phase 6 tested complete and interrupted copies, busy and dirty source rejection,
 missing objects, and cold restore. A future live-backup design requires a
 superseding ADR and explicit generation consistency.
 
-The initial Phase 6 implementation is not yet accepted: independent review
-demonstrated that lexical destination checking permits an aliased descendant
-path to recurse into the source vault. The Phase 6 blocker record in
-`ROADMAP.md` must be resolved before this implementation is treated as valid.
+The Phase 6 remediation replaces lexical descendant checking with opened
+filesystem-identity ancestry comparison before destination creation. Relative,
+`..`, and symlink-aliased descendant regression cases fail closed. This change
+awaits the independent gate re-review recorded in `ROADMAP.md`.

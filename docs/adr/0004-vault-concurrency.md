@@ -51,8 +51,14 @@ Phase 6 proved reader/reader success and reader/writer plus writer/writer
 exclusion across independent processes, including lock release after process
 kill. Broader concurrency requires a new persistence model and superseding ADR.
 
-The initial Phase 6 implementation is not yet accepted: independent review
-found that object readers can retain decryption authority after their service
-session closes and its lock is released, and that the current SQLCipher reader
-creates WAL/SHM sidecars. The Phase 6 blocker record in `ROADMAP.md` governs
-remediation and re-review.
+The Phase 6 remediation ties object readers to the borrowing service lifetime,
+so the session and lock cannot close while decryption authority remains. Reader
+admission requires a clean checkpoint and uses SQLCipher's immutable mode,
+which neither accesses nor changes the checkpointed persistent WAL/SHM files
+and works without directory write access. Writers validate and pin the sidecar
+identities before use. A per-connection Linux VFS opens fixed catalog members
+through the held directory descriptor, validates their inode type and link
+count, and performs SQLite I/O directly on those descriptors while preserving
+directory-sync errors; persistent-WAL teardown cannot unlink a substituted
+name. GPT-6 approved this blocker remediation. The remaining Phase 6 acceptance
+gaps are recorded in `ROADMAP.md`.

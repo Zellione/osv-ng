@@ -1,6 +1,7 @@
 //! Version-one independently encrypted, seekable object format.
 
 use std::{
+    cell::Cell,
     error::Error,
     fmt,
     fs::File,
@@ -251,8 +252,17 @@ impl fmt::Debug for ObjectDescriptor {
 struct ObjectDek(SecretKey<DEK_LEN>);
 
 impl ObjectDek {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn generate(random: &mut impl RandomSource) -> Result<Self, ObjectError> {
+        Self::generate_observed(random, None)
+    }
+
+    fn generate_observed(
+        random: &mut impl RandomSource,
+        observer: Option<&Cell<LockStatus>>,
+    ) -> Result<Self, ObjectError> {
         let mut key = SecretKey::zeroed().map_err(ObjectError::Memory)?;
+        observe(observer, key.lock_status());
         random.fill(key.expose_mut())?;
         Ok(Self(key))
     }
@@ -292,21 +302,35 @@ impl<R: Read + Seek> fmt::Debug for ObjectReader<R> {
 }
 
 impl<R: Read + Seek> ObjectReader<R> {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn open(
-        mut source: R,
+        source: R,
         dek: ObjectDek,
         vault_id: VaultId,
         object_id: ObjectId,
         role: ObjectRole,
     ) -> Result<Self, ObjectError> {
+        Self::open_observed(source, dek, vault_id, object_id, role, None)
+    }
+
+    fn open_observed(
+        mut source: R,
+        dek: ObjectDek,
+        vault_id: VaultId,
+        object_id: ObjectId,
+        role: ObjectRole,
+        observer: Option<&Cell<LockStatus>>,
+    ) -> Result<Self, ObjectError> {
         source.seek(SeekFrom::Start(0))?;
-        let header = read_authenticated_header(&mut source, &dek, vault_id, object_id, role)?;
+        let header =
+            read_authenticated_header(&mut source, &dek, vault_id, object_id, role, observer)?;
         let expected_len = physical_len(header.logical_len, header.chunk_size, header.chunk_count)?;
         if source.seek(SeekFrom::End(0))? != expected_len {
             return Err(ObjectError::InvalidLength);
         }
         source.seek(SeekFrom::Start(OBJECT_HEADER_LEN as u64))?;
         let cache = SecretBytes::zeroed(0).map_err(ObjectError::Memory)?;
+        observe(observer, cache.lock_status());
         let aggregate_lock_status = dek
             .0
             .lock_status()
@@ -499,21 +523,22 @@ pub(crate) fn publish_object(
     chunk_size: u32,
     random: &mut impl RandomSource,
     faults: &mut impl PublishFaultInjector,
+    observer: Option<&Cell<LockStatus>>,
 ) -> Result<ObjectDescriptor, ObjectError> {
     let chunk_count = validate_plan(logical_len, chunk_size)?;
     let mut id = [0_u8; OBJECT_ID_LEN];
     random.fill(&mut id)?;
     let id = ObjectId(id);
-    let dek = ObjectDek::generate(random)?;
+    let dek = ObjectDek::generate_observed(random, observer)?;
     let (wrapped_key, wrapping_lock_status) =
-        wrap_dek(&dek, wrapping_key, vault_id, id, role, random)?;
+        wrap_dek_observed(&dek, wrapping_key, vault_id, id, role, random, observer)?;
     let preamble = ObjectPreamble::create(random)?;
 
     let staging = ensure_directory(vault_directory, "staging")?;
     let staging_name = filename(id, ".osvo.part");
     let mut file = platform::open_dynamic_at(&staging, &staging_name, true, true)?;
     fail(faults, PublishPoint::StagingCreated)?;
-    let encryption_lock_status = encrypt_stream(
+    let encryption_lock_status = encrypt_stream_observed(
         source,
         &mut file,
         &dek,
@@ -524,6 +549,7 @@ pub(crate) fn publish_object(
         chunk_size,
         chunk_count,
         preamble,
+        observer,
     )?;
     fail(faults, PublishPoint::CiphertextWritten)?;
     file.sync_all()?;
@@ -531,9 +557,19 @@ pub(crate) fn publish_object(
     // Verify the exact inode created by this operation. The staging pathname is
     // untrusted and may be replaced while the writer descriptor remains open.
     let verification_file = file.try_clone()?;
-    let verification_dek = unwrap_dek(&wrapped_key, wrapping_key, vault_id, id, role)?;
-    let mut verifier = ObjectReader::open(verification_file, verification_dek, vault_id, id, role)?;
-    verifier.verify_all()?;
+    let verification_dek =
+        unwrap_dek_observed(&wrapped_key, wrapping_key, vault_id, id, role, observer)?;
+    let mut verifier = ObjectReader::open_observed(
+        verification_file,
+        verification_dek,
+        vault_id,
+        id,
+        role,
+        observer,
+    )?;
+    let verification = verifier.verify_all();
+    observe(observer, verifier.security_status().page_locks());
+    verification?;
     let verification_lock_status = verifier.security_status().page_locks();
     fail(faults, PublishPoint::CiphertextVerified)?;
 
@@ -576,18 +612,27 @@ pub(crate) fn open_object(
     vault_id: VaultId,
     wrapping_key: &SecretKey<32>,
     descriptor: &ObjectDescriptor,
+    observer: Option<&Cell<LockStatus>>,
 ) -> Result<ObjectReader<File>, ObjectError> {
     let namespace = role_directory_open(vault_directory, descriptor.role)?;
     let shard = platform::open_dynamic_directory_at(&namespace, &shard(descriptor.id))?;
     let file = platform::open_dynamic_at(&shard, &filename(descriptor.id, ".osvo"), false, false)?;
-    let dek = unwrap_dek(
+    let dek = unwrap_dek_observed(
         &descriptor.wrapped_key,
         wrapping_key,
         vault_id,
         descriptor.id,
         descriptor.role,
+        observer,
     )?;
-    let mut reader = ObjectReader::open(file, dek, vault_id, descriptor.id, descriptor.role)?;
+    let mut reader = ObjectReader::open_observed(
+        file,
+        dek,
+        vault_id,
+        descriptor.id,
+        descriptor.role,
+        observer,
+    )?;
     reader.aggregate_lock_status = reader
         .aggregate_lock_status
         .combine(wrapping_key.lock_status());
@@ -598,6 +643,7 @@ pub(crate) fn open_object(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 fn encrypt_stream(
     source: &mut impl Read,
     destination: &mut (impl Write + Seek),
@@ -610,10 +656,40 @@ fn encrypt_stream(
     chunk_count: u32,
     preamble: ObjectPreamble,
 ) -> Result<LockStatus, ObjectError> {
+    encrypt_stream_observed(
+        source,
+        destination,
+        dek,
+        vault_id,
+        object_id,
+        role,
+        logical_len,
+        chunk_size,
+        chunk_count,
+        preamble,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encrypt_stream_observed(
+    source: &mut impl Read,
+    destination: &mut (impl Write + Seek),
+    dek: &ObjectDek,
+    vault_id: VaultId,
+    object_id: ObjectId,
+    role: ObjectRole,
+    logical_len: u64,
+    chunk_size: u32,
+    chunk_count: u32,
+    preamble: ObjectPreamble,
+    observer: Option<&Cell<LockStatus>>,
+) -> Result<LockStatus, ObjectError> {
     destination.seek(SeekFrom::Start(0))?;
     destination.write_all(&preamble.bytes)?;
     let mut header_plaintext =
         SecretBytes::zeroed(ENCRYPTED_HEADER_LEN).map_err(ObjectError::Memory)?;
+    observe(observer, header_plaintext.lock_status());
     let mut lock_status = dek.0.lock_status().combine(header_plaintext.lock_status());
     header_plaintext.expose_mut()[..16].copy_from_slice(object_id.as_bytes());
     header_plaintext.expose_mut()[16] = role as u8;
@@ -639,6 +715,7 @@ fn encrypt_stream(
     for index in 0..chunk_count {
         let plaintext_len = chunk_plaintext_len(logical_len, chunk_size, index)?;
         let mut plaintext = SecretBytes::zeroed(plaintext_len).map_err(ObjectError::Memory)?;
+        observe(observer, plaintext.lock_status());
         lock_status = lock_status.combine(plaintext.lock_status());
         source.read_exact(plaintext.expose_mut())?;
         let tag = cipher
@@ -660,6 +737,7 @@ fn encrypt_stream(
         destination.write_all(&tag)?;
     }
     let mut extra = SecretBytes::zeroed(1).map_err(ObjectError::Memory)?;
+    observe(observer, extra.lock_status());
     lock_status = lock_status.combine(extra.lock_status());
     if source.read(extra.expose_mut())? != 0 {
         return Err(ObjectError::SourceLengthMismatch);
@@ -673,11 +751,13 @@ fn read_authenticated_header(
     vault_id: VaultId,
     expected_id: ObjectId,
     expected_role: ObjectRole,
+    observer: Option<&Cell<LockStatus>>,
 ) -> Result<AuthenticatedHeader, ObjectError> {
     let mut preamble_bytes = [0_u8; PREAMBLE_LEN];
     source.read_exact(&mut preamble_bytes)?;
     let preamble = ObjectPreamble::parse(&preamble_bytes)?;
     let mut plaintext = SecretBytes::zeroed(ENCRYPTED_HEADER_LEN).map_err(ObjectError::Memory)?;
+    observe(observer, plaintext.lock_status());
     let lock_status = plaintext.lock_status();
     source.read_exact(plaintext.expose_mut())?;
     let mut tag = [0_u8; TAG_LEN];
@@ -718,6 +798,7 @@ fn read_authenticated_header(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn wrap_dek(
     dek: &ObjectDek,
     wrapping_key: &SecretKey<32>,
@@ -726,9 +807,22 @@ fn wrap_dek(
     role: ObjectRole,
     random: &mut impl RandomSource,
 ) -> Result<(WrappedObjectKey, LockStatus), ObjectError> {
+    wrap_dek_observed(dek, wrapping_key, vault_id, object_id, role, random, None)
+}
+
+fn wrap_dek_observed(
+    dek: &ObjectDek,
+    wrapping_key: &SecretKey<32>,
+    vault_id: VaultId,
+    object_id: ObjectId,
+    role: ObjectRole,
+    random: &mut impl RandomSource,
+    observer: Option<&Cell<LockStatus>>,
+) -> Result<(WrappedObjectKey, LockStatus), ObjectError> {
     let mut bytes = [0_u8; WRAPPED_KEY_LEN];
     random.fill(&mut bytes[..24])?;
     let mut protected = SecretBytes::new(dek.0.expose()).map_err(ObjectError::Memory)?;
+    observe(observer, protected.lock_status());
     let tag = XChaCha20Poly1305::new(GenericArray::from_slice(wrapping_key.expose()))
         .encrypt_in_place_detached(
             XNonce::from_slice(&bytes[..24]),
@@ -747,6 +841,7 @@ fn wrap_dek(
     ))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn unwrap_dek(
     wrapped: &WrappedObjectKey,
     wrapping_key: &SecretKey<32>,
@@ -754,7 +849,19 @@ fn unwrap_dek(
     object_id: ObjectId,
     role: ObjectRole,
 ) -> Result<ObjectDek, ObjectError> {
+    unwrap_dek_observed(wrapped, wrapping_key, vault_id, object_id, role, None)
+}
+
+fn unwrap_dek_observed(
+    wrapped: &WrappedObjectKey,
+    wrapping_key: &SecretKey<32>,
+    vault_id: VaultId,
+    object_id: ObjectId,
+    role: ObjectRole,
+    observer: Option<&Cell<LockStatus>>,
+) -> Result<ObjectDek, ObjectError> {
     let mut protected = SecretKey::zeroed().map_err(ObjectError::Memory)?;
+    observe(observer, protected.lock_status());
     protected.expose_mut().copy_from_slice(&wrapped.0[24..56]);
     XChaCha20Poly1305::new(GenericArray::from_slice(wrapping_key.expose()))
         .decrypt_in_place_detached(
@@ -765,6 +872,12 @@ fn unwrap_dek(
         )
         .map_err(|_| ObjectError::Authentication)?;
     Ok(ObjectDek(protected))
+}
+
+fn observe(observer: Option<&Cell<LockStatus>>, status: LockStatus) {
+    if let Some(observer) = observer {
+        observer.set(observer.get().combine(status));
+    }
 }
 
 fn validate_plan(logical_len: u64, chunk_size: u32) -> Result<u32, ObjectError> {

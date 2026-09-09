@@ -4,6 +4,8 @@
 //! accepted by this crate are bounded before SQL execution and every mutation
 //! is transactional.
 
+#[cfg(target_os = "linux")]
+mod anchored_vfs;
 mod connection;
 mod error;
 mod repository;

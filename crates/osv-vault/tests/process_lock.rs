@@ -43,6 +43,51 @@ fn process_locks_allow_shared_readers_and_exclude_writers() {
     writer.wait().unwrap();
 }
 
+#[test]
+fn service_reports_degraded_transient_page_locks() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let path = parent.path().join("vault");
+    let password = Password::new(b"lock fixture password").unwrap();
+    VaultService::create(&path, &password, None, KdfParams::new(8, 1, 1).unwrap(), 1)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_osv-vault-lock-fixture"))
+        .arg(&path)
+        .arg("security-status")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "Degraded");
+
+    for mode in [
+        "failed-import-status",
+        "mid-import-status",
+        "failed-open-status",
+    ] {
+        let case_path = parent.path().join(mode);
+        let password = Password::new(b"lock fixture password").unwrap();
+        VaultService::create(
+            &case_path,
+            &password,
+            None,
+            KdfParams::new(8, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_osv-vault-lock-fixture"))
+            .arg(&case_path)
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture {mode} failed");
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "Degraded");
+    }
+}
+
 fn held_child(path: &Path, mode: &str, expected: &str) -> std::process::Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_osv-vault-lock-fixture"))
         .arg(path)

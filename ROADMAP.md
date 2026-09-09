@@ -994,9 +994,10 @@ objects.
 **Goal:** Combine catalog and objects without pretending they share a
 transaction.
 
-**Status:** Gate blocked as of 2026-09-09. Initial implementation is committed
-as `3faed36`; do not begin Phase 7 until the independent-review blockers below
-are remediated and re-reviewed.
+**Status:** Blocker remediation approved by GPT-6 as of 2026-09-09; the phase
+gate remains open for the acceptance gaps below. The initial implementation is
+committed as `3faed36`, and the review remediations and regression tests remain
+local. Do not begin Phase 7 until the remaining acceptance gaps are closed.
 
 - Added the `osv-vault` composition crate. Writer imports durably publish and
   authenticate ciphertext before beginning the catalog transaction. Deletion
@@ -1008,12 +1009,18 @@ are remediated and re-reviewed.
   and final ciphertext, and scans every catalog object. Missing files,
   authenticated corruption, and locator mismatches are reported with opaque
   identities and marked damaged; unknown names, symlinks, hard links, and
-  malformed namespaces are reported but never followed or removed.
+  malformed namespaces are reported but never followed or removed. Cleanup
+  intents are rejected without mutation if any target is again live.
 - Added a lifetime `flock` protocol on an owner-only, singly linked regular
   lock file. Readers take shared locks and writers take exclusive locks before
   credential derivation. Object traversal, maintenance, deletion, and backup
-  use descriptor-relative no-follow operations; the attempted descriptor-
-  anchored catalog access is not effective and is a gate blocker below.
+  use descriptor-relative no-follow operations. A Linux-only anchored SQLite
+  VFS resolves the catalog and its WAL/journal through the already-open vault
+  directory, rejects links and non-regular files, and performs SQLite reads,
+  writes, truncation, syncing, and sizing directly on that validated descriptor.
+  Service-level directory, catalog, and sidecar identity checks provide a second
+  fail-closed boundary. Persistent WAL mode prevents SQLite teardown from
+  unlinking a substituted sidecar name.
 - Clean writer close repairs outstanding work, checkpoints/truncates SQLCipher
   WAL state, releases secret-bearing storage, durably marks the vault clean,
   and releases the lock last. Writer crashes leave a durable dirty marker.
@@ -1025,7 +1032,8 @@ are remediated and re-reviewed.
 **Verification recorded 2026-09-09**
 
 - Workspace formatting, warnings-as-errors Clippy, and all-target/all-feature
-  tests pass. Phase 6 adds twelve service and subprocess tests.
+  tests pass. Phase 6 now adds twenty-three service, VFS, compile-fail, and
+  subprocess tests, including the remediation regressions.
   Independent processes prove reader/reader success and reader/writer plus
   writer/writer exclusion, including lock release after `SIGKILL`.
 - Real subprocess kills at each import, deletion, derived-replacement, and
@@ -1045,46 +1053,88 @@ are remediated and re-reviewed.
   The checksum-pinned offline Flatpak release test/build gate passes with the
   new crate, and all three installed stubs execute successfully in the sandbox.
 
-**Independent review blockers recorded 2026-09-09**
+**Independent review remediation approved (2026-09-09)**
 
-GPT-6 Astra reviewed `3faed36`, reproduced four failures with temporary harnesses,
-and rejected the phase gate. Resolve all blockers before restoring Complete:
+GPT-6 Astra reviewed `3faed36`, then re-reviewed successive remediations. It
+reproduced pre-validation sidecar damage, live WAL substitution during teardown,
+backup reparenting, lost failure-path memory-lock status, a VFS filename lifetime
+bug, and suppressed directory-sync behavior. The current remediation addresses
+those findings as follows. Its final pass approved the blocker remediation while
+explicitly excluding the remaining acceptance gaps from that approval:
 
-1. **P1 — catalog path containment is ineffective.** SQLite's Unix VFS
-   canonicalizes `/proc/self/fd/<directory>/catalog.db` back to an ordinary
-   pathname while `osv-catalog` disables `SQLITE_OPEN_NOFOLLOW` for that form.
-   The catalog and its sidecars can therefore escape the directory identity
-   whose lock and object-store handles the service owns after a directory or
-   final-name substitution. Implement genuinely descriptor-relative catalog
-   and sidecar access, or explicitly gate the invariant; add adversarial path
-   replacement tests.
-2. **P1 — object authority outlives the service lock.** `open_object` returns an
-   owned reader containing its file descriptor, DEK, and plaintext cache. The
-   reviewer closed the service, opened a new writer, deleted the media, and
-   still decrypted the entire object through the old reader. Tie reader
-   authority to the session lifetime or implement explicit revocation, and
-   test close/deletion with outstanding readers.
-3. **P1 — recovery can unlink a live catalog object.** Cleanup replay trusts an
-   authenticated journal payload without proving that its target is absent
-   from the live object table. The public full `CatalogTransaction` surface can
-   insert such a journal or an object reference that bypasses publication
-   ordering. Restrict the service transaction API to metadata-only operations,
-   semantically validate every cleanup target before unlink, and fail without
-   mutation on conflicts.
-4. **P2 — backup descendant detection is lexical.** An aliased path containing
-   `..` bypassed `destination.starts_with(source)` and recursively copied the
-   vault into itself until `EMFILE`. Compare opened filesystem identities and
-   ancestry before destination creation, prevent traversal from revisiting the
-   destination, and add relative, `..`, and symlink-alias regression tests.
-5. **P2 — reader mode mutates and requires directory write access.** A reader
-   created `catalog.db-wal` and `catalog.db-shm`; opening a clean vault in a
-   `0500` directory failed. Implement a genuinely non-mutating reader
-   configuration with explicit dirty/WAL handling, then verify no filesystem
-   changes and successful read-only-directory access.
-6. **P2 — lock-degradation reporting is lost.** The service exposes no combined
-   `SecurityStatus` and discards publication and recovery-reader lock status.
-   Aggregate all lower-layer and transient-operation degradation conservatively
-   and add a subprocess test with the memory-lock limit lowered.
+**GPT-6 review ledger (resume here)**
+
+- Pass 1 on `3faed36`: rejected ineffective catalog containment, object-reader
+  authority outliving the service lock, cleanup capable of unlinking a live
+  catalog object, lexical backup descendant checks, mutating reader mode, and
+  discarded transient memory-lock degradation.
+- Pass 2 on the first remediation: rejected the sidecar validation/open TOCTOU,
+  destructive handling of a substituted live WAL name, destination reparenting
+  during backup, and failure-path lock status that was still lost.
+- Pass 3 on the second remediation: rejected a custom-VFS filename pointer that
+  did not live until `xClose`, loss of SQLite's journal/WAL directory-sync
+  behavior when `SQLITE_OPEN_CREATE` was cleared, and ignored `xDelete`
+  directory-sync failures. SQLite-owned filename allocations and explicit sync
+  error propagation remedied these points.
+- Pass 4 on the updated VFS: accepted the filename allocation lifetime and close
+  order, reader lifetime, metadata-only transactions, cleanup conflict checks,
+  and direct failure-path lock-status propagation. It found two remaining P1
+  issues. First, fallback callbacks gave unknown filenames to the unrestricted
+  Unix VFS; an unauthenticated hot-journal super-journal trailer could thereby
+  request an outside-file access/delete. Exact per-VFS logical-name matching now
+  rejects unknown/null opens and deletes and reports unknown access checks as
+  absent; super-journal opens are rejected even if named like an internal file.
+  A focused outside-victim regression verifies those callbacks have no external
+  filesystem authority.
+- Pass 4 P1 remediation: the VFS no longer delegates file I/O
+  or infers a descriptor identity. Its version-1 SQLite I/O methods read, write,
+  truncate, sync, and size the exact descriptor returned by the validated
+  descriptor-relative `openat`; the lifetime vault `flock` remains the locking
+  authority. Unit regressions prove a name replacement cannot redirect an
+  already-open file and unknown recovery names cannot access or delete a victim.
+- Pass 5: GPT-6 approved the descriptor-native VFS and all prior blocker
+  remediations. It found no further blocking correctness, lifetime, or Rust-
+  safety issue in the persistent-writer/immutable-reader service usage. The
+  public anchored catalog APIs now document their external lifetime-lock
+  precondition and reject unsupported modes. Resume Phase 6 at the acceptance
+  gaps below, not at the resolved blocker list.
+
+1. **P1 — catalog path containment and VFS safety.** The service registers a
+   per-connection descriptor-native VFS. Each fixed catalog member is opened
+   with `openat`, `O_NOFOLLOW`, and regular-file/single-link validation. SQLite
+   file I/O then operates only on that exact descriptor; no pathname delegation
+   or descriptor-count inference remains. Unknown and super-journal names have
+   no file authority. Create and delete paths propagate required directory-sync
+   failures. Captured absolute vault ancestry and service-level file identities
+   add defense in depth. Persistent WAL files are checkpointed but not unlinked
+   by SQLite, so a replacement name survives teardown unchanged. Adversarial
+   directory, catalog, live-WAL, hard-link, opened-name replacement, and outside-
+   recovery-name tests cover these cases.
+2. **P1 — object authority lifetime.** `ServiceObjectReader` borrows its
+   `VaultService`, so Rust prevents service close or mutable deletion while an
+   object descriptor, DEK, or plaintext cache remains usable.
+3. **P1 — cleanup semantic validation.** The public service transaction exposes
+   only metadata operations. Immediate and replay cleanup validate every target
+   against the live object table before the first unlink; lookup errors and
+   conflicts fail without mutation.
+4. **P2 — backup descendant detection.** Before destination creation, the
+   opened destination-parent ancestry is walked by filesystem identity and
+   compared with the opened source. The walker also tracks visited identities
+   and rejects the destination identity if it is reparented into the source
+   after creation. Relative, `..`, symlink-alias, and fault-injected reparenting
+   regression cases fail closed.
+5. **P2 — non-mutating reader mode.** Reader admission requires a clean marker
+   and a zero-length, singly linked regular WAL when persistent sidecars exist,
+   then opens SQLCipher with immutable read-only mode and ignores those
+   sidecars. Tests verify an unchanged directory and successful access at mode
+   `0500`.
+6. **P2 — lock-degradation reporting.** `VaultService::security_status`
+   conservatively combines storage, catalog, publication, recovery-reader, and
+   live-reader status. Storage reports each actual secret allocation to the
+   service immediately, so degradation remains observable even if publication
+   or object open fails before returning an owned value. Subprocesses with
+   `RLIMIT_MEMLOCK=0` observe `Degraded` for open, failed import, and failed
+   object-open paths.
 
 **Acceptance gaps found by review**
 

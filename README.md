@@ -4,8 +4,8 @@
 GTK4, GStreamer, SQLCipher, native Wayland, and Flatpak are the accepted initial
 stack.
 
-The repository is implementing Phase 6. Its first atomic vault-service change
-is committed but the phase gate is blocked on independent-review findings. The
+The repository is implementing Phase 6. GPT-6 approved its atomic vault-service
+blocker remediation; remaining acceptance work is recorded in the roadmap. The
 repository also contains the production cryptographic, encrypted object-store,
 and SQLCipher catalog foundations plus the archived Phase 1 feasibility
 prototypes. See [ROADMAP.md](ROADMAP.md) for the blockers, detailed status, and

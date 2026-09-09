@@ -7,9 +7,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use osv_catalog::{MediaClass, MediaId, ObjectState};
+use osv_catalog::{Catalog, CatalogMode, MediaClass, MediaId, ObjectState};
 use osv_crypto::{KdfParams, Password};
-use osv_storage::ObjectRole;
+use osv_storage::{ObjectRole, UnlockedVault};
 use osv_test_support::TempVault;
 use osv_vault::{
     BackupFaultInjector, BackupPoint, ImportMetadata, OpenMode, ServiceError, ServiceFaultInjector,
@@ -242,6 +242,201 @@ fn closed_backup_restores_and_partial_backup_fails_closed() {
         Err(ServiceError::BackupInterrupted(_))
     ));
     assert!(VaultService::open(&partial, &password, None, OpenMode::Reader).is_err());
+}
+
+#[test]
+fn backup_rejects_normalized_and_symlink_aliased_descendants() {
+    use std::os::unix::fs::symlink;
+
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, _password, writer) = create(parent.path(), "vault");
+    writer.close().unwrap();
+
+    fs::create_dir(path.join("nested")).unwrap();
+    assert!(matches!(
+        backup_closed(&path, &path.join("nested/../copy")),
+        Err(ServiceError::InvalidInput)
+    ));
+
+    let alias = parent.path().join("alias");
+    symlink(&path, &alias).unwrap();
+    assert!(backup_closed(&path, &alias.join("nested/copy")).is_err());
+}
+
+#[test]
+fn reader_is_non_mutating_and_works_without_directory_write_access() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, mut writer) = create(parent.path(), "vault");
+    writer
+        .import(&mut Cursor::new(b"read only"), 9, metadata(12))
+        .unwrap();
+    writer.close().unwrap();
+    fs::remove_file(path.join("catalog.db-wal")).unwrap();
+    let mut writer = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    // Churn allocations after SQLite has retained its delegated VFS filename,
+    // then force journal/WAL path use and a clean checkpoint.
+    let churn: Vec<String> = (0..2_048)
+        .map(|index| format!("allocation-{index}"))
+        .collect();
+    let transaction = writer.transaction().unwrap();
+    transaction.create_tag("recreated WAL").unwrap();
+    transaction.commit().unwrap();
+    drop(churn);
+    writer.close().unwrap();
+    assert_eq!(fs::metadata(path.join("catalog.db-wal")).unwrap().len(), 0);
+    let before: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+    let reader = VaultService::open(&path, &password, None, OpenMode::Reader).unwrap();
+    reader.close().unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let after: Vec<_> = fs::read_dir(&path)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(fs::metadata(path.join("catalog.db-wal")).unwrap().len(), 0);
+}
+
+#[test]
+fn service_rejects_directory_and_catalog_name_substitution() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, _password, mut writer) = create(parent.path(), "directory-vault");
+    let moved = parent.path().join("moved-vault");
+    fs::rename(&path, &moved).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        writer.transaction(),
+        Err(ServiceError::PathIdentityChanged)
+    ));
+    drop(writer);
+
+    let ancestor = parent.path().join("ancestor");
+    fs::create_dir(&ancestor).unwrap();
+    let path = ancestor.join("vault");
+    let (_path, _password, mut writer) = create(&ancestor, "vault");
+    fs::rename(&ancestor, parent.path().join("moved-ancestor")).unwrap();
+    fs::create_dir(&ancestor).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(matches!(
+        writer.transaction(),
+        Err(ServiceError::PathIdentityChanged)
+    ));
+    drop(writer);
+
+    let (path, _password, mut writer) = create(parent.path(), "catalog-vault");
+    fs::rename(path.join("catalog.db"), path.join("displaced.db")).unwrap();
+    fs::File::create(path.join("catalog.db")).unwrap();
+    assert!(matches!(
+        writer.transaction(),
+        Err(ServiceError::PathIdentityChanged)
+    ));
+
+    let (path, _password, mut writer) = create(parent.path(), "sidecar-vault");
+    let replacement = path.join("catalog.db-wal");
+    fs::rename(&replacement, parent.path().join("detached-wal")).unwrap();
+    fs::write(&replacement, b"replacement must survive").unwrap();
+    assert!(matches!(
+        writer.transaction(),
+        Err(ServiceError::PathIdentityChanged)
+    ));
+    assert!(matches!(
+        writer.close(),
+        Err(ServiceError::PathIdentityChanged)
+    ));
+    assert_eq!(fs::read(replacement).unwrap(), b"replacement must survive");
+}
+
+#[test]
+fn writer_rejects_hard_linked_sidecar_before_sqlcipher_touches_it() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, writer) = create(parent.path(), "vault");
+    writer.close().unwrap();
+    let _ = fs::remove_file(path.join("catalog.db-shm"));
+    let victim = parent.path().join("victim");
+    let expected = vec![0x77; 32 * 1024];
+    fs::write(&victim, &expected).unwrap();
+    fs::hard_link(&victim, path.join("catalog.db-shm")).unwrap();
+
+    assert!(VaultService::open(&path, &password, None, OpenMode::Writer).is_err());
+    assert_eq!(fs::read(victim).unwrap(), expected);
+
+    let (path, password, writer) = create(parent.path(), "main-file-vault");
+    writer.close().unwrap();
+    fs::rename(path.join("catalog.db"), path.join("real-catalog.db")).unwrap();
+    let victim = parent.path().join("main-file-victim");
+    fs::write(&victim, &expected).unwrap();
+    fs::hard_link(&victim, path.join("catalog.db")).unwrap();
+    assert!(VaultService::open(&path, &password, None, OpenMode::Writer).is_err());
+    assert_eq!(fs::read(victim).unwrap(), expected);
+}
+
+struct ReparentDestination {
+    destination: std::path::PathBuf,
+    moved: std::path::PathBuf,
+}
+
+impl BackupFaultInjector for ReparentDestination {
+    fn should_fail(&mut self, point: BackupPoint) -> bool {
+        if point == BackupPoint::DestinationCreated {
+            fs::rename(&self.destination, &self.moved).unwrap();
+        }
+        false
+    }
+}
+
+#[test]
+fn backup_walker_rejects_destination_reparented_into_source() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, _password, writer) = create(parent.path(), "vault");
+    writer.close().unwrap();
+    let destination = parent.path().join("copy");
+    let mut fault = ReparentDestination {
+        destination: destination.clone(),
+        moved: path.join("copy"),
+    };
+    assert!(matches!(
+        backup_closed_with(&path, &destination, &mut fault),
+        Err(ServiceError::InvalidInput)
+    ));
+    assert!(!path.join("copy/copy").exists());
+}
+
+#[test]
+fn recovery_refuses_to_unlink_a_live_catalog_object() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, mut writer) = create(parent.path(), "vault");
+    let id = writer
+        .import(&mut Cursor::new(b"still live"), 10, metadata(13))
+        .unwrap();
+    writer.close().unwrap();
+
+    let storage = UnlockedVault::unlock(&path, &password, None).unwrap();
+    let mut catalog = Catalog::open(
+        &path.join("catalog.db"),
+        &storage.derived_keys().catalog,
+        storage.header().vault_id().as_bytes(),
+        CatalogMode::ReadWrite,
+    )
+    .unwrap();
+    let mut payload = vec![ObjectRole::Original as u8];
+    payload.extend_from_slice(id.as_bytes());
+    let tx = catalog.transaction().unwrap();
+    tx.insert_operation([0x71; 16], 1, 1, &payload, 2).unwrap();
+    tx.commit().unwrap();
+    catalog.close().unwrap();
+    drop(storage);
+
+    assert!(matches!(
+        VaultService::open(&path, &password, None, OpenMode::Writer),
+        Err(ServiceError::CleanupConflict)
+    ));
+    assert!(
+        path.join(UnlockedVault::object_locator(id, ObjectRole::Original))
+            .exists()
+    );
 }
 
 #[test]

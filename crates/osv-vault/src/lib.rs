@@ -5,6 +5,7 @@
 //! ciphertext and deletion drops the wrapped DEK before ciphertext is unlinked.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     error::Error,
     fmt,
@@ -15,10 +16,10 @@ use std::{
 };
 
 use osv_catalog::{
-    Catalog, CatalogError, CatalogMode, CatalogTransaction, MediaClass, MediaId, NewDerivedObject,
-    NewMedia, NewObject, ObjectState,
+    Catalog, CatalogError, CatalogMode, CatalogTransaction, Child, GalleryId, MediaClass, MediaId,
+    NewDerivedObject, NewGallery, NewMedia, NewObject, ObjectState, SearchResult, TagId,
 };
-use osv_crypto::{KdfParams, Password, SecretBytes};
+use osv_crypto::{KdfParams, LockStatus, Password, SecretBytes, SecurityStatus};
 use osv_storage::{ObjectError, ObjectId, ObjectReader, ObjectRole, UnlockedVault, VaultError};
 
 const CATALOG_NAME: &str = "catalog.db";
@@ -138,9 +139,11 @@ pub struct VaultService {
     catalog: Option<Catalog>,
     storage: Option<UnlockedVault>,
     _directory: File,
+    directory_binding: DirectoryBinding,
     lock: VaultLock,
     mode: OpenMode,
     startup_recovery: RecoveryReport,
+    security_lock_status: Cell<LockStatus>,
 }
 
 impl fmt::Debug for VaultService {
@@ -163,23 +166,33 @@ impl VaultService {
     ) -> Result<Self, ServiceError> {
         let storage = UnlockedVault::create(path, password, keyfile, kdf_params)?;
         let directory = storage.try_clone_directory()?;
+        let directory_binding = DirectoryBinding::capture(path, &directory)?;
         let mut lock = VaultLock::acquire(&directory, OpenMode::Writer, true)?;
         directory.sync_all()?;
-        let catalog = Catalog::create(
+        let catalog = Catalog::create_anchored(
             &member_path(&directory, CATALOG_NAME),
+            directory.try_clone()?,
             &storage.derived_keys().catalog,
             storage.header().vault_id().as_bytes(),
             created_at_ms,
         )?;
+        let directory_binding = directory_binding.bind_catalog(&directory, true, None)?;
+        directory_binding.verify()?;
         directory.sync_all()?;
         lock.mark_dirty()?;
+        let security_lock_status = storage
+            .security_status()
+            .page_locks()
+            .combine(catalog.security_status().page_locks());
         Ok(Self {
             catalog: Some(catalog),
             storage: Some(storage),
             _directory: directory,
+            directory_binding,
             lock,
             mode: OpenMode::Writer,
             startup_recovery: RecoveryReport::default(),
+            security_lock_status: Cell::new(security_lock_status),
         })
     }
 
@@ -200,19 +213,37 @@ impl VaultService {
         faults: &mut impl ServiceFaultInjector,
     ) -> Result<Self, ServiceError> {
         let directory = platform::open_directory(path)?;
+        let directory_binding = DirectoryBinding::capture(path, &directory)?;
         let mut lock = VaultLock::acquire(&directory, mode, false)?;
+        if mode == OpenMode::Reader && !lock.is_clean()? {
+            return Err(ServiceError::UncleanVault);
+        }
+        platform::validate_catalog_sidecars(&directory, mode == OpenMode::Reader)?;
+        let expected_catalog_identity =
+            platform::identity(&platform::open_regular_member(&directory, CATALOG_NAME)?)?;
         let storage =
             UnlockedVault::unlock_from_directory(directory.try_clone()?, password, keyfile)?;
         let catalog_mode = match mode {
-            OpenMode::Reader => CatalogMode::ReadOnly,
-            OpenMode::Writer => CatalogMode::ReadWrite,
+            OpenMode::Reader => CatalogMode::ImmutableReadOnly,
+            OpenMode::Writer => CatalogMode::PersistentReadWrite,
         };
-        let catalog = Catalog::open(
+        let catalog = Catalog::open_anchored(
             &member_path(&directory, CATALOG_NAME),
+            directory.try_clone()?,
             &storage.derived_keys().catalog,
             storage.header().vault_id().as_bytes(),
             catalog_mode,
         )?;
+        let directory_binding = directory_binding.bind_catalog(
+            &directory,
+            mode == OpenMode::Writer,
+            Some(expected_catalog_identity),
+        )?;
+        directory_binding.verify()?;
+        let security_lock_status = storage
+            .security_status()
+            .page_locks()
+            .combine(catalog.security_status().page_locks());
         if mode == OpenMode::Writer {
             lock.mark_dirty()?;
         }
@@ -220,9 +251,11 @@ impl VaultService {
             catalog: Some(catalog),
             storage: Some(storage),
             _directory: directory,
+            directory_binding,
             lock,
             mode,
             startup_recovery: RecoveryReport::default(),
+            security_lock_status: Cell::new(security_lock_status),
         };
         if mode == OpenMode::Writer {
             service.startup_recovery = service.recover_with(faults)?;
@@ -239,9 +272,15 @@ impl VaultService {
         self.catalog().reader()
     }
 
-    pub fn transaction(&mut self) -> Result<CatalogTransaction<'_>, ServiceError> {
+    pub fn transaction(&mut self) -> Result<MetadataTransaction<'_>, ServiceError> {
         self.require_writer()?;
-        Ok(self.catalog_mut().transaction()?)
+        self.directory_binding.verify()?;
+        Ok(MetadataTransaction(self.catalog_mut().transaction()?))
+    }
+
+    #[must_use]
+    pub fn security_status(&self) -> SecurityStatus {
+        SecurityStatus::new(self.security_lock_status.get())
     }
 
     pub fn import(
@@ -261,9 +300,19 @@ impl VaultService {
         faults: &mut impl ServiceFaultInjector,
     ) -> Result<ObjectId, ServiceError> {
         self.require_writer()?;
-        let descriptor =
-            self.storage()
-                .publish_object(source, logical_len, ObjectRole::Original)?;
+        self.directory_binding.verify()?;
+        let descriptor = self.storage().publish_object_observed(
+            source,
+            logical_len,
+            ObjectRole::Original,
+            &self.security_lock_status,
+        )?;
+        self.record_lock_status(
+            descriptor
+                .publication_security_status()
+                .expect("published objects record transient lock status")
+                .page_locks(),
+        );
         fail(faults, ServicePoint::ObjectDurable)?;
         let locator = UnlockedVault::object_locator(descriptor.id(), descriptor.role());
         let mut catalog = self.catalog.take().expect("catalog present");
@@ -308,6 +357,7 @@ impl VaultService {
         faults: &mut impl ServiceFaultInjector,
     ) -> Result<(), ServiceError> {
         self.require_writer()?;
+        self.directory_binding.verify()?;
         let operation_id = *media.as_bytes();
         let mut catalog = self.catalog.take().expect("catalog present");
         let result: Result<Vec<osv_catalog::CleanupObject>, ServiceError> = (|| {
@@ -375,10 +425,22 @@ impl VaultService {
         faults: &mut impl ServiceFaultInjector,
     ) -> Result<ObjectId, ServiceError> {
         self.require_writer()?;
+        self.directory_binding.verify()?;
         if !matches!(role, ObjectRole::Thumbnail | ObjectRole::Poster) {
             return Err(ServiceError::InvalidInput);
         }
-        let descriptor = self.storage().publish_object(source, logical_len, role)?;
+        let descriptor = self.storage().publish_object_observed(
+            source,
+            logical_len,
+            role,
+            &self.security_lock_status,
+        )?;
+        self.record_lock_status(
+            descriptor
+                .publication_security_status()
+                .expect("published objects record transient lock status")
+                .page_locks(),
+        );
         fail(faults, ServicePoint::ObjectDurable)?;
         let locator = UnlockedVault::object_locator(descriptor.id(), role);
         let operation_id = *descriptor.id().as_bytes();
@@ -431,6 +493,7 @@ impl VaultService {
         faults: &mut impl ServiceFaultInjector,
     ) -> Result<RecoveryReport, ServiceError> {
         self.require_writer()?;
+        self.directory_binding.verify()?;
         let mut report = RecoveryReport::default();
         for entry in self.catalog().reader().operation_journal()? {
             if !matches!(
@@ -440,7 +503,17 @@ impl VaultService {
             {
                 return Err(ServiceError::InvalidJournal);
             }
-            for (id, role) in decode_cleanup(&entry.payload)? {
+            let cleanup = decode_cleanup(&entry.payload)?;
+            // Validate the complete intent before unlinking anything. A valid
+            // cleanup journal can never target an object still carrying a DEK.
+            for (id, _role) in &cleanup {
+                match self.catalog().reader().object(*id) {
+                    Ok(_) => return Err(ServiceError::CleanupConflict),
+                    Err(CatalogError::NotFound) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            for (id, role) in cleanup {
                 if self.storage().remove_ciphertext(id, role)? {
                     report.removed_orphans += 1;
                 }
@@ -485,8 +558,15 @@ impl VaultService {
             } else if !physical.contains(&(id, role)) {
                 Some(DamageKind::Missing)
             } else {
-                match self.storage().open_object(&object.descriptor) {
-                    Ok(mut reader) => reader.verify_all().err().map(|_| DamageKind::Corrupt),
+                match self
+                    .storage()
+                    .open_object_observed(&object.descriptor, &self.security_lock_status)
+                {
+                    Ok(mut reader) => {
+                        let result = reader.verify_all().err().map(|_| DamageKind::Corrupt);
+                        self.record_lock_status(reader.security_status().page_locks());
+                        result
+                    }
                     Err(_) => Some(DamageKind::Corrupt),
                 }
             };
@@ -500,7 +580,8 @@ impl VaultService {
         Ok(report)
     }
 
-    pub fn open_object(&self, id: ObjectId) -> Result<ObjectReader<File>, ServiceError> {
+    pub fn open_object(&self, id: ObjectId) -> Result<ServiceObjectReader<'_>, ServiceError> {
+        self.directory_binding.verify()?;
         let stored = self.catalog().reader().object(id)?;
         if stored.state != ObjectState::Ready
             || stored.locator
@@ -508,10 +589,18 @@ impl VaultService {
         {
             return Err(ServiceError::DamagedObject);
         }
-        Ok(self.storage().open_object(&stored.descriptor)?)
+        let inner = self
+            .storage()
+            .open_object_observed(&stored.descriptor, &self.security_lock_status)?;
+        self.record_lock_status(inner.security_status().page_locks());
+        Ok(ServiceObjectReader {
+            inner,
+            service_status: &self.security_lock_status,
+        })
     }
 
     pub fn close(mut self) -> Result<(), ServiceError> {
+        self.directory_binding.verify()?;
         if self.mode == OpenMode::Writer {
             self.recover_with(&mut NoServiceFaults)?;
         }
@@ -530,6 +619,13 @@ impl VaultService {
         &self,
         objects: &[osv_catalog::CleanupObject],
     ) -> Result<(), ServiceError> {
+        for object in objects {
+            match self.catalog().reader().object(object.id) {
+                Ok(_) => return Err(ServiceError::CleanupConflict),
+                Err(CatalogError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         for object in objects {
             self.storage().remove_ciphertext(object.id, object.role)?;
         }
@@ -555,6 +651,210 @@ impl VaultService {
     fn storage(&self) -> &UnlockedVault {
         self.storage.as_ref().expect("storage present")
     }
+
+    fn record_lock_status(&self, status: LockStatus) {
+        self.security_lock_status
+            .set(self.security_lock_status.get().combine(status));
+    }
+}
+
+struct DirectoryBinding {
+    stable_path: PathBuf,
+    parent: File,
+    name: std::ffi::OsString,
+    identity: (u64, u64),
+    catalog_identity: Option<(u64, u64)>,
+    catalog_sidecars: Vec<(String, File, (u64, u64))>,
+    pre_catalog_fds: HashMap<(u64, u64), usize>,
+}
+
+impl DirectoryBinding {
+    fn capture(path: &Path, directory: &File) -> Result<Self, ServiceError> {
+        let (parent_path, name) = split_parent(path)?;
+        let parent = platform::open_directory(&parent_path)?;
+        let stable_path = std::fs::canonicalize(path)?;
+        Ok(Self {
+            stable_path,
+            parent,
+            name,
+            identity: platform::identity(directory)?,
+            catalog_identity: None,
+            catalog_sidecars: Vec::new(),
+            pre_catalog_fds: platform::open_fd_identity_counts()?,
+        })
+    }
+
+    fn bind_catalog(
+        mut self,
+        directory: &File,
+        require_sidecars: bool,
+        expected_catalog_identity: Option<(u64, u64)>,
+    ) -> Result<Self, ServiceError> {
+        let catalog = platform::open_regular_member(directory, CATALOG_NAME)?;
+        let catalog_identity = platform::identity(&catalog)?;
+        if expected_catalog_identity.is_some_and(|expected| expected != catalog_identity) {
+            return Err(ServiceError::PathIdentityChanged);
+        }
+        if !platform::fd_identity_count_grew(
+            &self.pre_catalog_fds,
+            catalog_identity,
+            catalog.as_raw_fd(),
+        )? {
+            return Err(ServiceError::PathIdentityChanged);
+        }
+        if require_sidecars {
+            let member = "catalog.db-wal";
+            let sidecar = platform::open_regular_member(directory, member)?;
+            let identity = platform::identity(&sidecar)?;
+            if !platform::fd_identity_count_grew(
+                &self.pre_catalog_fds,
+                identity,
+                sidecar.as_raw_fd(),
+            )? {
+                return Err(ServiceError::PathIdentityChanged);
+            }
+            self.catalog_sidecars
+                .push((member.to_owned(), sidecar, identity));
+        }
+        self.catalog_identity = Some(catalog_identity);
+        Ok(self)
+    }
+
+    fn verify(&self) -> Result<(), ServiceError> {
+        let stable = platform::open_directory(&self.stable_path)
+            .map_err(|_| ServiceError::PathIdentityChanged)?;
+        if platform::identity(&stable)? != self.identity {
+            return Err(ServiceError::PathIdentityChanged);
+        }
+        let current = platform::open_directory_at(&self.parent, &self.name)
+            .map_err(|_| ServiceError::PathIdentityChanged)?;
+        if platform::identity(&current)? == self.identity {
+            let catalog = platform::open_regular_member(&current, CATALOG_NAME)
+                .map_err(|_| ServiceError::PathIdentityChanged)?;
+            if Some(platform::identity(&catalog)?) == self.catalog_identity {
+                for (name, _held, identity) in &self.catalog_sidecars {
+                    let sidecar = platform::open_regular_member(&current, name)
+                        .map_err(|_| ServiceError::PathIdentityChanged)?;
+                    if platform::identity(&sidecar)? != *identity {
+                        return Err(ServiceError::PathIdentityChanged);
+                    }
+                }
+                Ok(())
+            } else {
+                Err(ServiceError::PathIdentityChanged)
+            }
+        } else {
+            Err(ServiceError::PathIdentityChanged)
+        }
+    }
+}
+
+/// Object authority cannot outlive the service session and its process lock.
+///
+/// Closing or mutating the service while a reader will still be used is a
+/// compile-time error:
+///
+/// ```compile_fail
+/// use std::io::Read;
+/// use osv_storage::ObjectId;
+/// use osv_vault::VaultService;
+///
+/// fn cannot_close(service: VaultService, id: ObjectId) {
+///     let mut reader = service.open_object(id).unwrap();
+///     service.close().unwrap();
+///     reader.read_to_end(&mut Vec::new()).unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use std::io::Read;
+/// use osv_catalog::MediaId;
+/// use osv_storage::ObjectId;
+/// use osv_vault::VaultService;
+///
+/// fn cannot_delete(mut service: VaultService, object: ObjectId, media: MediaId) {
+///     let mut reader = service.open_object(object).unwrap();
+///     service.delete_media(media, 1).unwrap();
+///     reader.read_to_end(&mut Vec::new()).unwrap();
+/// }
+/// ```
+pub struct ServiceObjectReader<'service> {
+    inner: ObjectReader<File>,
+    service_status: &'service Cell<LockStatus>,
+}
+
+impl Read for ServiceObjectReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let result = self.inner.read(buffer);
+        self.service_status.set(
+            self.service_status
+                .get()
+                .combine(self.inner.security_status().page_locks()),
+        );
+        result
+    }
+}
+
+impl Seek for ServiceObjectReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        let result = self.inner.seek(position);
+        self.service_status.set(
+            self.service_status
+                .get()
+                .combine(self.inner.security_status().page_locks()),
+        );
+        result
+    }
+}
+
+/// Catalog authority deliberately limited to metadata-only mutations.
+pub struct MetadataTransaction<'catalog>(CatalogTransaction<'catalog>);
+
+impl MetadataTransaction<'_> {
+    pub fn create_gallery(&self, gallery: NewGallery<'_>) -> Result<(), CatalogError> {
+        self.0.create_gallery(gallery)
+    }
+
+    pub fn add_gallery_child(
+        &self,
+        parent: GalleryId,
+        position: u32,
+        child: Child,
+    ) -> Result<(), CatalogError> {
+        self.0.add_gallery_child(parent, position, child)
+    }
+
+    pub fn gallery_children(
+        &self,
+        parent: GalleryId,
+        maximum: u32,
+    ) -> Result<Vec<Child>, CatalogError> {
+        self.0.gallery_children(parent, maximum)
+    }
+
+    pub fn create_tag(&self, name: &str) -> Result<TagId, CatalogError> {
+        self.0.create_tag(name)
+    }
+
+    pub fn tag_media(&self, media: MediaId, tag: TagId) -> Result<(), CatalogError> {
+        self.0.tag_media(media, tag)
+    }
+
+    pub fn set_favorite(&self, media: MediaId, favorite: bool) -> Result<(), CatalogError> {
+        self.0.set_favorite(media, favorite)
+    }
+
+    pub fn search_media(
+        &self,
+        query: &str,
+        maximum: u32,
+    ) -> Result<Vec<SearchResult>, CatalogError> {
+        self.0.search_media(query, maximum)
+    }
+
+    pub fn commit(self) -> Result<(), CatalogError> {
+        self.0.commit()
+    }
 }
 
 /// Copies a cleanly closed vault while holding its exclusive process lock.
@@ -578,6 +878,9 @@ pub fn backup_closed_with(
     }
     let (destination_parent, destination_name) = split_parent(destination)?;
     let parent = platform::open_directory(&destination_parent)?;
+    if platform::is_same_or_descendant(&source_directory, &parent)? {
+        return Err(ServiceError::InvalidInput);
+    }
     platform::create_directory(&parent, &destination_name)?;
     let destination_directory = platform::open_directory_at(&parent, &destination_name)?;
     backup_fail(faults, BackupPoint::DestinationCreated)?;
@@ -710,6 +1013,8 @@ pub enum ServiceError {
     ReadOnly,
     InvalidInput,
     InvalidJournal,
+    CleanupConflict,
+    PathIdentityChanged,
     DamagedObject,
     UncleanVault,
     InjectedFault(ServicePoint),
@@ -727,6 +1032,10 @@ impl fmt::Display for ServiceError {
             Self::ReadOnly => formatter.write_str("vault session is read-only"),
             Self::InvalidInput => formatter.write_str("invalid vault service input"),
             Self::InvalidJournal => formatter.write_str("invalid encrypted recovery journal"),
+            Self::CleanupConflict => formatter.write_str("cleanup target is still live in catalog"),
+            Self::PathIdentityChanged => {
+                formatter.write_str("vault directory identity changed during the session")
+            }
             Self::DamagedObject => formatter.write_str("vault object is marked damaged"),
             Self::UncleanVault => formatter.write_str("vault was not cleanly closed"),
             Self::InjectedFault(point) => write!(formatter, "injected service fault at {point:?}"),
@@ -824,6 +1133,68 @@ mod platform {
         Ok(file)
     }
 
+    pub(super) fn open_regular_member(directory: &File, member: &str) -> io::Result<File> {
+        let name =
+            CString::new(member).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG || metadata.st_nlink != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid catalog member",
+            ));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn validate_catalog_sidecars(
+        directory: &File,
+        require_empty_wal: bool,
+    ) -> io::Result<()> {
+        for name in ["catalog.db-wal", "catalog.db-shm", "catalog.db-journal"] {
+            let encoded = CString::new(name).expect("fixed catalog sidecar name");
+            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe {
+                libc::fstatat(
+                    directory.as_raw_fd(),
+                    encoded.as_ptr(),
+                    &mut metadata,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+            {
+                if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+                    || metadata.st_nlink != 1
+                    || (require_empty_wal && name == "catalog.db-wal" && metadata.st_size != 0)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid catalog sidecar",
+                    ));
+                }
+                continue;
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOENT) {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn create_directory(parent: &File, name: &OsStr) -> io::Result<()> {
         let name = CString::new(name.as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -851,6 +1222,79 @@ mod platform {
         }
     }
 
+    pub(super) fn identity(file: &File) -> io::Result<(u64, u64)> {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(file.as_raw_fd(), &mut metadata) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((metadata.st_dev, metadata.st_ino))
+    }
+
+    fn open_fd_numbers() -> io::Result<HashSet<i32>> {
+        let mut descriptors: HashSet<i32> = std::fs::read_dir("/proc/self/fd")?
+            .filter_map(|entry| {
+                entry.ok().and_then(|value| {
+                    value
+                        .file_name()
+                        .to_str()
+                        .and_then(|name| name.parse().ok())
+                })
+            })
+            .collect();
+        descriptors.retain(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1);
+        Ok(descriptors)
+    }
+
+    pub(super) fn open_fd_identity_counts() -> io::Result<HashMap<(u64, u64), usize>> {
+        let mut counts = HashMap::new();
+        for fd in open_fd_numbers()? {
+            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut metadata) } == 0 {
+                *counts
+                    .entry((metadata.st_dev, metadata.st_ino))
+                    .or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    pub(super) fn fd_identity_count_grew(
+        prior: &HashMap<(u64, u64), usize>,
+        sought: (u64, u64),
+        excluded: i32,
+    ) -> io::Result<bool> {
+        let mut count = 0;
+        for fd in open_fd_numbers()? {
+            if fd == excluded {
+                continue;
+            }
+            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut metadata) } != 0 {
+                continue;
+            }
+            if (metadata.st_dev, metadata.st_ino) == sought {
+                count += 1;
+            }
+        }
+        Ok(count > prior.get(&sought).copied().unwrap_or(0))
+    }
+
+    pub(super) fn is_same_or_descendant(ancestor: &File, candidate: &File) -> io::Result<bool> {
+        let sought = identity(ancestor)?;
+        let mut current = candidate.try_clone()?;
+        loop {
+            let current_identity = identity(&current)?;
+            if current_identity == sought {
+                return Ok(true);
+            }
+            let parent = open_directory_at(&current, OsStr::new(".."))?;
+            if identity(&parent)? == current_identity {
+                return Ok(false);
+            }
+            current = parent;
+        }
+    }
+
     fn names(directory: &File) -> io::Result<Vec<std::ffi::OsString>> {
         std::fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))?
             .map(|entry| entry.map(|value| value.file_name()))
@@ -862,6 +1306,27 @@ mod platform {
         destination: &File,
         faults: &mut impl BackupFaultInjector,
     ) -> Result<(), ServiceError> {
+        let destination_identity = identity(destination)?;
+        let mut visited = HashSet::new();
+        copy_tree_inner(
+            source,
+            destination,
+            destination_identity,
+            &mut visited,
+            faults,
+        )
+    }
+
+    fn copy_tree_inner(
+        source: &File,
+        destination: &File,
+        destination_identity: (u64, u64),
+        visited: &mut HashSet<(u64, u64)>,
+        faults: &mut impl BackupFaultInjector,
+    ) -> Result<(), ServiceError> {
+        if !visited.insert(identity(source)?) {
+            return Err(ServiceError::InvalidInput);
+        }
         for name in names(source)? {
             let encoded = CString::new(name.as_bytes())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -880,11 +1345,20 @@ mod platform {
             if unsafe { libc::fstat(source_entry.as_raw_fd(), &mut metadata) } != 0 {
                 return Err(io::Error::last_os_error().into());
             }
+            if (metadata.st_dev, metadata.st_ino) == destination_identity {
+                return Err(ServiceError::InvalidInput);
+            }
             match metadata.st_mode & libc::S_IFMT {
                 libc::S_IFDIR => {
                     create_directory(destination, &name)?;
                     let destination_entry = open_directory_at(destination, &name)?;
-                    copy_tree(&source_entry, &destination_entry, faults)?;
+                    copy_tree_inner(
+                        &source_entry,
+                        &destination_entry,
+                        destination_identity,
+                        visited,
+                        faults,
+                    )?;
                     destination_entry.sync_all()?;
                 }
                 libc::S_IFREG if metadata.st_nlink == 1 => {

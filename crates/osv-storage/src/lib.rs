@@ -10,6 +10,7 @@ pub use object::{
 };
 
 use std::{
+    cell::Cell,
     error::Error,
     fmt,
     fs::File,
@@ -278,6 +279,30 @@ impl UnlockedVault {
             DEFAULT_CHUNK_SIZE,
             &mut SystemRandom,
             &mut object::NoPublishFaults,
+            None,
+        )
+    }
+
+    /// Publication variant which reports every transient allocation status,
+    /// including allocations released before an error is returned.
+    pub fn publish_object_observed(
+        &self,
+        source: &mut impl Read,
+        logical_len: u64,
+        role: ObjectRole,
+        observer: &Cell<osv_crypto::LockStatus>,
+    ) -> Result<ObjectDescriptor, ObjectError> {
+        object::publish_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            source,
+            logical_len,
+            role,
+            DEFAULT_CHUNK_SIZE,
+            &mut SystemRandom,
+            &mut object::NoPublishFaults,
+            Some(observer),
         )
     }
 
@@ -302,6 +327,7 @@ impl UnlockedVault {
             chunk_size,
             random,
             faults,
+            None,
         )
     }
 
@@ -316,6 +342,23 @@ impl UnlockedVault {
             self.header.vault_id(),
             &self.derived_keys.object_wrapping,
             descriptor,
+            None,
+        )
+    }
+
+    /// Object-open variant which reports transient allocation status even when
+    /// authentication fails before a reader can be returned.
+    pub fn open_object_observed(
+        &self,
+        descriptor: &ObjectDescriptor,
+        observer: &Cell<osv_crypto::LockStatus>,
+    ) -> Result<ObjectReader<File>, ObjectError> {
+        object::open_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            descriptor,
+            Some(observer),
         )
     }
 }
