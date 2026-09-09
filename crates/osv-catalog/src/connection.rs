@@ -1,5 +1,7 @@
 use std::{
+    ffi::OsStr,
     fs::{self, OpenOptions},
+    os::unix::ffi::OsStrExt,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -17,7 +19,12 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogMode {
     ReadOnly,
+    /// Read-only snapshot which never consults or creates journal sidecars.
+    /// Callers must first prove the database was cleanly checkpointed.
+    ImmutableReadOnly,
     ReadWrite,
+    /// Writer whose WAL/SHM names are removed explicitly by an anchored owner.
+    PersistentReadWrite,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +49,8 @@ pub struct IntegrityReport {
 
 pub struct Catalog {
     pub(crate) connection: Connection,
+    #[cfg(target_os = "linux")]
+    _anchored_vfs: Option<crate::anchored_vfs::AnchoredVfs>,
     mode: CatalogMode,
     path: PathBuf,
     security_status: SecurityStatus,
@@ -72,6 +81,39 @@ impl Catalog {
             CatalogConfig::default(),
             &mut NoMigrationFault,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Creates a catalog through the descriptor-relative service VFS.
+    ///
+    /// The caller must hold its exclusive vault lock for the complete returned
+    /// `Catalog` lifetime. `osv-vault` is the production owner of that lock.
+    pub fn create_anchored(
+        path: &Path,
+        directory: std::fs::File,
+        key: &SecretKey<32>,
+        vault_id: &[u8; 16],
+        created_at_ms: i64,
+    ) -> Result<Self> {
+        if created_at_ms < 0 {
+            return Err(CatalogError::InvalidInput("timestamp"));
+        }
+        create_catalog_file(path)?;
+        let mut catalog = Self::open_anchored_connection(
+            path,
+            directory,
+            key,
+            CatalogMode::PersistentReadWrite,
+            CatalogConfig::default(),
+        )?;
+        migrate(
+            &mut catalog.connection,
+            vault_id,
+            created_at_ms,
+            &mut NoMigrationFault,
+        )?;
+        catalog.verify_vault(vault_id)?;
+        Ok(catalog)
     }
 
     pub fn create_with(
@@ -129,6 +171,38 @@ impl Catalog {
         Ok(catalog)
     }
 
+    #[cfg(target_os = "linux")]
+    /// Opens a catalog through the descriptor-relative service VFS.
+    ///
+    /// The caller must hold the matching shared or exclusive vault lock for the
+    /// complete returned `Catalog` lifetime. Only immutable readers and
+    /// persistent exclusive writers are supported by this no-locking VFS.
+    pub fn open_anchored(
+        path: &Path,
+        directory: std::fs::File,
+        key: &SecretKey<32>,
+        expected_vault_id: &[u8; 16],
+        mode: CatalogMode,
+    ) -> Result<Self> {
+        if !matches!(
+            mode,
+            CatalogMode::ImmutableReadOnly | CatalogMode::PersistentReadWrite
+        ) {
+            return Err(CatalogError::InvalidInput("anchored catalog mode"));
+        }
+        let catalog =
+            Self::open_anchored_connection(path, directory, key, mode, CatalogConfig::default())?;
+        let version: u32 = catalog
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version != crate::SCHEMA_VERSION {
+            return Err(CatalogError::UnknownSchema(version));
+        }
+        validate_migration_record(&catalog.connection)?;
+        catalog.verify_vault(expected_vault_id)?;
+        Ok(catalog)
+    }
+
     fn open_connection(
         path: &Path,
         key: &SecretKey<32>,
@@ -136,19 +210,89 @@ impl Catalog {
         config: CatalogConfig,
     ) -> Result<Self> {
         validate_catalog_file(path)?;
-        let flags = match mode {
-            CatalogMode::ReadOnly => {
+        let mut flags = match mode {
+            CatalogMode::ReadOnly | CatalogMode::ImmutableReadOnly => {
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
             }
-            CatalogMode::ReadWrite => {
+            CatalogMode::ReadWrite | CatalogMode::PersistentReadWrite => {
                 OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
             }
         };
-        let connection = Connection::open_with_flags(path, flags)?;
+        // SQLite rejects `/proc/self/fd/<directory>/catalog.db` as a symlink
+        // when NOFOLLOW is set even though only the intermediate procfs entry is
+        // a symlink. That form is already anchored by a live directory handle;
+        // ordinary paths still require SQLite's final-component protection.
+        let proc_fd_anchored = path
+            .components()
+            .take(4)
+            .map(|component| component.as_os_str())
+            .eq(["/", "proc", "self", "fd"].map(std::ffi::OsStr::new));
+        if !proc_fd_anchored {
+            flags |= OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        }
+        // Immutable mode is the only SQLite read-only mode which never opens
+        // or creates WAL/SHM sidecars. Vault readers are admitted only after
+        // the service has proved the writer cleanly checkpointed and closed.
+        let immutable_uri;
+        let open_path = if mode == CatalogMode::ImmutableReadOnly {
+            flags |= OpenFlags::SQLITE_OPEN_URI;
+            immutable_uri = immutable_file_uri(path.as_os_str());
+            Path::new(&immutable_uri)
+        } else {
+            path
+        };
+        let connection = Connection::open_with_flags(open_path, flags)?;
+        if mode == CatalogMode::PersistentReadWrite {
+            set_persistent_wal(&connection)?;
+        }
         let raw_key_status = apply_raw_key(&connection, key)?;
         configure(&connection, mode, config)?;
         Ok(Self {
             connection,
+            #[cfg(target_os = "linux")]
+            _anchored_vfs: None,
+            mode,
+            path: path.to_owned(),
+            security_status: SecurityStatus::new(key.lock_status().combine(raw_key_status)),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_anchored_connection(
+        path: &Path,
+        directory: std::fs::File,
+        key: &SecretKey<32>,
+        mode: CatalogMode,
+        config: CatalogConfig,
+    ) -> Result<Self> {
+        validate_catalog_file(path)?;
+        let anchored_vfs = crate::anchored_vfs::AnchoredVfs::register(directory)?;
+        let mut flags = match mode {
+            CatalogMode::ReadOnly | CatalogMode::ImmutableReadOnly => {
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            }
+            CatalogMode::ReadWrite | CatalogMode::PersistentReadWrite => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            }
+        };
+        let immutable_uri;
+        let open_path = if mode == CatalogMode::ImmutableReadOnly {
+            flags |= OpenFlags::SQLITE_OPEN_URI;
+            immutable_uri = immutable_file_uri(anchored_vfs.database_name().as_os_str());
+            Path::new(&immutable_uri)
+        } else {
+            anchored_vfs.database_name()
+        };
+        let connection =
+            Connection::open_with_flags_and_vfs(open_path, flags, anchored_vfs.name())?;
+        if mode == CatalogMode::PersistentReadWrite {
+            set_persistent_wal(&connection)?;
+        }
+        let raw_key_status = apply_raw_key(&connection, key)?;
+        configure(&connection, mode, config)?;
+        Ok(Self {
+            connection,
+            _anchored_vfs: Some(anchored_vfs),
             mode,
             path: path.to_owned(),
             security_status: SecurityStatus::new(key.lock_status().combine(raw_key_status)),
@@ -168,7 +312,10 @@ impl Catalog {
     }
 
     pub fn transaction(&mut self) -> Result<CatalogTransaction<'_>> {
-        if self.mode != CatalogMode::ReadWrite {
+        if !matches!(
+            self.mode,
+            CatalogMode::ReadWrite | CatalogMode::PersistentReadWrite
+        ) {
             return Err(CatalogError::InvalidInput("read-only transaction"));
         }
         CatalogTransaction::begin(&mut self.connection)
@@ -203,7 +350,10 @@ impl Catalog {
     }
 
     pub fn checkpoint_for_offline_backup(&mut self) -> Result<()> {
-        if self.mode != CatalogMode::ReadWrite {
+        if !matches!(
+            self.mode,
+            CatalogMode::ReadWrite | CatalogMode::PersistentReadWrite
+        ) {
             return Err(CatalogError::InvalidInput("read-only checkpoint"));
         }
         let (busy, _pages, remaining): (i64, i64, i64) =
@@ -218,7 +368,10 @@ impl Catalog {
     }
 
     pub fn close(mut self) -> Result<()> {
-        if self.mode == CatalogMode::ReadWrite {
+        if matches!(
+            self.mode,
+            CatalogMode::ReadWrite | CatalogMode::PersistentReadWrite
+        ) {
             self.checkpoint_for_offline_backup()?;
         }
         self.connection
@@ -229,6 +382,44 @@ impl Catalog {
     #[must_use]
     pub fn path_is_redacted_in_debug(&self) -> bool {
         !format!("{self:?}").contains(&self.path.to_string_lossy().to_string())
+    }
+}
+
+fn immutable_file_uri(path: &OsStr) -> std::ffi::OsString {
+    use std::fmt::Write as _;
+
+    let mut uri = String::from("file:");
+    for byte in path.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'/' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(*byte));
+        } else {
+            write!(&mut uri, "%{byte:02X}").expect("writing to a string cannot fail");
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri.into()
+}
+
+#[allow(unsafe_code)]
+fn set_persistent_wal(connection: &Connection) -> Result<()> {
+    let mut enabled: libc::c_int = 1;
+    // SAFETY: the connection is live and exclusively borrowed during this
+    // synchronous file-control call; SQLite reads and writes one integer.
+    let result = unsafe {
+        ffi::sqlite3_file_control(
+            connection.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_PERSIST_WAL,
+            std::ptr::from_mut(&mut enabled).cast(),
+        )
+    };
+    if result == ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(CatalogError::from(rusqlite::Error::SqliteFailure(
+            ffi::Error::new(result),
+            None,
+        )))
     }
 }
 
@@ -304,8 +495,11 @@ fn configure(connection: &Connection, mode: CatalogMode, config: CatalogConfig) 
         return Err(CatalogError::IntegrityFailed);
     }
     match mode {
-        CatalogMode::ReadOnly => connection.execute_batch("PRAGMA query_only=ON;")?,
+        CatalogMode::ReadOnly | CatalogMode::ImmutableReadOnly => {
+            connection.execute_batch("PRAGMA query_only=ON;")?
+        }
         CatalogMode::ReadWrite => connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=1000;")?,
+        CatalogMode::PersistentReadWrite => connection.execute_batch("PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON; PRAGMA wal_autocheckpoint=1000;")?,
     }
     Ok(())
 }

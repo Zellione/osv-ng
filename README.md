@@ -4,11 +4,12 @@
 GTK4, GStreamer, SQLCipher, native Wayland, and Flatpak are the accepted initial
 stack.
 
-The repository is currently in Phase 2. It contains the production Cargo
-workspace bootstrap plus the archived Phase 1 feasibility prototypes and
-Flatpak smoke application. The postponed manual Phase 1 checks remain required
-before release qualification; see [ROADMAP.md](ROADMAP.md) for their status and
-the current Phase 2 work.
+The repository is implementing Phase 6. GPT-6 approved its atomic vault-service
+blocker remediation; remaining acceptance work is recorded in the roadmap. The
+repository also contains the production cryptographic, encrypted object-store,
+and SQLCipher catalog foundations plus the archived Phase 1 feasibility
+prototypes. See [ROADMAP.md](ROADMAP.md) for the blockers, detailed status, and
+verification records.
 
 ## Build and test the Phase 2 workspace
 
@@ -60,10 +61,9 @@ This is a workspace bootstrap gate, not distributable application packaging.
 The temporary Flatpak ID grants no runtime permissions and does not decide the
 release application ID.
 
-The workspace currently establishes crate boundaries and shared test-support
-primitives; it is not yet a functional vault application. Development and
-diagnostic rules are in [docs/development-policy.md](docs/development-policy.md),
-and direct dependency decisions are in
+The workspace now provides a tested headless vault service; the end-user media
+pipeline and GTK application arrive in later phases. Development and diagnostic
+rules are in [docs/development-policy.md](docs/development-policy.md), and direct dependency decisions are in
 [docs/dependencies.md](docs/dependencies.md).
 
 ## Supported development environment
