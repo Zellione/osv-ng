@@ -50,3 +50,9 @@ safe read-only tooling.
 Phase 6 proved reader/reader success and reader/writer plus writer/writer
 exclusion across independent processes, including lock release after process
 kill. Broader concurrency requires a new persistence model and superseding ADR.
+
+The initial Phase 6 implementation is not yet accepted: independent review
+found that object readers can retain decryption authority after their service
+session closes and its lock is released, and that the current SQLCipher reader
+creates WAL/SHM sidecars. The Phase 6 blocker record in `ROADMAP.md` governs
+remediation and re-review.

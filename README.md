@@ -4,11 +4,12 @@
 GTK4, GStreamer, SQLCipher, native Wayland, and Flatpak are the accepted initial
 stack.
 
-The repository has completed Phase 6. It contains the production cryptographic,
-encrypted object-store, SQLCipher catalog, and atomic vault-service foundations,
-plus the archived Phase 1 feasibility prototypes. The postponed manual Phase 1
-checks remain required before release qualification; see
-[ROADMAP.md](ROADMAP.md) for detailed status and verification records.
+The repository is implementing Phase 6. Its first atomic vault-service change
+is committed but the phase gate is blocked on independent-review findings. The
+repository also contains the production cryptographic, encrypted object-store,
+and SQLCipher catalog foundations plus the archived Phase 1 feasibility
+prototypes. See [ROADMAP.md](ROADMAP.md) for the blockers, detailed status, and
+verification records.
 
 ## Build and test the Phase 2 workspace
 

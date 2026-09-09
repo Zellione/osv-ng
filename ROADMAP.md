@@ -994,7 +994,9 @@ objects.
 **Goal:** Combine catalog and objects without pretending they share a
 transaction.
 
-**Completed 2026-09-09**
+**Status:** Gate blocked as of 2026-09-09. Initial implementation is committed
+as `3faed36`; do not begin Phase 7 until the independent-review blockers below
+are remediated and re-reviewed.
 
 - Added the `osv-vault` composition crate. Writer imports durably publish and
   authenticate ciphertext before beginning the catalog transaction. Deletion
@@ -1008,11 +1010,10 @@ transaction.
   identities and marked damaged; unknown names, symlinks, hard links, and
   malformed namespaces are reported but never followed or removed.
 - Added a lifetime `flock` protocol on an owner-only, singly linked regular
-  lock file. Readers take shared locks and never mutate vault state; writers
-  take exclusive locks before credential derivation. Catalog access uses a
-  live directory descriptor through `/proc/self/fd`, while final catalog names,
-  object traversal, maintenance, deletion, and backup reject symlinks and
-  non-regular entries.
+  lock file. Readers take shared locks and writers take exclusive locks before
+  credential derivation. Object traversal, maintenance, deletion, and backup
+  use descriptor-relative no-follow operations; the attempted descriptor-
+  anchored catalog access is not effective and is a gate blocker below.
 - Clean writer close repairs outstanding work, checkpoints/truncates SQLCipher
   WAL state, releases secret-bearing storage, durably marks the vault clean,
   and releases the lock last. Writer crashes leave a durable dirty marker.
@@ -1035,13 +1036,65 @@ transaction.
   cover the lower filesystem and SQLCipher boundaries composed here.
 - Tests cover successful import/read, read-only rejection, derived replacement,
   deletion after key removal, idempotent cleanup, orphan and staging recovery,
-  missing and corrupt originals, restrictive-permission failure, an `ENOSPC`
-  I/O path, complete cold backup/restore, interrupted copy rejection, busy
-  backup rejection, and dirty-marker recovery. At no tested boundary does a
-  catalog reference precede durable object publication.
+  missing and corrupt originals and derivatives, restrictive-permission
+  failure, a source-side `ENOSPC` read error, complete cold backup/restore,
+  interrupted copy rejection, busy backup rejection, and dirty-marker recovery.
+  The review found material untested boundaries and adversarial cases, so these
+  results do not yet satisfy the Phase 6 exit criteria.
 - Production and fuzz dependency graphs pass `cargo audit` and `cargo deny`.
   The checksum-pinned offline Flatpak release test/build gate passes with the
   new crate, and all three installed stubs execute successfully in the sandbox.
+
+**Independent review blockers recorded 2026-09-09**
+
+GPT-6 Astra reviewed `3faed36`, reproduced four failures with temporary harnesses,
+and rejected the phase gate. Resolve all blockers before restoring Complete:
+
+1. **P1 — catalog path containment is ineffective.** SQLite's Unix VFS
+   canonicalizes `/proc/self/fd/<directory>/catalog.db` back to an ordinary
+   pathname while `osv-catalog` disables `SQLITE_OPEN_NOFOLLOW` for that form.
+   The catalog and its sidecars can therefore escape the directory identity
+   whose lock and object-store handles the service owns after a directory or
+   final-name substitution. Implement genuinely descriptor-relative catalog
+   and sidecar access, or explicitly gate the invariant; add adversarial path
+   replacement tests.
+2. **P1 — object authority outlives the service lock.** `open_object` returns an
+   owned reader containing its file descriptor, DEK, and plaintext cache. The
+   reviewer closed the service, opened a new writer, deleted the media, and
+   still decrypted the entire object through the old reader. Tie reader
+   authority to the session lifetime or implement explicit revocation, and
+   test close/deletion with outstanding readers.
+3. **P1 — recovery can unlink a live catalog object.** Cleanup replay trusts an
+   authenticated journal payload without proving that its target is absent
+   from the live object table. The public full `CatalogTransaction` surface can
+   insert such a journal or an object reference that bypasses publication
+   ordering. Restrict the service transaction API to metadata-only operations,
+   semantically validate every cleanup target before unlink, and fail without
+   mutation on conflicts.
+4. **P2 — backup descendant detection is lexical.** An aliased path containing
+   `..` bypassed `destination.starts_with(source)` and recursively copied the
+   vault into itself until `EMFILE`. Compare opened filesystem identities and
+   ancestry before destination creation, prevent traversal from revisiting the
+   destination, and add relative, `..`, and symlink-alias regression tests.
+5. **P2 — reader mode mutates and requires directory write access.** A reader
+   created `catalog.db-wal` and `catalog.db-shm`; opening a clean vault in a
+   `0500` directory failed. Implement a genuinely non-mutating reader
+   configuration with explicit dirty/WAL handling, then verify no filesystem
+   changes and successful read-only-directory access.
+6. **P2 — lock-degradation reporting is lost.** The service exposes no combined
+   `SecurityStatus` and discards publication and recovery-reader lock status.
+   Aggregate all lower-layer and transient-operation degradation conservatively
+   and add a subprocess test with the memory-lock limit lowered.
+
+**Acceptance gaps found by review**
+
+- The current `ENOSPC` test fails the plaintext input reader; it does not cover
+  ciphertext writes, `fsync`, directory durability, or catalog commit failure.
+- Vault creation, clean/dirty marker transitions, and some recovery/unlink
+  filesystem boundaries lack the promised subprocess kill/fault matrix.
+- Re-run the complete workspace, dependency-policy, fuzz-workspace, and offline
+  Flatpak gates after remediation, then obtain independent approval before
+  changing the phase status back to Complete.
 
 **Deviations and follow-up**
 

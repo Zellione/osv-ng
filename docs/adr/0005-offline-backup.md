@@ -49,3 +49,8 @@ backup protocol would need a consistent-generation manifest and is deferred.
 Phase 6 tested complete and interrupted copies, busy and dirty source rejection,
 missing objects, and cold restore. A future live-backup design requires a
 superseding ADR and explicit generation consistency.
+
+The initial Phase 6 implementation is not yet accepted: independent review
+demonstrated that lexical destination checking permits an aliased descendant
+path to recurse into the source vault. The Phase 6 blocker record in
+`ROADMAP.md` must be resolved before this implementation is treated as valid.
