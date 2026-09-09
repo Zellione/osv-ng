@@ -665,7 +665,6 @@ struct DirectoryBinding {
     identity: (u64, u64),
     catalog_identity: Option<(u64, u64)>,
     catalog_sidecars: Vec<(String, File, (u64, u64))>,
-    pre_catalog_fds: HashMap<(u64, u64), usize>,
 }
 
 impl DirectoryBinding {
@@ -680,7 +679,6 @@ impl DirectoryBinding {
             identity: platform::identity(directory)?,
             catalog_identity: None,
             catalog_sidecars: Vec::new(),
-            pre_catalog_fds: platform::open_fd_identity_counts()?,
         })
     }
 
@@ -695,24 +693,10 @@ impl DirectoryBinding {
         if expected_catalog_identity.is_some_and(|expected| expected != catalog_identity) {
             return Err(ServiceError::PathIdentityChanged);
         }
-        if !platform::fd_identity_count_grew(
-            &self.pre_catalog_fds,
-            catalog_identity,
-            catalog.as_raw_fd(),
-        )? {
-            return Err(ServiceError::PathIdentityChanged);
-        }
         if require_sidecars {
             let member = "catalog.db-wal";
             let sidecar = platform::open_regular_member(directory, member)?;
             let identity = platform::identity(&sidecar)?;
-            if !platform::fd_identity_count_grew(
-                &self.pre_catalog_fds,
-                identity,
-                sidecar.as_raw_fd(),
-            )? {
-                return Err(ServiceError::PathIdentityChanged);
-            }
             self.catalog_sidecars
                 .push((member.to_owned(), sidecar, identity));
         }
@@ -1228,55 +1212,6 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         Ok((metadata.st_dev, metadata.st_ino))
-    }
-
-    fn open_fd_numbers() -> io::Result<HashSet<i32>> {
-        let mut descriptors: HashSet<i32> = std::fs::read_dir("/proc/self/fd")?
-            .filter_map(|entry| {
-                entry.ok().and_then(|value| {
-                    value
-                        .file_name()
-                        .to_str()
-                        .and_then(|name| name.parse().ok())
-                })
-            })
-            .collect();
-        descriptors.retain(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1);
-        Ok(descriptors)
-    }
-
-    pub(super) fn open_fd_identity_counts() -> io::Result<HashMap<(u64, u64), usize>> {
-        let mut counts = HashMap::new();
-        for fd in open_fd_numbers()? {
-            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut metadata) } == 0 {
-                *counts
-                    .entry((metadata.st_dev, metadata.st_ino))
-                    .or_insert(0) += 1;
-            }
-        }
-        Ok(counts)
-    }
-
-    pub(super) fn fd_identity_count_grew(
-        prior: &HashMap<(u64, u64), usize>,
-        sought: (u64, u64),
-        excluded: i32,
-    ) -> io::Result<bool> {
-        let mut count = 0;
-        for fd in open_fd_numbers()? {
-            if fd == excluded {
-                continue;
-            }
-            let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(fd, &mut metadata) } != 0 {
-                continue;
-            }
-            if (metadata.st_dev, metadata.st_ino) == sought {
-                count += 1;
-            }
-        }
-        Ok(count > prior.get(&sought).copied().unwrap_or(0))
     }
 
     pub(super) fn is_same_or_descendant(ancestor: &File, candidate: &File) -> io::Result<bool> {

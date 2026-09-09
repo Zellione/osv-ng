@@ -1098,6 +1098,13 @@ explicitly excluding the remaining acceptance gaps from that approval:
   public anchored catalog APIs now document their external lifetime-lock
   precondition and reject unsupported modes. Resume Phase 6 at the acceptance
   gaps below, not at the resolved blocker list.
+- CI follow-up: the first PR workspace run exposed a parallel-test race in the
+  obsolete service-level process-wide descriptor-count inference. Two vault
+  creation helpers spuriously returned `PathIdentityChanged` while unrelated
+  tests opened and closed descriptors. The descriptor-native VFS already owns
+  the exact validated catalog descriptors, so the redundant count snapshots
+  and comparisons were removed; stable directory, catalog, and WAL inode
+  bindings remain in place.
 
 1. **P1 — catalog path containment and VFS safety.** The service registers a
    per-connection descriptor-native VFS. Each fixed catalog member is opened
