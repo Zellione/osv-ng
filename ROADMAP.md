@@ -994,10 +994,10 @@ objects.
 **Goal:** Combine catalog and objects without pretending they share a
 transaction.
 
-**Status:** Blocker remediation approved by GPT-6 as of 2026-09-09; the phase
-gate remains open for the acceptance gaps below. The initial implementation is
-committed as `3faed36`, and the review remediations and regression tests remain
-local. Do not begin Phase 7 until the remaining acceptance gaps are closed.
+**Status:** Complete as of 2026-09-10. Acceptance-gap implementation, full local
+verification, and independent review are complete. Blocker remediation is
+merged through `da37c1f`; the final acceptance work remains local on the phase
+remediation branch.
 
 - Added the `osv-vault` composition crate. Writer imports durably publish and
   authenticate ciphertext before beginning the catalog transaction. Deletion
@@ -1143,15 +1143,40 @@ explicitly excluding the remaining acceptance gaps from that approval:
    `RLIMIT_MEMLOCK=0` observe `Degraded` for open, failed import, and failed
    object-open paths.
 
-**Acceptance gaps found by review**
+**Acceptance-gap remediation completed 2026-09-10**
 
-- The current `ENOSPC` test fails the plaintext input reader; it does not cover
-  ciphertext writes, `fsync`, directory durability, or catalog commit failure.
-- Vault creation, clean/dirty marker transitions, and some recovery/unlink
-  filesystem boundaries lack the promised subprocess kill/fault matrix.
-- Re-run the complete workspace, dependency-policy, fuzz-workspace, and offline
-  Flatpak gates after remediation, then obtain independent approval before
-  changing the phase status back to Complete.
+- Publication now exposes exact-call persistence faults separately from crash
+  boundaries. Deterministic `ENOSPC` tests cover ciphertext writes, ciphertext
+  `fsync`, each namespace-creation sync, final-shard sync, and staging-directory
+  sync. The write matrix includes a multi-chunk failure after encrypted payload
+  has reached the staging file. Every failure returns no catalog reference and
+  writer recovery removes the recognized staging file or encrypted orphan.
+- GPT-6 Astra's first acceptance review rejected a too-late namespace-sync hook:
+  a successful `mkdir` followed by failed parent sync could leave the name
+  present, and retry previously skipped that durability barrier. Publication now
+  syncs the parent after both creation and `AlreadyExists`, with the injection on
+  that actual sync path. A regression fails the role-root sync twice on the same
+  writer before a successful import and subsequent orphan cleanup.
+- The per-connection anchored VFS has a test-only, race-free next-sync failure.
+  A real SQLite commit receiving `SQLITE_IOERR_FSYNC` recovers to either legal
+  transaction outcome: an uncommitted catalog with its orphan removed, or a
+  committed catalog whose already-durable object authenticates successfully.
+  The catalog never references absent or unauthenticated ciphertext.
+- Stable boundaries and real `SIGKILL` tests now cover creation; ordinary writer
+  dirty-marker truncate, write, and sync; catalog close; clean-marker truncate,
+  write, and sync; immediate cleanup unlink/sync; and recovery cleanup, staging,
+  and orphan unlink/sync. Exact marker and unlink-directory sync failures retain
+  safe reader admission and cleanup intent behavior across reopen. Creation
+  interrupted after only the storage layer is durable is rejected as incomplete;
+  later creation and all cleanup states converge on the next writer open.
+- Workspace formatting, all-target/all-feature tests, warnings-as-errors Clippy,
+  the exact secret-canary regression, production and fuzz `cargo audit`/`cargo
+  deny`, fuzz formatting, and the 20-second ASan harness smoke pass. The offline
+  Flatpak release test/build gate passes, and all three installed stubs execute.
+  The no-default-features vault integration-test target also compiles, closing a
+  feature-guard regression found by the first independent review.
+- GPT-6 Astra's final independent re-review found no remaining P0-P3 issue and
+  approved Phase 6 acceptance completion. The Phase 7 gate is open.
 
 **Deviations and follow-up**
 
@@ -1184,6 +1209,30 @@ explicitly excluding the remaining acceptance gaps from that approval:
 ### Phase 7 — Media and archive isolation foundation
 
 **Goal:** Put hostile parsers behind a narrow, testable authority boundary.
+
+**Status:** Planned on 2026-09-10 and ready to start after Phase 6 approval. No
+Phase 7 implementation has started.
+
+**Implementation sequence**
+
+1. Record a protocol/authority-lifecycle ADR, then add a dependency-light
+   protocol crate with a fixed magic, explicit version negotiation, bounded
+   frame lengths, request identities, and state-machine validation.
+2. Add Unix descriptor and bounded-stream transport. The broker owns and wipes
+   authenticated plaintext buffers; workers receive neither vault paths nor
+   keys, and cancellation closes every object-scoped channel.
+3. Add a short-lived child supervisor with startup handshake, deadlines,
+   cancellation escalation, exit classification, bounded restart policy, and
+   deterministic teardown.
+4. Apply Linux sandboxing before worker protocol acceptance: `no_new_privs`,
+   descriptor allowlisting, resource limits, network denial, and separately
+   measured seccomp/Landlock policy with explicit degraded-state reporting.
+5. Integrate the media and archive worker stubs, then add malformed-protocol
+   property/fuzz tests, hostile worker subprocess tests, sanitizer coverage,
+   and Flatpak hardware/software compatibility checks.
+
+Each slice must land test-first and keep worker messages, diagnostics, and
+errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deliverables**
 

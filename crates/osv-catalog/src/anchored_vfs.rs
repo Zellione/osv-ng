@@ -7,7 +7,7 @@ use std::{
     os::fd::AsRawFd,
     os::unix::ffi::OsStrExt,
     ptr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use rusqlite::ffi;
@@ -20,6 +20,7 @@ static NEXT_RETIRED_ID: AtomicU64 = AtomicU64::new(1);
 struct Context {
     directory: File,
     logical_database: CString,
+    fail_next_sync: AtomicBool,
 }
 
 #[repr(C)]
@@ -27,6 +28,7 @@ struct AnchoredFile {
     base: ffi::sqlite3_file,
     descriptor: libc::c_int,
     persistent_wal: libc::c_int,
+    context: *const Context,
 }
 
 pub(crate) struct AnchoredVfs {
@@ -54,6 +56,7 @@ impl AnchoredVfs {
         let mut context = Box::new(Context {
             directory,
             logical_database: database_name.clone(),
+            fail_next_sync: AtomicBool::new(false),
         });
         // Clone only platform services such as randomness and time. All
         // filename-bearing callbacks and file I/O are replaced below.
@@ -86,6 +89,11 @@ impl AnchoredVfs {
 
     pub(crate) fn database_name(&self) -> &std::path::Path {
         std::path::Path::new(std::ffi::OsStr::from_bytes(self.database_name.as_bytes()))
+    }
+
+    #[cfg(feature = "test-fixtures")]
+    pub(crate) fn fail_next_sync(&self) {
+        self.context.fail_next_sync.store(true, Ordering::Release);
     }
 }
 
@@ -184,6 +192,7 @@ unsafe extern "C" fn x_open(
         },
         descriptor,
         persistent_wal: 0,
+        context,
     };
     // SAFETY: SQLite allocated and aligned vfs.szOsFile bytes for output.
     unsafe { output.cast::<AnchoredFile>().write(file) };
@@ -301,7 +310,16 @@ unsafe extern "C" fn io_truncate(
 }
 
 unsafe extern "C" fn io_sync(file: *mut ffi::sqlite3_file, _flags: libc::c_int) -> libc::c_int {
-    if unsafe { libc::fsync(anchored_file(file).descriptor) } == 0 {
+    let file = anchored_file(file);
+    // Test-only configuration is stored in the per-connection VFS context, so
+    // parallel catalogs cannot consume one another's injected failure.
+    if unsafe { &*file.context }
+        .fail_next_sync
+        .swap(false, Ordering::AcqRel)
+    {
+        return ffi::SQLITE_IOERR_FSYNC;
+    }
+    if unsafe { libc::fsync(file.descriptor) } == 0 {
         ffi::SQLITE_OK
     } else {
         ffi::SQLITE_IOERR_FSYNC

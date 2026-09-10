@@ -5,7 +5,7 @@ use std::{
 };
 
 use osv_catalog::{MediaClass, MediaId};
-use osv_crypto::Password;
+use osv_crypto::{KdfParams, Password};
 use osv_vault::{ImportMetadata, OpenMode, ServiceFaultInjector, ServicePoint, VaultService};
 
 struct PauseAt(ServicePoint);
@@ -38,6 +38,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|point| point.name() == boundary)
         .ok_or("invalid boundary")?;
     let password = Password::new(b"crash fixture password")?;
+    if operation == "create" {
+        let _vault = VaultService::create_with_faults(
+            Path::new(&path),
+            &password,
+            None,
+            KdfParams::new(8, 1, 1)?,
+            1,
+            &mut PauseAt(point),
+        )?;
+        return Err("fixture passed selected boundary without being killed".into());
+    }
     if operation == "recover" {
         let _vault = VaultService::open_with_recovery_faults(
             Path::new(&path),
@@ -50,6 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut vault = VaultService::open(Path::new(&path), &password, None, OpenMode::Writer)?;
     match operation.as_str() {
+        "close" => vault.close_with_faults(&mut PauseAt(point))?,
         "import" => {
             vault.import_with(
                 &mut Cursor::new(b"crash import"),

@@ -321,6 +321,17 @@ impl Catalog {
         CatalogTransaction::begin(&mut self.connection)
     }
 
+    /// Makes the next anchored VFS sync fail for persistence testing.
+    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+    pub fn fail_next_sync_for_test(&self) -> Result<()> {
+        let vfs = self
+            ._anchored_vfs
+            .as_ref()
+            .ok_or(CatalogError::InvalidInput("unanchored sync fault"))?;
+        vfs.fail_next_sync();
+        Ok(())
+    }
+
     #[must_use]
     pub const fn reader(&self) -> CatalogReader<'_> {
         CatalogReader::new(&self.connection)

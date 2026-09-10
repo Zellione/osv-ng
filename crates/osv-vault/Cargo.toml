@@ -8,7 +8,7 @@ repository.workspace = true
 publish = false
 
 [features]
-test-fixtures = []
+test-fixtures = ["osv-catalog/test-fixtures", "osv-storage/test-fixtures"]
 
 [[bin]]
 name = "osv-vault-lock-fixture"
