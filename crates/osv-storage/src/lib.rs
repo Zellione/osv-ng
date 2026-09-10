@@ -6,7 +6,8 @@ pub use object::{
     CiphertextInventory, CiphertextObject, DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MAX_LOGICAL_LEN,
     MIN_CHUNK_SIZE, OBJECT_FORMAT_VERSION, OBJECT_HEADER_LEN, ObjectDescriptor, ObjectError,
     ObjectId, ObjectPreamble, ObjectReader, ObjectRole, PUBLISH_POINTS, PublishFaultInjector,
-    PublishPoint, WrappedObjectKey,
+    PublishIoPoint, PublishPoint, RemovalFaultInjector, RemovalIoPoint, RemovalPoint,
+    WrappedObjectKey,
 };
 
 use std::{
@@ -181,8 +182,25 @@ impl UnlockedVault {
         object::remove_object(&self.directory, id, role)
     }
 
+    pub fn remove_ciphertext_with_faults(
+        &self,
+        id: ObjectId,
+        role: ObjectRole,
+        faults: &mut impl RemovalFaultInjector,
+    ) -> Result<bool, ObjectError> {
+        object::remove_object_with_faults(&self.directory, id, role, faults)
+    }
+
     pub fn remove_staging_ciphertext(&self, id: ObjectId) -> Result<bool, ObjectError> {
         object::remove_staging(&self.directory, id)
+    }
+
+    pub fn remove_staging_ciphertext_with_faults(
+        &self,
+        id: ObjectId,
+        faults: &mut impl RemovalFaultInjector,
+    ) -> Result<bool, ObjectError> {
+        object::remove_staging_with_faults(&self.directory, id, faults)
     }
 
     /// Atomically replaces credential wrapping without changing the master key.
@@ -302,6 +320,29 @@ impl UnlockedVault {
             DEFAULT_CHUNK_SIZE,
             &mut SystemRandom,
             &mut object::NoPublishFaults,
+            Some(observer),
+        )
+    }
+
+    /// Observed publication variant with deterministic persistence failures.
+    pub fn publish_object_observed_with_faults(
+        &self,
+        source: &mut impl Read,
+        logical_len: u64,
+        role: ObjectRole,
+        observer: &Cell<osv_crypto::LockStatus>,
+        faults: &mut impl PublishFaultInjector,
+    ) -> Result<ObjectDescriptor, ObjectError> {
+        object::publish_object(
+            &self.directory,
+            self.header.vault_id(),
+            &self.derived_keys.object_wrapping,
+            source,
+            logical_len,
+            role,
+            DEFAULT_CHUNK_SIZE,
+            &mut SystemRandom,
+            faults,
             Some(observer),
         )
     }

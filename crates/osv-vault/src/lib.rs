@@ -20,7 +20,10 @@ use osv_catalog::{
     NewDerivedObject, NewGallery, NewMedia, NewObject, ObjectState, SearchResult, TagId,
 };
 use osv_crypto::{KdfParams, LockStatus, Password, SecretBytes, SecurityStatus};
-use osv_storage::{ObjectError, ObjectId, ObjectReader, ObjectRole, UnlockedVault, VaultError};
+use osv_storage::{
+    ObjectError, ObjectId, ObjectReader, ObjectRole, RemovalFaultInjector, RemovalIoPoint,
+    RemovalPoint, UnlockedVault, VaultError,
+};
 
 const CATALOG_NAME: &str = "catalog.db";
 const LOCK_NAME: &str = "vault.lock";
@@ -36,33 +39,104 @@ pub enum OpenMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServicePoint {
+    CreationStorageDurable,
+    CreationCatalogDurable,
+    CreationDirtyMarkerTruncated,
+    CreationDirtyMarkerWritten,
+    CreationDirtyMarkerDurable,
+    WriterDirtyMarkerTruncated,
+    WriterDirtyMarkerWritten,
+    WriterDirtyMarkerDurable,
     ObjectDurable,
     BeforeCatalogCommit,
     CatalogCommitted,
+    CiphertextUnlinked,
     CiphertextRemoved,
+    RecoveryCiphertextUnlinked,
+    RecoveryCiphertextRemoved,
+    RecoveryStagingUnlinked,
+    RecoveryStagingRemoved,
+    RecoveryOrphanUnlinked,
+    RecoveryOrphanRemoved,
     RecoveryRepair,
+    CloseCatalogClosed,
+    CloseCleanMarkerTruncated,
+    CloseCleanMarkerWritten,
+    CloseCleanMarkerDurable,
 }
 
 impl ServicePoint {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::CreationStorageDurable => "service-creation-storage-durable",
+            Self::CreationCatalogDurable => "service-creation-catalog-durable",
+            Self::CreationDirtyMarkerTruncated => "service-creation-dirty-marker-truncated",
+            Self::CreationDirtyMarkerWritten => "service-creation-dirty-marker-written",
+            Self::CreationDirtyMarkerDurable => "service-creation-dirty-marker-durable",
+            Self::WriterDirtyMarkerTruncated => "service-writer-dirty-marker-truncated",
+            Self::WriterDirtyMarkerWritten => "service-writer-dirty-marker-written",
+            Self::WriterDirtyMarkerDurable => "service-writer-dirty-marker-durable",
             Self::ObjectDurable => "service-object-durable",
             Self::BeforeCatalogCommit => "service-before-catalog-commit",
             Self::CatalogCommitted => "service-catalog-committed",
+            Self::CiphertextUnlinked => "service-ciphertext-unlinked",
             Self::CiphertextRemoved => "service-ciphertext-removed",
+            Self::RecoveryCiphertextUnlinked => "service-recovery-ciphertext-unlinked",
+            Self::RecoveryCiphertextRemoved => "service-recovery-ciphertext-removed",
+            Self::RecoveryStagingUnlinked => "service-recovery-staging-unlinked",
+            Self::RecoveryStagingRemoved => "service-recovery-staging-removed",
+            Self::RecoveryOrphanUnlinked => "service-recovery-orphan-unlinked",
+            Self::RecoveryOrphanRemoved => "service-recovery-orphan-removed",
             Self::RecoveryRepair => "service-recovery-repair",
+            Self::CloseCatalogClosed => "service-close-catalog-closed",
+            Self::CloseCleanMarkerTruncated => "service-close-clean-marker-truncated",
+            Self::CloseCleanMarkerWritten => "service-close-clean-marker-written",
+            Self::CloseCleanMarkerDurable => "service-close-clean-marker-durable",
         }
     }
 }
 
-pub const SERVICE_POINTS: [ServicePoint; 5] = [
+pub const SERVICE_POINTS: [ServicePoint; 24] = [
+    ServicePoint::CreationStorageDurable,
+    ServicePoint::CreationCatalogDurable,
+    ServicePoint::CreationDirtyMarkerTruncated,
+    ServicePoint::CreationDirtyMarkerWritten,
+    ServicePoint::CreationDirtyMarkerDurable,
+    ServicePoint::WriterDirtyMarkerTruncated,
+    ServicePoint::WriterDirtyMarkerWritten,
+    ServicePoint::WriterDirtyMarkerDurable,
     ServicePoint::ObjectDurable,
     ServicePoint::BeforeCatalogCommit,
     ServicePoint::CatalogCommitted,
+    ServicePoint::CiphertextUnlinked,
     ServicePoint::CiphertextRemoved,
+    ServicePoint::RecoveryCiphertextUnlinked,
+    ServicePoint::RecoveryCiphertextRemoved,
+    ServicePoint::RecoveryStagingUnlinked,
+    ServicePoint::RecoveryStagingRemoved,
+    ServicePoint::RecoveryOrphanUnlinked,
+    ServicePoint::RecoveryOrphanRemoved,
     ServicePoint::RecoveryRepair,
+    ServicePoint::CloseCatalogClosed,
+    ServicePoint::CloseCleanMarkerTruncated,
+    ServicePoint::CloseCleanMarkerWritten,
+    ServicePoint::CloseCleanMarkerDurable,
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceIoPoint {
+    CreationDirtyMarkerWrite,
+    CreationDirtyMarkerSync,
+    WriterDirtyMarkerWrite,
+    WriterDirtyMarkerSync,
+    CloseCleanMarkerWrite,
+    CloseCleanMarkerSync,
+    CiphertextDirectorySync,
+    RecoveryCiphertextDirectorySync,
+    RecoveryStagingDirectorySync,
+    RecoveryOrphanDirectorySync,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackupPoint {
@@ -86,6 +160,10 @@ impl BackupFaultInjector for NoBackupFaults {
 
 pub trait ServiceFaultInjector {
     fn should_fail(&mut self, point: ServicePoint) -> bool;
+
+    fn io_error(&mut self, _point: ServiceIoPoint) -> Option<io::Error> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -164,7 +242,27 @@ impl VaultService {
         kdf_params: KdfParams,
         created_at_ms: i64,
     ) -> Result<Self, ServiceError> {
+        Self::create_with_faults(
+            path,
+            password,
+            keyfile,
+            kdf_params,
+            created_at_ms,
+            &mut NoServiceFaults,
+        )
+    }
+
+    /// Creation variant exposing only post-durability interruption boundaries.
+    pub fn create_with_faults(
+        path: &Path,
+        password: &Password,
+        keyfile: Option<&SecretBytes>,
+        kdf_params: KdfParams,
+        created_at_ms: i64,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<Self, ServiceError> {
         let storage = UnlockedVault::create(path, password, keyfile, kdf_params)?;
+        fail(faults, ServicePoint::CreationStorageDurable)?;
         let directory = storage.try_clone_directory()?;
         let directory_binding = DirectoryBinding::capture(path, &directory)?;
         let mut lock = VaultLock::acquire(&directory, OpenMode::Writer, true)?;
@@ -179,7 +277,8 @@ impl VaultService {
         let directory_binding = directory_binding.bind_catalog(&directory, true, None)?;
         directory_binding.verify()?;
         directory.sync_all()?;
-        lock.mark_dirty()?;
+        fail(faults, ServicePoint::CreationCatalogDurable)?;
+        lock.mark_creation_dirty(faults)?;
         let security_lock_status = storage
             .security_status()
             .page_locks()
@@ -245,7 +344,7 @@ impl VaultService {
             .page_locks()
             .combine(catalog.security_status().page_locks());
         if mode == OpenMode::Writer {
-            lock.mark_dirty()?;
+            lock.mark_writer_dirty(faults)?;
         }
         let mut service = Self {
             catalog: Some(catalog),
@@ -313,6 +412,68 @@ impl VaultService {
                 .expect("published objects record transient lock status")
                 .page_locks(),
         );
+        self.catalog_import(descriptor, metadata, faults)
+    }
+
+    /// Publication variant used to prove exact filesystem failures cannot
+    /// create catalog references.
+    pub fn import_with_publication_faults(
+        &mut self,
+        source: &mut impl Read,
+        logical_len: u64,
+        metadata: ImportMetadata<'_>,
+        publication_faults: &mut impl osv_storage::PublishFaultInjector,
+    ) -> Result<ObjectId, ServiceError> {
+        self.require_writer()?;
+        self.directory_binding.verify()?;
+        let descriptor = self.storage().publish_object_observed_with_faults(
+            source,
+            logical_len,
+            ObjectRole::Original,
+            &self.security_lock_status,
+            publication_faults,
+        )?;
+        self.record_lock_status(
+            descriptor
+                .publication_security_status()
+                .expect("published objects record transient lock status")
+                .page_locks(),
+        );
+        self.catalog_import(descriptor, metadata, &mut NoServiceFaults)
+    }
+
+    /// Import variant whose real catalog-commit sync fails in the anchored VFS.
+    #[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+    pub fn import_with_catalog_sync_failure(
+        &mut self,
+        source: &mut impl Read,
+        logical_len: u64,
+        metadata: ImportMetadata<'_>,
+    ) -> Result<ObjectId, ServiceError> {
+        self.require_writer()?;
+        self.directory_binding.verify()?;
+        let descriptor = self.storage().publish_object_observed(
+            source,
+            logical_len,
+            ObjectRole::Original,
+            &self.security_lock_status,
+        )?;
+        self.record_lock_status(
+            descriptor
+                .publication_security_status()
+                .expect("published objects record transient lock status")
+                .page_locks(),
+        );
+        self.catalog().fail_next_sync_for_test()?;
+        self.catalog_import(descriptor, metadata, &mut NoServiceFaults)
+    }
+
+    fn catalog_import(
+        &mut self,
+        descriptor: osv_storage::ObjectDescriptor,
+        metadata: ImportMetadata<'_>,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<ObjectId, ServiceError> {
         fail(faults, ServicePoint::ObjectDurable)?;
         let locator = UnlockedVault::object_locator(descriptor.id(), descriptor.role());
         let mut catalog = self.catalog.take().expect("catalog present");
@@ -378,8 +539,7 @@ impl VaultService {
         self.catalog = Some(catalog);
         let objects = result?;
         fail(faults, ServicePoint::CatalogCommitted)?;
-        self.cleanup_descriptors(&objects)?;
-        fail(faults, ServicePoint::CiphertextRemoved)?;
+        self.cleanup_descriptors(&objects, faults)?;
         let tx = self.catalog_mut().transaction()?;
         tx.remove_operation(operation_id)?;
         tx.commit()?;
@@ -475,8 +635,7 @@ impl VaultService {
         self.catalog = Some(catalog);
         let old = result?;
         fail(faults, ServicePoint::CatalogCommitted)?;
-        self.cleanup_descriptors(&old)?;
-        fail(faults, ServicePoint::CiphertextRemoved)?;
+        self.cleanup_descriptors(&old, faults)?;
         let tx = self.catalog_mut().transaction()?;
         tx.remove_operation(operation_id)?;
         tx.commit()?;
@@ -514,7 +673,16 @@ impl VaultService {
                 }
             }
             for (id, role) in cleanup {
-                if self.storage().remove_ciphertext(id, role)? {
+                let mut removal_faults = ServiceRemovalFaults {
+                    faults,
+                    unlinked: ServicePoint::RecoveryCiphertextUnlinked,
+                    durable: ServicePoint::RecoveryCiphertextRemoved,
+                    sync: ServiceIoPoint::RecoveryCiphertextDirectorySync,
+                };
+                if self
+                    .storage()
+                    .remove_ciphertext_with_faults(id, role, &mut removal_faults)?
+                {
                     report.removed_orphans += 1;
                 }
             }
@@ -533,7 +701,16 @@ impl VaultService {
         let inventory = self.storage().ciphertext_inventory()?;
         report.unexpected_entries = inventory.unexpected_entries;
         for id in inventory.staging_ids {
-            if self.storage().remove_staging_ciphertext(id)? {
+            let mut removal_faults = ServiceRemovalFaults {
+                faults,
+                unlinked: ServicePoint::RecoveryStagingUnlinked,
+                durable: ServicePoint::RecoveryStagingRemoved,
+                sync: ServiceIoPoint::RecoveryStagingDirectorySync,
+            };
+            if self
+                .storage()
+                .remove_staging_ciphertext_with_faults(id, &mut removal_faults)?
+            {
                 report.removed_staging_files += 1;
             }
         }
@@ -543,10 +720,20 @@ impl VaultService {
             .map(|object| (object.id, object.role))
             .collect();
         for object in inventory.objects {
-            if referenced.get(&object.id) != Some(&object.role)
-                && self.storage().remove_ciphertext(object.id, object.role)?
-            {
-                report.removed_orphans += 1;
+            if referenced.get(&object.id) != Some(&object.role) {
+                let mut removal_faults = ServiceRemovalFaults {
+                    faults,
+                    unlinked: ServicePoint::RecoveryOrphanUnlinked,
+                    durable: ServicePoint::RecoveryOrphanRemoved,
+                    sync: ServiceIoPoint::RecoveryOrphanDirectorySync,
+                };
+                if self.storage().remove_ciphertext_with_faults(
+                    object.id,
+                    object.role,
+                    &mut removal_faults,
+                )? {
+                    report.removed_orphans += 1;
+                }
             }
         }
         for object in objects {
@@ -599,7 +786,15 @@ impl VaultService {
         })
     }
 
-    pub fn close(mut self) -> Result<(), ServiceError> {
+    pub fn close(self) -> Result<(), ServiceError> {
+        self.close_with_faults(&mut NoServiceFaults)
+    }
+
+    /// Close variant exposing postcondition boundaries for crash tests.
+    pub fn close_with_faults(
+        mut self,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<(), ServiceError> {
         self.directory_binding.verify()?;
         if self.mode == OpenMode::Writer {
             self.recover_with(&mut NoServiceFaults)?;
@@ -607,10 +802,11 @@ impl VaultService {
         if let Some(catalog) = self.catalog.take() {
             catalog.close()?;
         }
+        fail(faults, ServicePoint::CloseCatalogClosed)?;
         drop(self.storage.take());
         // Lock is deliberately still live until this function returns.
         if self.mode == OpenMode::Writer {
-            self.lock.mark_clean()?;
+            self.lock.mark_clean_with(faults)?;
         }
         Ok(())
     }
@@ -618,6 +814,7 @@ impl VaultService {
     fn cleanup_descriptors(
         &self,
         objects: &[osv_catalog::CleanupObject],
+        faults: &mut impl ServiceFaultInjector,
     ) -> Result<(), ServiceError> {
         for object in objects {
             match self.catalog().reader().object(object.id) {
@@ -627,7 +824,17 @@ impl VaultService {
             }
         }
         for object in objects {
-            self.storage().remove_ciphertext(object.id, object.role)?;
+            let mut removal_faults = ServiceRemovalFaults {
+                faults,
+                unlinked: ServicePoint::CiphertextUnlinked,
+                durable: ServicePoint::CiphertextRemoved,
+                sync: ServiceIoPoint::CiphertextDirectorySync,
+            };
+            self.storage().remove_ciphertext_with_faults(
+                object.id,
+                object.role,
+                &mut removal_faults,
+            )?;
         }
         Ok(())
     }
@@ -940,6 +1147,38 @@ fn fail(faults: &mut impl ServiceFaultInjector, point: ServicePoint) -> Result<(
     }
 }
 
+fn service_io_fail(
+    faults: &mut impl ServiceFaultInjector,
+    point: ServiceIoPoint,
+) -> Result<(), ServiceError> {
+    faults
+        .io_error(point)
+        .map_or(Ok(()), |error| Err(error.into()))
+}
+
+struct ServiceRemovalFaults<'faults, F> {
+    faults: &'faults mut F,
+    unlinked: ServicePoint,
+    durable: ServicePoint,
+    sync: ServiceIoPoint,
+}
+
+impl<F: ServiceFaultInjector> RemovalFaultInjector for ServiceRemovalFaults<'_, F> {
+    fn should_fail(&mut self, point: RemovalPoint) -> bool {
+        let service_point = match point {
+            RemovalPoint::Unlinked => self.unlinked,
+            RemovalPoint::DirectoryDurable => self.durable,
+        };
+        self.faults.should_fail(service_point)
+    }
+
+    fn io_error(&mut self, point: RemovalIoPoint) -> Option<io::Error> {
+        match point {
+            RemovalIoPoint::DirectorySync => self.faults.io_error(self.sync),
+        }
+    }
+}
+
 fn member_path(directory: &File, name: &str) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}/{name}", directory.as_raw_fd()))
 }
@@ -965,19 +1204,71 @@ impl VaultLock {
         Ok(Self { file })
     }
 
-    fn mark_dirty(&mut self) -> io::Result<()> {
-        self.write_state(b'D')
+    fn mark_creation_dirty(
+        &mut self,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<(), ServiceError> {
+        self.write_state_with(
+            b'D',
+            faults,
+            ServicePoint::CreationDirtyMarkerTruncated,
+            ServicePoint::CreationDirtyMarkerWritten,
+            ServicePoint::CreationDirtyMarkerDurable,
+            ServiceIoPoint::CreationDirtyMarkerWrite,
+            ServiceIoPoint::CreationDirtyMarkerSync,
+        )
     }
 
-    fn mark_clean(&mut self) -> io::Result<()> {
-        self.write_state(b'C')
+    fn mark_writer_dirty(
+        &mut self,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<(), ServiceError> {
+        self.write_state_with(
+            b'D',
+            faults,
+            ServicePoint::WriterDirtyMarkerTruncated,
+            ServicePoint::WriterDirtyMarkerWritten,
+            ServicePoint::WriterDirtyMarkerDurable,
+            ServiceIoPoint::WriterDirtyMarkerWrite,
+            ServiceIoPoint::WriterDirtyMarkerSync,
+        )
     }
 
-    fn write_state(&mut self, state: u8) -> io::Result<()> {
+    fn mark_clean_with(
+        &mut self,
+        faults: &mut impl ServiceFaultInjector,
+    ) -> Result<(), ServiceError> {
+        self.write_state_with(
+            b'C',
+            faults,
+            ServicePoint::CloseCleanMarkerTruncated,
+            ServicePoint::CloseCleanMarkerWritten,
+            ServicePoint::CloseCleanMarkerDurable,
+            ServiceIoPoint::CloseCleanMarkerWrite,
+            ServiceIoPoint::CloseCleanMarkerSync,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_state_with(
+        &mut self,
+        state: u8,
+        faults: &mut impl ServiceFaultInjector,
+        truncated: ServicePoint,
+        written: ServicePoint,
+        durable: ServicePoint,
+        write_io: ServiceIoPoint,
+        sync_io: ServiceIoPoint,
+    ) -> Result<(), ServiceError> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.set_len(0)?;
+        fail(faults, truncated)?;
+        service_io_fail(faults, write_io)?;
         self.file.write_all(&[state])?;
-        self.file.sync_all()
+        fail(faults, written)?;
+        service_io_fail(faults, sync_io)?;
+        self.file.sync_all()?;
+        fail(faults, durable)
     }
 
     fn is_clean(&mut self) -> io::Result<bool> {

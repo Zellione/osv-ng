@@ -8,12 +8,15 @@ use std::{
 use std::os::unix::fs::PermissionsExt;
 
 use osv_catalog::{Catalog, CatalogMode, MediaClass, MediaId, ObjectState};
-use osv_crypto::{KdfParams, Password};
-use osv_storage::{ObjectRole, UnlockedVault};
+use osv_crypto::{KdfParams, Password, SystemRandom};
+use osv_storage::{
+    MIN_CHUNK_SIZE, ObjectError, ObjectRole, PublishFaultInjector, PublishIoPoint, PublishPoint,
+    UnlockedVault,
+};
 use osv_test_support::TempVault;
 use osv_vault::{
     BackupFaultInjector, BackupPoint, ImportMetadata, OpenMode, ServiceError, ServiceFaultInjector,
-    ServicePoint, VaultService, backup_closed, backup_closed_with,
+    ServiceIoPoint, ServicePoint, VaultService, backup_closed, backup_closed_with,
 };
 
 fn params() -> KdfParams {
@@ -476,6 +479,60 @@ impl Read for DiskFull {
     }
 }
 
+struct FailPublishIo {
+    point: PublishIoPoint,
+    matching_writes_before_failure: Option<usize>,
+}
+
+impl FailPublishIo {
+    const fn new(point: PublishIoPoint) -> Self {
+        Self {
+            point,
+            matching_writes_before_failure: Some(0),
+        }
+    }
+
+    const fn after_matching_writes(point: PublishIoPoint, count: usize) -> Self {
+        Self {
+            point,
+            matching_writes_before_failure: Some(count),
+        }
+    }
+}
+
+impl PublishFaultInjector for FailPublishIo {
+    fn should_fail(&mut self, _point: PublishPoint) -> bool {
+        false
+    }
+
+    fn io_error(&mut self, point: PublishIoPoint) -> Option<io::Error> {
+        if point != self.point || self.matching_writes_before_failure.is_none() {
+            return None;
+        }
+        if self.matching_writes_before_failure == Some(0) {
+            self.matching_writes_before_failure = None;
+            Some(io::Error::from_raw_os_error(libc::ENOSPC))
+        } else {
+            self.matching_writes_before_failure = self
+                .matching_writes_before_failure
+                .map(|remaining| remaining - 1);
+            None
+        }
+    }
+}
+
+struct FailServiceIo(ServiceIoPoint);
+
+impl ServiceFaultInjector for FailServiceIo {
+    fn should_fail(&mut self, _point: ServicePoint) -> bool {
+        false
+    }
+
+    fn io_error(&mut self, point: ServiceIoPoint) -> Option<io::Error> {
+        (point == self.0).then(|| io::Error::from_raw_os_error(libc::ENOSPC))
+    }
+}
+
 #[test]
 fn disk_full_io_failure_leaves_no_reference_and_staging_is_recoverable() {
     let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
@@ -485,6 +542,302 @@ fn disk_full_io_failure_leaves_no_reference_and_staging_is_recoverable() {
     drop(writer);
     let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
     assert_eq!(recovered.startup_recovery().removed_staging_files, 1);
+    recovered.close().unwrap();
+}
+
+#[test]
+fn publication_io_failures_never_create_a_catalog_reference() {
+    for (index, mut fault) in [
+        FailPublishIo::new(PublishIoPoint::CiphertextWrite),
+        // Fail while writing the first chunk tag, after an encrypted payload
+        // chunk has reached the staging file.
+        FailPublishIo::after_matching_writes(PublishIoPoint::CiphertextWrite, 4),
+        FailPublishIo::new(PublishIoPoint::CiphertextSync),
+        FailPublishIo::new(PublishIoPoint::StagingNamespaceSync),
+        FailPublishIo::new(PublishIoPoint::RoleRootNamespaceSync),
+        FailPublishIo::new(PublishIoPoint::ShardNamespaceSync),
+        FailPublishIo::new(PublishIoPoint::NamespaceDirectorySync),
+        FailPublishIo::new(PublishIoPoint::FinalDirectorySync),
+        FailPublishIo::new(PublishIoPoint::StagingDirectorySync),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+        let (path, password, mut writer) = create(parent.path(), &format!("io-fault-{index}"));
+        let result = writer.import_with_publication_faults(
+            &mut Cursor::new(vec![0x61; 2 * 1024 * 1024]),
+            2 * 1024 * 1024,
+            metadata(20 + u8::try_from(index).unwrap()),
+            &mut fault,
+        );
+        assert!(matches!(
+            result,
+            Err(ServiceError::Object(ObjectError::Io(ref error)))
+                if error.raw_os_error() == Some(libc::ENOSPC)
+        ));
+        assert!(writer.reader().all_objects().unwrap().is_empty());
+        drop(writer);
+
+        let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+        assert!(recovered.reader().all_objects().unwrap().is_empty());
+        let recovered_artifacts = recovered.startup_recovery().removed_staging_files
+            + recovered.startup_recovery().removed_orphans;
+        assert!(recovered_artifacts <= 1);
+        assert_eq!(
+            recovered_artifacts,
+            usize::from(index != 3),
+            "only a staging-namespace sync failure precedes object-file creation"
+        );
+        recovered.close().unwrap();
+    }
+}
+
+#[test]
+fn namespace_sync_failure_is_retried_when_the_directory_already_exists() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, mut writer) = create(parent.path(), "namespace-retry");
+    for byte in [40, 41] {
+        let result = writer.import_with_publication_faults(
+            &mut Cursor::new(b"retry namespace durability"),
+            26,
+            metadata(byte),
+            &mut FailPublishIo::new(PublishIoPoint::RoleRootNamespaceSync),
+        );
+        assert!(matches!(
+            result,
+            Err(ServiceError::Object(ObjectError::Io(_)))
+        ));
+        assert!(writer.reader().all_objects().unwrap().is_empty());
+    }
+    writer
+        .import(&mut Cursor::new(b"successful retry"), 16, metadata(42))
+        .unwrap();
+    drop(writer);
+    let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    assert_eq!(recovered.reader().all_objects().unwrap().len(), 1);
+    assert_eq!(recovered.startup_recovery().removed_staging_files, 2);
+    recovered.close().unwrap();
+}
+
+#[test]
+fn derived_child_namespace_sync_failure_is_retried_and_recovered() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, writer) = create(parent.path(), "derived-namespace-retry");
+    writer.close().unwrap();
+    let storage = UnlockedVault::unlock(&path, &password, None).unwrap();
+    for _ in 0..2 {
+        let result = storage.publish_object_with(
+            &mut Cursor::new(b"derived namespace"),
+            17,
+            ObjectRole::Thumbnail,
+            MIN_CHUNK_SIZE,
+            &mut SystemRandom,
+            &mut FailPublishIo::new(PublishIoPoint::RoleChildNamespaceSync),
+        );
+        assert!(matches!(result, Err(ObjectError::Io(_))));
+    }
+    drop(storage);
+    let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    assert_eq!(recovered.startup_recovery().removed_staging_files, 2);
+    assert!(recovered.reader().all_objects().unwrap().is_empty());
+    recovered.close().unwrap();
+}
+
+#[test]
+fn marker_and_cleanup_sync_failures_remain_recoverable() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let path = parent.path().join("creation-marker-sync");
+    let password = Password::new(b"test password").unwrap();
+    assert!(matches!(
+        VaultService::create_with_faults(
+            &path,
+            &password,
+            None,
+            params(),
+            1,
+            &mut FailServiceIo(ServiceIoPoint::CreationDirtyMarkerSync),
+        ),
+        Err(ServiceError::Io(ref error)) if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    assert!(matches!(
+        VaultService::open(&path, &password, None, OpenMode::Reader),
+        Err(ServiceError::UncleanVault)
+    ));
+    VaultService::open(&path, &password, None, OpenMode::Writer)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let (path, password, writer) = create(parent.path(), "dirty-marker-sync");
+    writer.close().unwrap();
+    assert!(matches!(
+        VaultService::open_with_recovery_faults(
+            &path,
+            &password,
+            None,
+            OpenMode::Writer,
+            &mut FailServiceIo(ServiceIoPoint::WriterDirtyMarkerSync),
+        ),
+        Err(ServiceError::Io(ref error)) if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    assert!(matches!(
+        VaultService::open(&path, &password, None, OpenMode::Reader),
+        Err(ServiceError::UncleanVault)
+    ));
+    VaultService::open(&path, &password, None, OpenMode::Writer)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let (path, password, writer) = create(parent.path(), "clean-marker-sync");
+    assert!(matches!(
+        writer.close_with_faults(&mut FailServiceIo(ServiceIoPoint::CloseCleanMarkerSync)),
+        Err(ServiceError::Io(ref error)) if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    VaultService::open(&path, &password, None, OpenMode::Reader)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let (path, password, mut writer) = create(parent.path(), "immediate-cleanup-sync");
+    writer
+        .import(&mut Cursor::new(b"cleanup sync"), 12, metadata(43))
+        .unwrap();
+    assert!(matches!(
+        writer.delete_media_with(
+            MediaId::from_bytes([43; 16]),
+            4,
+            &mut FailServiceIo(ServiceIoPoint::CiphertextDirectorySync),
+        ),
+        Err(ServiceError::Object(ObjectError::Io(ref error)))
+            if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    assert_eq!(writer.reader().operation_journal().unwrap().len(), 1);
+    drop(writer);
+    let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    assert!(recovered.reader().operation_journal().unwrap().is_empty());
+    recovered.close().unwrap();
+
+    let (path, password, mut writer) = create(parent.path(), "recovery-cleanup-sync");
+    writer
+        .import(&mut Cursor::new(b"cleanup sync"), 12, metadata(43))
+        .unwrap();
+    assert!(
+        writer
+            .delete_media_with(
+                MediaId::from_bytes([43; 16]),
+                4,
+                &mut FailAt(ServicePoint::CatalogCommitted),
+            )
+            .is_err()
+    );
+    drop(writer);
+    assert!(matches!(
+        VaultService::open_with_recovery_faults(
+            &path,
+            &password,
+            None,
+            OpenMode::Writer,
+            &mut FailServiceIo(ServiceIoPoint::RecoveryCiphertextDirectorySync),
+        ),
+        Err(ServiceError::Object(ObjectError::Io(ref error)))
+            if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    assert!(recovered.reader().operation_journal().unwrap().is_empty());
+    assert!(recovered.reader().all_objects().unwrap().is_empty());
+    recovered.close().unwrap();
+
+    let (path, password, writer) = create(parent.path(), "staging-recovery-sync");
+    writer.close().unwrap();
+    let storage = UnlockedVault::unlock(&path, &password, None).unwrap();
+    assert!(
+        storage
+            .publish_object_with(
+                &mut Cursor::new(b"staging sync"),
+                12,
+                ObjectRole::Original,
+                MIN_CHUNK_SIZE,
+                &mut SystemRandom,
+                &mut FailPublishIo::new(PublishIoPoint::CiphertextWrite),
+            )
+            .is_err()
+    );
+    drop(storage);
+    assert!(matches!(
+        VaultService::open_with_recovery_faults(
+            &path,
+            &password,
+            None,
+            OpenMode::Writer,
+            &mut FailServiceIo(ServiceIoPoint::RecoveryStagingDirectorySync),
+        ),
+        Err(ServiceError::Object(ObjectError::Io(ref error)))
+            if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    VaultService::open(&path, &password, None, OpenMode::Writer)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let (path, password, mut writer) = create(parent.path(), "orphan-recovery-sync");
+    assert!(
+        writer
+            .import_with(
+                &mut Cursor::new(b"orphan sync"),
+                11,
+                metadata(44),
+                &mut FailAt(ServicePoint::ObjectDurable),
+            )
+            .is_err()
+    );
+    drop(writer);
+    assert!(matches!(
+        VaultService::open_with_recovery_faults(
+            &path,
+            &password,
+            None,
+            OpenMode::Writer,
+            &mut FailServiceIo(ServiceIoPoint::RecoveryOrphanDirectorySync),
+        ),
+        Err(ServiceError::Object(ObjectError::Io(ref error)))
+            if error.raw_os_error() == Some(libc::ENOSPC)
+    ));
+    VaultService::open(&path, &password, None, OpenMode::Writer)
+        .unwrap()
+        .close()
+        .unwrap();
+}
+
+#[cfg(all(target_os = "linux", feature = "test-fixtures"))]
+#[test]
+fn catalog_commit_sync_failure_recovers_to_an_authenticated_old_or_new_state() {
+    let parent = TempVault::create_in(Path::new("/tmp")).unwrap();
+    let (path, password, mut writer) = create(parent.path(), "catalog-sync-fault");
+    let result = writer.import_with_catalog_sync_failure(
+        &mut Cursor::new(b"durable ciphertext"),
+        18,
+        metadata(30),
+    );
+    assert!(matches!(result, Err(ServiceError::Catalog(_))));
+    drop(writer);
+
+    let recovered = VaultService::open(&path, &password, None, OpenMode::Writer).unwrap();
+    let objects = recovered.reader().all_objects().unwrap();
+    assert!(objects.len() <= 1);
+    if let Some(object) = objects.first() {
+        let mut plaintext = Vec::new();
+        recovered
+            .open_object(object.descriptor.id())
+            .unwrap()
+            .read_to_end(&mut plaintext)
+            .unwrap();
+        assert_eq!(plaintext, b"durable ciphertext");
+        assert_eq!(recovered.startup_recovery().removed_orphans, 0);
+    } else {
+        assert_eq!(recovered.startup_recovery().removed_orphans, 1);
+    }
     recovered.close().unwrap();
 }
 

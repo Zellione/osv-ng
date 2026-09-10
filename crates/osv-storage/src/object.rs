@@ -475,6 +475,20 @@ pub enum PublishPoint {
     StagingDirectoryDurable,
 }
 
+/// Filesystem calls whose failures must preserve publication ordering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublishIoPoint {
+    CiphertextWrite,
+    CiphertextSync,
+    StagingNamespaceSync,
+    RoleRootNamespaceSync,
+    RoleChildNamespaceSync,
+    ShardNamespaceSync,
+    NamespaceDirectorySync,
+    FinalDirectorySync,
+    StagingDirectorySync,
+}
+
 impl PublishPoint {
     /// Stable public name used by crash-test supervisors.
     #[must_use]
@@ -503,6 +517,38 @@ pub const PUBLISH_POINTS: [PublishPoint; 7] = [
 
 pub trait PublishFaultInjector {
     fn should_fail(&mut self, point: PublishPoint) -> bool;
+
+    /// Returns an injected operating-system error for one exact I/O operation.
+    fn io_error(&mut self, _point: PublishIoPoint) -> Option<io::Error> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalPoint {
+    Unlinked,
+    DirectoryDurable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemovalIoPoint {
+    DirectorySync,
+}
+
+pub trait RemovalFaultInjector {
+    fn should_fail(&mut self, point: RemovalPoint) -> bool;
+
+    fn io_error(&mut self, _point: RemovalIoPoint) -> Option<io::Error> {
+        None
+    }
+}
+
+pub(crate) struct NoRemovalFaults;
+
+impl RemovalFaultInjector for NoRemovalFaults {
+    fn should_fail(&mut self, _point: RemovalPoint) -> bool {
+        false
+    }
 }
 
 pub(crate) struct NoPublishFaults;
@@ -534,24 +580,36 @@ pub(crate) fn publish_object(
         wrap_dek_observed(&dek, wrapping_key, vault_id, id, role, random, observer)?;
     let preamble = ObjectPreamble::create(random)?;
 
-    let staging = ensure_directory(vault_directory, "staging")?;
+    let staging = ensure_directory_with_faults(
+        vault_directory,
+        "staging",
+        faults,
+        PublishIoPoint::StagingNamespaceSync,
+    )?;
     let staging_name = filename(id, ".osvo.part");
     let mut file = platform::open_dynamic_at(&staging, &staging_name, true, true)?;
     fail(faults, PublishPoint::StagingCreated)?;
-    let encryption_lock_status = encrypt_stream_observed(
-        source,
-        &mut file,
-        &dek,
-        vault_id,
-        id,
-        role,
-        logical_len,
-        chunk_size,
-        chunk_count,
-        preamble,
-        observer,
-    )?;
+    let encryption_lock_status = {
+        let mut destination = PublishDestination {
+            file: &mut file,
+            faults,
+        };
+        encrypt_stream_observed(
+            source,
+            &mut destination,
+            &dek,
+            vault_id,
+            id,
+            role,
+            logical_len,
+            chunk_size,
+            chunk_count,
+            preamble,
+            observer,
+        )?
+    };
     fail(faults, PublishPoint::CiphertextWritten)?;
+    io_fail(faults, PublishIoPoint::CiphertextSync)?;
     file.sync_all()?;
     fail(faults, PublishPoint::CiphertextDurable)?;
     // Verify the exact inode created by this operation. The staging pathname is
@@ -573,15 +631,23 @@ pub(crate) fn publish_object(
     let verification_lock_status = verifier.security_status().page_locks();
     fail(faults, PublishPoint::CiphertextVerified)?;
 
-    let namespace = role_directory_create(vault_directory, role)?;
+    let namespace = role_directory_create(vault_directory, role, faults)?;
     let shard_name = shard(id);
-    let shard = ensure_directory(&namespace, &shard_name)?;
+    let shard = ensure_directory_with_faults(
+        &namespace,
+        &shard_name,
+        faults,
+        PublishIoPoint::ShardNamespaceSync,
+    )?;
+    io_fail(faults, PublishIoPoint::NamespaceDirectorySync)?;
     namespace.sync_all()?;
     let final_name = filename(id, ".osvo");
     platform::rename_between(&staging, &staging_name, &shard, &final_name)?;
     fail(faults, PublishPoint::FinalRenamed)?;
+    io_fail(faults, PublishIoPoint::FinalDirectorySync)?;
     shard.sync_all()?;
     fail(faults, PublishPoint::FinalDirectoryDurable)?;
+    io_fail(faults, PublishIoPoint::StagingDirectorySync)?;
     staging.sync_all()?;
     fail(faults, PublishPoint::StagingDirectoryDurable)?;
 
@@ -605,6 +671,30 @@ pub(crate) fn publish_object(
             .combine(verification_lock_status),
     ));
     Ok(descriptor)
+}
+
+struct PublishDestination<'file, 'faults, F> {
+    file: &'file mut File,
+    faults: &'faults mut F,
+}
+
+impl<F: PublishFaultInjector> Write for PublishDestination<'_, '_, F> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if let Some(error) = self.faults.io_error(PublishIoPoint::CiphertextWrite) {
+            return Err(error);
+        }
+        self.file.write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl<F: PublishFaultInjector> Seek for PublishDestination<'_, '_, F> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.file.seek(position)
+    }
 }
 
 pub(crate) fn open_object(
@@ -988,11 +1078,25 @@ fn wrap_aad(vault_id: VaultId, object_id: ObjectId, role: ObjectRole) -> Vec<u8>
     .concat()
 }
 
-fn role_directory_create(vault: &File, role: ObjectRole) -> Result<File, ObjectError> {
+fn role_directory_create(
+    vault: &File,
+    role: ObjectRole,
+    faults: &mut impl PublishFaultInjector,
+) -> Result<File, ObjectError> {
     let (root_name, child_name) = role.namespace();
-    let root = ensure_directory(vault, root_name)?;
+    let root = ensure_directory_with_faults(
+        vault,
+        root_name,
+        faults,
+        PublishIoPoint::RoleRootNamespaceSync,
+    )?;
     match child_name {
-        Some(name) => ensure_directory(&root, name),
+        Some(name) => ensure_directory_with_faults(
+            &root,
+            name,
+            faults,
+            PublishIoPoint::RoleChildNamespaceSync,
+        ),
         None => Ok(root),
     }
 }
@@ -1019,6 +1123,15 @@ pub(crate) fn remove_object(
     id: ObjectId,
     role: ObjectRole,
 ) -> Result<bool, ObjectError> {
+    remove_object_with_faults(vault, id, role, &mut NoRemovalFaults)
+}
+
+pub(crate) fn remove_object_with_faults(
+    vault: &File,
+    id: ObjectId,
+    role: ObjectRole,
+    faults: &mut impl RemovalFaultInjector,
+) -> Result<bool, ObjectError> {
     let namespace = match role_directory_open(vault, role) {
         Ok(value) => value,
         Err(ObjectError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -1036,7 +1149,10 @@ pub(crate) fn remove_object(
         Err(error) => return Err(error.into()),
     }
     platform::unlink_dynamic_at(&shard, &name)?;
+    removal_fail(faults, RemovalPoint::Unlinked)?;
+    removal_io_fail(faults, RemovalIoPoint::DirectorySync)?;
     shard.sync_all()?;
+    removal_fail(faults, RemovalPoint::DirectoryDurable)?;
     Ok(true)
 }
 
@@ -1122,6 +1238,14 @@ pub(crate) fn inventory(vault: &File) -> Result<CiphertextInventory, ObjectError
 }
 
 pub(crate) fn remove_staging(vault: &File, id: ObjectId) -> Result<bool, ObjectError> {
+    remove_staging_with_faults(vault, id, &mut NoRemovalFaults)
+}
+
+pub(crate) fn remove_staging_with_faults(
+    vault: &File,
+    id: ObjectId,
+    faults: &mut impl RemovalFaultInjector,
+) -> Result<bool, ObjectError> {
     let staging = match platform::open_dynamic_directory_at(vault, "staging") {
         Ok(value) => value,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -1134,7 +1258,10 @@ pub(crate) fn remove_staging(vault: &File, id: ObjectId) -> Result<bool, ObjectE
         Err(error) => return Err(error.into()),
     }
     platform::unlink_dynamic_at(&staging, &name)?;
+    removal_fail(faults, RemovalPoint::Unlinked)?;
+    removal_io_fail(faults, RemovalIoPoint::DirectorySync)?;
     staging.sync_all()?;
+    removal_fail(faults, RemovalPoint::DirectoryDurable)?;
     Ok(true)
 }
 
@@ -1166,12 +1293,21 @@ const fn hex_nibble(value: u8) -> Option<u8> {
     }
 }
 
-fn ensure_directory(parent: &File, name: &str) -> Result<File, ObjectError> {
+fn ensure_directory_with_faults(
+    parent: &File,
+    name: &str,
+    faults: &mut impl PublishFaultInjector,
+    point: PublishIoPoint,
+) -> Result<File, ObjectError> {
     match platform::create_dynamic_directory_at(parent, name) {
-        Ok(()) => parent.sync_all()?,
+        Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
+    io_fail(faults, point)?;
+    // Retry must repeat the parent durability barrier after a prior mkdir
+    // succeeded but its sync failed.
+    parent.sync_all()?;
     platform::open_dynamic_directory_at(parent, name).map_err(Into::into)
 }
 
@@ -1203,6 +1339,35 @@ fn fail(faults: &mut impl PublishFaultInjector, point: PublishPoint) -> Result<(
     }
 }
 
+fn io_fail(
+    faults: &mut impl PublishFaultInjector,
+    point: PublishIoPoint,
+) -> Result<(), ObjectError> {
+    faults
+        .io_error(point)
+        .map_or(Ok(()), |error| Err(error.into()))
+}
+
+fn removal_fail(
+    faults: &mut impl RemovalFaultInjector,
+    point: RemovalPoint,
+) -> Result<(), ObjectError> {
+    if faults.should_fail(point) {
+        Err(ObjectError::InjectedRemovalFault(point))
+    } else {
+        Ok(())
+    }
+}
+
+fn removal_io_fail(
+    faults: &mut impl RemovalFaultInjector,
+    point: RemovalIoPoint,
+) -> Result<(), ObjectError> {
+    faults
+        .io_error(point)
+        .map_or(Ok(()), |error| Err(error.into()))
+}
+
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().expect("fixed integer"))
 }
@@ -1230,6 +1395,7 @@ pub enum ObjectError {
     InvalidSeek,
     PublishedIdentityChanged,
     InjectedFault(PublishPoint),
+    InjectedRemovalFault(RemovalPoint),
 }
 
 impl fmt::Display for ObjectError {
@@ -1256,6 +1422,9 @@ impl fmt::Display for ObjectError {
                 formatter.write_str("published object identity changed")
             }
             Self::InjectedFault(point) => write!(formatter, "injected object fault at {point:?}"),
+            Self::InjectedRemovalFault(point) => {
+                write!(formatter, "injected removal fault at {point:?}")
+            }
         }
     }
 }
