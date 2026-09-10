@@ -9,7 +9,9 @@ publish = false
 
 [dependencies]
 osv-crypto.workspace = true
+osv-isolation.workspace = true
 osv-import.workspace = true
+osv-worker-protocol.workspace = true
 
 [lints]
 workspace = true

@@ -261,6 +261,7 @@ dependencies = [
  "osv-crypto",
  "osv-storage",
  "osv-test-support",
+ "osv-worker-protocol",
 ]
 
 [[package]]
@@ -277,6 +278,13 @@ dependencies = [
 [[package]]
 name = "osv-test-support"
 version = "0.1.0"
+
+[[package]]
+name = "osv-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "poly1305"

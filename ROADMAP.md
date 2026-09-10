@@ -7,8 +7,9 @@ This document defines the approved direction for a greenfield successor to
 project are intentionally retained. Source compatibility, its one-file format,
 its UI, and legacy-vault migration are not requirements.
 
-Phases 0 and 2 are complete as of 2026-09-07, and Phases 3 and 4 are complete as
-of 2026-09-08. Phase 1's five isolated
+Phases 0 and 2 are complete as of 2026-09-07, Phases 3 and 4 are complete as
+of 2026-09-08, and Phases 5 through 7 are complete as of 2026-09-10. The Phase
+8 gate is open. Phase 1's five isolated
 prototypes passed their automated core paths, and ADRs accept GTK4, GStreamer,
 SQLCipher, and brokered authenticated media transport as the initial directions.
 Phase 1's manual and representative-media checks below remain explicitly
@@ -108,6 +109,8 @@ crates/
   osv-catalog/         SQLCipher connection, schema, queries, migrations
   osv-media/           worker protocol and decoded-media abstractions
   osv-import/          import/archive plans and duplicate decisions
+  osv-worker-protocol/ allocation-bounded worker wire format and state machine
+  osv-isolation/       Unix transport, worker sandbox, and child supervisor
   osv-app/             GTK application, controllers, views, preferences
   osv-test-support/    fixtures, fault injection, temporary vault builders
 helpers/
@@ -1210,8 +1213,64 @@ explicitly excluding the remaining acceptance gaps from that approval:
 
 **Goal:** Put hostile parsers behind a narrow, testable authority boundary.
 
-**Status:** Planned on 2026-09-10 and ready to start after Phase 6 approval. No
-Phase 7 implementation has started.
+**Completed 2026-09-10**
+
+**Progress (2026-09-10)**
+
+- Accepted ADR 0010. Added dependency-light `osv-worker-protocol` with fixed
+  magic/header/version, explicit negotiation, 1 MiB payload bounds, request
+  identities, ordered chunk sequences, public failure classes, and a broker
+  state machine.
+- Added `osv-isolation` with wipeable best-effort locked plaintext owners,
+  bounded Unix framing, exact-one `SCM_RIGHTS` descriptor validation, absolute
+  operation deadlines, startup deadlines, bounded restart, cancellation,
+  process-clone denial, parent-death termination, deterministic reap, and exit
+  classification.
+- Workers apply dump protection, `no_new_privs`, a descriptor allowlist,
+  resource limits, architecture-checked seccomp filesystem/network/exec
+  restrictions, and an empty Landlock ruleset when supported before sending
+  ready. The handshake exposes Landlock absence as a degraded flag and the
+  broker rejects missing mandatory protections.
+- Integrated both production worker stubs through the same supervised protocol.
+  Their no-argument mode remains a process-hardening self-check for the Flatpak
+  installation gate; parsing mode is available only through `--worker` and its
+  inherited standard-input control socket.
+- Added truncation/bounds/state tests, real media/archive subprocess sessions,
+  hostile hang/downgrade/false-sandbox/access tests, and a `worker-frame` fuzz
+  target. Messages and errors contain no paths, keys, catalog values, or
+  decrypted metadata.
+
+**Verification**
+
+- Workspace formatting, all-target/all-feature tests, warnings-as-errors
+  Clippy, the exact secret-canary regression, and the separate fuzz-workspace
+  format/build gates pass.
+- Production and fuzz `cargo audit` and `cargo deny` gates pass. The ASan
+  isolation target passes for protocol and descriptor FFI; subprocess cases
+  intentionally skip under ASan because its shadow mapping exceeds the worker's
+  1 GiB address-space limit.
+- The 20-second ASan `worker-frame` fuzz smoke completed 26,349,657 executions
+  with no finding. Hostile subprocess tests cover startup and operation hangs,
+  abnormal exit/reap, cancellation, downgrade, missing sandbox enforcement,
+  filesystem open/enumeration, network creation, process creation, dumpability
+  changes, descriptor closure/spoofing, and address-space exhaustion while
+  retaining codec-style thread creation.
+- The offline Flatpak release test/build gate passes with the isolation tests in
+  release mode. The installed app, media-worker, and archive-worker self-checks
+  execute successfully. One first clean build encountered the pre-existing
+  parallel SQLCipher initialization test race; the subsequent clean rebuild
+  passed and this remains a test-harness follow-up rather than accepted flake.
+
+**Deviations and follow-up**
+
+- Landlock is defense in depth and may be unavailable under an older kernel or
+  outer sandbox. Its absence is explicitly reported; mandatory seccomp,
+  descriptor, resource-limit, dump, and `no_new_privs` protections fail closed.
+- Phase 7 verifies that the sandbox permits codec-style threads and works in
+  the packaged Flatpak, but production workers are parser stubs and do not yet
+  negotiate a hardware or software decoder. Representative GStreamer software
+  fallback and hardware-device measurements remain the explicit Phase 9/10
+  acceptance work; they are not inferred from registry availability.
 
 **Implementation sequence**
 
