@@ -91,10 +91,20 @@ impl FramedChannel {
     }
 
     pub fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
-        let mut encoded = frame.encode()?;
-        let result = self.write_all(&encoded);
-        encoded.zeroize();
-        result.map_err(Into::into)
+        let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
+        frame.encode_into(encoded.expose_mut())?;
+        self.write_all(encoded.expose()).map_err(Into::into)
+    }
+
+    pub(crate) fn send_nonblocking(&mut self, frame: &Frame) -> Result<(), TransportError> {
+        let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
+        frame.encode_into(encoded.expose_mut())?;
+        let written = send_bytes_nonblocking(self.stream.as_raw_fd(), encoded.expose())?;
+        if written == encoded.len() {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::WouldBlock).into())
+        }
     }
 
     pub fn receive(&mut self) -> Result<Frame, TransportError> {
@@ -180,6 +190,23 @@ impl FramedChannel {
 #[allow(unsafe_code)]
 fn read_bytes(descriptor: RawFd, bytes: &mut [u8]) -> io::Result<usize> {
     let result = unsafe { libc::read(descriptor, bytes.as_mut_ptr().cast(), bytes.len()) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result as usize)
+    }
+}
+
+#[allow(unsafe_code)]
+fn send_bytes_nonblocking(descriptor: RawFd, bytes: &[u8]) -> io::Result<usize> {
+    let result = unsafe {
+        libc::send(
+            descriptor,
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT,
+        )
+    };
     if result < 0 {
         Err(io::Error::last_os_error())
     } else {

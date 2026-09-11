@@ -3,6 +3,53 @@ use osv_worker_protocol::{Frame, Message, Role, VERSION};
 use std::{os::fd::FromRawFd, os::unix::net::UnixStream, time::Duration};
 
 #[allow(unsafe_code)]
+fn make_landlock_unavailable() {
+    const LD_W_ABS: u16 = 0x20;
+    const JMP_JEQ_K: u16 = 0x15;
+    const RET_K: u16 = 0x06;
+    const ALLOW: u32 = 0x7fff_0000;
+    const ERRNO: u32 = 0x0005_0000;
+    let mut filter = [
+        libc::sock_filter {
+            code: LD_W_ABS,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: JMP_JEQ_K,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_landlock_create_ruleset as u32,
+        },
+        libc::sock_filter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: ERRNO | libc::ENOSYS as u32,
+        },
+        libc::sock_filter {
+            code: RET_K,
+            jt: 0,
+            jf: 0,
+            k: ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: u16::try_from(filter.len()).unwrap(),
+        filter: filter.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program,) },
+        0
+    );
+}
+
+#[allow(unsafe_code)]
 fn channel_after_sandbox() -> FramedChannel {
     apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
     FramedChannel::new(unsafe { UnixStream::from_raw_fd(WORKER_CONTROL_FD) })
@@ -135,6 +182,28 @@ fn main() {
                 | (u8::from(!enumeration_denied || !oversized_mapping_denied) << 6);
             if failures != 0 {
                 std::process::exit(i32::from(failures));
+            }
+        }
+        Some("mutation-probe") => {
+            let path = arguments.next().expect("probe path");
+            let renamed = arguments.next().expect("renamed probe path");
+            let landlock_mode = arguments.next();
+            if landlock_mode.as_deref() == Some("without-landlock") {
+                make_landlock_unavailable();
+            }
+            let report = apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            if landlock_mode.as_deref() == Some("with-landlock") && !report.landlock_enforced() {
+                std::process::exit(77);
+            }
+            let chmod_denied = std::fs::set_permissions(
+                &path,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+            )
+            .is_err();
+            let rename_denied = std::fs::rename(&path, &renamed).is_err();
+            let unlink_denied = std::fs::remove_file(&path).is_err();
+            if !(chmod_denied && rename_denied && unlink_denied) {
+                std::process::exit(1);
             }
         }
         _ => std::process::exit(64),

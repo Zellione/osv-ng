@@ -39,7 +39,9 @@ Diagnostics carry only public failure classes.
 The trusted broker authenticates object chunks before constructing a
 `PlaintextBuffer`. That owner uses the project's locked, non-dumpable,
 wipe-on-release allocation and exposes bytes only for synchronous transport.
-Wire encoding and worker receive buffers are bounded and wiped after use. The
+Wire encoding writes directly into a locked or explicitly degraded,
+non-dumpable, wipe-on-release allocation without an intermediate plaintext
+allocation. Worker receive buffers are bounded and wiped after use. The
 worker receives bytes, never a vault descriptor or key. `SCM_RIGHTS` support is
 limited to exactly one regular-file, pipe, or Unix-socket descriptor and rejects
 directories and multiplicity; it is reserved for narrowly scoped plaintext or
@@ -49,7 +51,8 @@ Before ready, the worker disables dumps, sets `no_new_privs`, caps core/file
 output, descriptors, address space, CPU, and stack, and installs a
 seccomp filter. The filter validates the syscall architecture and denies new
 network endpoints, filesystem opens/enumeration/path inspection, execution,
-new process-style clone variants, and sandbox/process-group escape operations.
+pathname and descriptor mutation syscall families, new process-style clone
+variants, and sandbox/process-group escape operations.
 Thread-style `clone` remains available for codec runtimes. An empty Landlock
 ruleset additionally denies handled filesystem access when the running kernel
 supports it. Ready reports individual enforcement flags. The broker requires
@@ -62,6 +65,9 @@ than pretending it succeeded.
   socket, or channel after cancellation.
 - Per-request process startup and plaintext IPC add latency and copies. The
   protocol applies kernel backpressure and one absolute operation deadline.
+  Cancellation uses one best-effort nonblocking frame and starts its independent
+  grace deadline before transmission, so a full send buffer cannot extend worker
+  authority to the operation deadline.
 - Landlock is defense in depth because kernels or outer sandboxes may not offer
   it. Seccomp, descriptor closure, limits, and `no_new_privs` are mandatory.
 - Seccomp is a narrow deny policy rather than a syscall allowlist so GStreamer

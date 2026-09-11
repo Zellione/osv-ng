@@ -231,18 +231,22 @@ impl Supervisor {
     }
 
     pub fn cancel(&mut self) -> ExitClass {
+        let deadline = Instant::now() + self.limits.cancellation_grace;
         let cancel = Frame {
             request_id: self.request_id(),
             message: Message::Cancel,
         };
         let _ = self.machine.sent(&cancel);
-        let _ = self.channel.send(&cancel);
+        let _ = self.channel.send_nonblocking(&cancel);
         let _ = self.channel.stream().shutdown(std::net::Shutdown::Both);
-        for _ in 0..10 {
+        loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 return classify_status(status);
             }
-            std::thread::sleep(self.limits.cancellation_grace / 10);
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -321,5 +325,57 @@ fn classify_status(status: ExitStatus) -> ExitClass {
         ExitClass::Signal
     } else {
         ExitClass::WorkerFailure
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn cancellation_deadline_includes_a_saturated_nonreading_channel() {
+        let (broker, _nonreading_worker) = UnixStream::pair().unwrap();
+        broker.set_nonblocking(true).unwrap();
+        let bytes = [0_u8; 4096];
+        loop {
+            let result = unsafe {
+                libc::send(
+                    broker.as_raw_fd(),
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if result < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+
+        let grace = Duration::from_millis(100);
+        let child = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut supervisor = Supervisor {
+            child,
+            channel: FramedChannel::new(broker),
+            machine: BrokerMachine::new(1),
+            limits: SupervisorLimits {
+                startup: Duration::from_secs(1),
+                operation: Duration::from_secs(30),
+                cancellation_grace: grace,
+                maximum_restarts: 0,
+            },
+            sandbox_flags: 0,
+            request_id: 1,
+            operation_deadline: Instant::now() + Duration::from_secs(30),
+        };
+
+        let started = Instant::now();
+        assert_eq!(supervisor.cancel(), ExitClass::Deadline);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancellation inherited the operation deadline"
+        );
     }
 }

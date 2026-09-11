@@ -1215,7 +1215,7 @@ explicitly excluding the remaining acceptance gaps from that approval:
 
 **Completed 2026-09-10**
 
-**Progress (2026-09-10)**
+**Progress (updated 2026-09-11)**
 
 - Accepted ADR 0010. Added dependency-light `osv-worker-protocol` with fixed
   magic/header/version, explicit negotiation, 1 MiB payload bounds, request
@@ -1239,12 +1239,23 @@ explicitly excluding the remaining acceptance gaps from that approval:
   hostile hang/downgrade/false-sandbox/access tests, and a `worker-frame` fuzz
   target. Messages and errors contain no paths, keys, catalog values, or
   decrypted metadata.
+- Remediated the Phase 7 security review: mandatory seccomp now denies
+  pathname and descriptor mutation families even without Landlock; frame
+  encoding writes directly into protected wipe-on-release storage without an
+  intermediate allocation; and cancellation sends best-effort without blocking
+  before its single grace deadline. Added Landlock-present/degraded filesystem
+  integrity, encoder-allocation, and saturated non-reading worker regressions.
 
 **Verification**
 
 - Workspace formatting, all-target/all-feature tests, warnings-as-errors
   Clippy, the exact secret-canary regression, and the separate fuzz-workspace
   format/build gates pass.
+- After the 2026-09-11 review remediation, formatting, warnings-as-errors
+  Clippy, full workspace tests, the exact debug-redaction canary, production
+  and fuzz dependency policy/audit gates, and the offline Flatpak release
+  build/tests plus installed stubs pass. The 20-second ASan `secret-canary`
+  harness smoke completed 11,093,035 executions without a finding.
 - Production and fuzz `cargo audit` and `cargo deny` gates pass. The ASan
   isolation target passes for protocol and descriptor FFI; subprocess cases
   intentionally skip under ASan because its shadow mapping exceeds the worker's

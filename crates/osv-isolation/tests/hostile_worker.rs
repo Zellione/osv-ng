@@ -1,6 +1,7 @@
 use osv_isolation::{ExitClass, PlaintextBuffer, Supervisor, SupervisorLimits};
 use osv_worker_protocol::Role;
 use std::{
+    fs,
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::Path,
     process::{Command, Stdio},
@@ -111,4 +112,55 @@ fn sandbox_denies_new_filesystem_and_network_authority() {
     let status = command.status().unwrap();
     drop(parent);
     assert!(status.success(), "probe status: {status:?}");
+}
+
+#[test]
+fn sandbox_denies_path_mutation_with_and_without_landlock() {
+    if address_sanitizer_active() {
+        return;
+    }
+    let _guard = TEST_PROCESSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for landlock_mode in ["with-landlock", "without-landlock"] {
+        let directory = std::env::temp_dir().join(format!(
+            "osv-isolation-mutation-{}-{landlock_mode}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("source");
+        let renamed = directory.join("renamed");
+        fs::write(&path, b"unchanged").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let (parent, child) = UnixStream::pair().unwrap();
+        let status = Command::new(fixture())
+            .arg("mutation-probe")
+            .arg(&path)
+            .arg(&renamed)
+            .arg(landlock_mode)
+            .stdin(Stdio::from(OwnedFd::from(child)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        drop(parent);
+
+        let landlock_unavailable = landlock_mode == "with-landlock" && status.code() == Some(77);
+        assert!(
+            status.success() || landlock_unavailable,
+            "{landlock_mode} probe status: {status:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions())
+                & 0o777,
+            0o600
+        );
+        assert!(!renamed.exists());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
 }

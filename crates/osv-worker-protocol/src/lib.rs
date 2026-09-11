@@ -149,21 +149,29 @@ impl fmt::Display for ProtocolError {
 impl Error for ProtocolError {}
 
 impl Frame {
-    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
-        let (kind, payload) = encode_message(&self.message)?;
-        let payload_len = u32::try_from(payload.len()).map_err(|_| ProtocolError::Oversized)?;
-        if payload.len() > MAX_PAYLOAD_LEN {
+    pub fn encoded_len(&self) -> Result<usize, ProtocolError> {
+        HEADER_LEN
+            .checked_add(payload_len(&self.message)?)
+            .ok_or(ProtocolError::Oversized)
+    }
+
+    pub fn encode_into(&self, encoded: &mut [u8]) -> Result<(), ProtocolError> {
+        let payload_len = payload_len(&self.message)?;
+        if encoded.len() != HEADER_LEN + payload_len {
+            return Err(ProtocolError::Truncated);
+        }
+        let payload_len = u32::try_from(payload_len).map_err(|_| ProtocolError::Oversized)?;
+        if payload_len as usize > MAX_PAYLOAD_LEN {
             return Err(ProtocolError::Oversized);
         }
-        let mut encoded = Vec::with_capacity(HEADER_LEN + payload.len());
-        encoded.extend_from_slice(&MAGIC);
-        encoded.extend_from_slice(&VERSION.to_le_bytes());
-        encoded.push(kind as u8);
-        encoded.push(0);
-        encoded.extend_from_slice(&payload_len.to_le_bytes());
-        encoded.extend_from_slice(&self.request_id.to_le_bytes());
-        encoded.extend_from_slice(&payload);
-        Ok(encoded)
+        encoded[..8].copy_from_slice(&MAGIC);
+        encoded[8..10].copy_from_slice(&VERSION.to_le_bytes());
+        encoded[10] = message_kind(&self.message) as u8;
+        encoded[11] = 0;
+        encoded[12..16].copy_from_slice(&payload_len.to_le_bytes());
+        encoded[16..24].copy_from_slice(&self.request_id.to_le_bytes());
+        encode_payload(&self.message, &mut encoded[HEADER_LEN..]);
+        Ok(())
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, ProtocolError> {
@@ -195,39 +203,53 @@ impl Frame {
     }
 }
 
-fn encode_message(message: &Message) -> Result<(Kind, Vec<u8>), ProtocolError> {
-    let result = match message {
+fn payload_len(message: &Message) -> Result<usize, ProtocolError> {
+    match message {
+        Message::Hello { .. } => Ok(4),
+        Message::Ready { .. } => Ok(6),
+        Message::Start { .. } | Message::Failed { .. } => Ok(1),
+        Message::Data { bytes, .. } if bytes.len() <= MAX_DATA_LEN => Ok(8 + bytes.len()),
+        Message::Data { .. } => Err(ProtocolError::Oversized),
+        Message::End { .. } => Ok(8),
+        Message::Cancel | Message::Complete => Ok(0),
+    }
+}
+
+fn message_kind(message: &Message) -> Kind {
+    match message {
+        Message::Hello { .. } => Kind::Hello,
+        Message::Ready { .. } => Kind::Ready,
+        Message::Start { .. } => Kind::Start,
+        Message::Data { .. } => Kind::Data,
+        Message::End { .. } => Kind::End,
+        Message::Cancel => Kind::Cancel,
+        Message::Complete => Kind::Complete,
+        Message::Failed { .. } => Kind::Failed,
+    }
+}
+
+fn encode_payload(message: &Message, payload: &mut [u8]) {
+    match message {
         Message::Hello { minimum, maximum } => {
-            let mut bytes = Vec::with_capacity(4);
-            bytes.extend_from_slice(&minimum.to_le_bytes());
-            bytes.extend_from_slice(&maximum.to_le_bytes());
-            (Kind::Hello, bytes)
+            payload[..2].copy_from_slice(&minimum.to_le_bytes());
+            payload[2..].copy_from_slice(&maximum.to_le_bytes());
         }
         Message::Ready {
             version,
             sandbox_flags,
         } => {
-            let mut bytes = Vec::with_capacity(6);
-            bytes.extend_from_slice(&version.to_le_bytes());
-            bytes.extend_from_slice(&sandbox_flags.to_le_bytes());
-            (Kind::Ready, bytes)
+            payload[..2].copy_from_slice(&version.to_le_bytes());
+            payload[2..].copy_from_slice(&sandbox_flags.to_le_bytes());
         }
-        Message::Start { role } => (Kind::Start, vec![*role as u8]),
+        Message::Start { role } => payload[0] = *role as u8,
         Message::Data { sequence, bytes } => {
-            if bytes.len() > MAX_DATA_LEN {
-                return Err(ProtocolError::Oversized);
-            }
-            let mut payload = Vec::with_capacity(8 + bytes.len());
-            payload.extend_from_slice(&sequence.to_le_bytes());
-            payload.extend_from_slice(bytes);
-            (Kind::Data, payload)
+            payload[..8].copy_from_slice(&sequence.to_le_bytes());
+            payload[8..].copy_from_slice(bytes);
         }
-        Message::End { chunks } => (Kind::End, chunks.to_le_bytes().to_vec()),
-        Message::Cancel => (Kind::Cancel, Vec::new()),
-        Message::Complete => (Kind::Complete, Vec::new()),
-        Message::Failed { class } => (Kind::Failed, vec![*class as u8]),
-    };
-    Ok(result)
+        Message::End { chunks } => payload.copy_from_slice(&chunks.to_le_bytes()),
+        Message::Failed { class } => payload[0] = *class as u8,
+        Message::Cancel | Message::Complete => {}
+    }
 }
 
 fn decode_message(kind: Kind, bytes: &[u8]) -> Result<Message, ProtocolError> {
@@ -355,6 +377,36 @@ impl BrokerMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    struct CountingAllocator;
+
+    std::thread_local! {
+        static COUNT_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            COUNT_ALLOCATIONS.with(|enabled| {
+                if enabled.get() {
+                    ALLOCATION_COUNT.with(|count| count.set(count.get() + 1));
+                }
+            });
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(pointer, layout) };
+        }
+    }
 
     #[test]
     fn all_messages_round_trip() {
@@ -384,21 +436,23 @@ mod tests {
                 request_id: 42,
                 message,
             };
-            assert_eq!(Frame::decode(&frame.encode().unwrap()).unwrap(), frame);
+            let mut encoded = vec![0; frame.encoded_len().unwrap()];
+            frame.encode_into(&mut encoded).unwrap();
+            assert_eq!(Frame::decode(&encoded).unwrap(), frame);
         }
     }
 
     #[test]
     fn decoder_rejects_every_truncation_and_oversized_claim() {
-        let encoded = Frame {
+        let frame = Frame {
             request_id: 7,
             message: Message::Data {
                 sequence: 0,
                 bytes: vec![9; 32],
             },
-        }
-        .encode()
-        .unwrap();
+        };
+        let mut encoded = vec![0; frame.encoded_len().unwrap()];
+        frame.encode_into(&mut encoded).unwrap();
         for end in 0..encoded.len() {
             assert!(Frame::decode(&encoded[..end]).is_err());
         }
@@ -467,5 +521,24 @@ mod tests {
         let debug = format!("{message:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("sensitive-pixels"));
+    }
+
+    #[test]
+    fn data_encoding_creates_no_intermediate_allocation() {
+        let frame = Frame {
+            request_id: 17,
+            message: Message::Data {
+                sequence: 3,
+                bytes: vec![0xa5; 4096],
+            },
+        };
+        let mut encoded = vec![0; frame.encoded_len().unwrap()];
+        ALLOCATION_COUNT.with(|count| count.set(0));
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(true));
+        frame.encode_into(&mut encoded).unwrap();
+        COUNT_ALLOCATIONS.with(|enabled| enabled.set(false));
+        assert_eq!(ALLOCATION_COUNT.with(Cell::get), 0);
+        assert_eq!(&encoded[HEADER_LEN + 8..], &[0xa5; 4096]);
+        encoded.zeroize();
     }
 }
