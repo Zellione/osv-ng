@@ -60,7 +60,13 @@ impl CssSlots {
 
 pub fn run() -> glib::ExitCode {
     let app = gtk::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_window);
+    app.connect_activate(|app| {
+        if let Some(window) = app.active_window() {
+            window.present();
+        } else {
+            build_window(app);
+        }
+    });
     app.run()
 }
 
@@ -115,7 +121,11 @@ fn install_keyboard(
                 .shortcuts
                 .get(*command)
                 .and_then(gtk::accelerator_parse)
-                .is_some_and(|binding| binding == (key, modifiers))
+                .is_some_and(|(expected_key, expected_modifiers)| {
+                    expected_key.to_lower() == key.to_lower()
+                        && expected_modifiers
+                            == (modifiers & gtk::accelerator_get_default_mod_mask())
+                })
         });
         let Some(command) = command else {
             return glib::Propagation::Proceed;
@@ -440,6 +450,10 @@ fn tasks_page(state: &Rc<RefCell<ShellState>>) -> gtk::Widget {
     let progress_for_start = progress.clone();
     let status_for_start = status.clone();
     start.connect_clicked(move |_| {
+        if active_for_start.borrow().is_some() {
+            status_for_start.set_label("Cancel or wait for the current task first.");
+            return;
+        }
         let revoked = Rc::new(Cell::new(false));
         let Some((job, generation)) = state_for_start.borrow_mut().start_job(
             "Synthetic task",
@@ -452,10 +466,22 @@ fn tasks_page(state: &Rc<RefCell<ShellState>>) -> gtk::Widget {
         let state = Rc::clone(&state_for_start);
         let progress = progress_for_start.clone();
         let status = status_for_start.clone();
+        let active = Rc::clone(&active_for_start);
         let step = Rc::new(Cell::new(0_u8));
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if active.borrow().as_ref() != Some(&(job, generation)) {
+                return glib::ControlFlow::Break;
+            }
             if revoked.get() {
-                status.set_label("Task cancelled");
+                let terminal = state.borrow().job(job).map(|job| job.state);
+                status.set_label(match terminal {
+                    Some(crate::JobState::Failed) => {
+                        "A background operation stopped. Review the task and retry."
+                    }
+                    Some(crate::JobState::Complete) => "Task complete",
+                    _ => "Task cancelled",
+                });
+                *active.borrow_mut() = None;
                 return glib::ControlFlow::Break;
             }
             let next = step.get().saturating_add(5);
@@ -466,6 +492,7 @@ fn tasks_page(state: &Rc<RefCell<ShellState>>) -> gtk::Widget {
             progress.set_fraction(f64::from(next) / 100.0);
             if next == 100 {
                 status.set_label("Task complete");
+                *active.borrow_mut() = None;
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
@@ -637,11 +664,16 @@ fn preferences_page(
             3 => Command::Tasks,
             _ => Command::Preferences,
         };
-        match state_for_shortcut
-            .borrow_mut()
-            .shortcuts
-            .assign(command, &shortcut.text())
-        {
+        let accelerator = shortcut.text();
+        let result = if gtk::accelerator_parse(&accelerator).is_none() {
+            Err(crate::ShortcutError::Invalid)
+        } else {
+            state_for_shortcut
+                .borrow_mut()
+                .shortcuts
+                .assign(command, &accelerator)
+        };
+        match result {
             Ok(()) => shortcut_status.set_label("Shortcut assigned."),
             Err(error) => shortcut_status.set_label(&error.to_string()),
         }

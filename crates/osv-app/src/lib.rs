@@ -249,9 +249,10 @@ fn parse_binding(accelerator: &str) -> Option<KeyBinding> {
         "comma" | "delete" | "escape" | "space" | "home" | "end" | "page_up" | "page_down"
     ) || key
         .strip_prefix('f')
+        .filter(|number| !number.starts_with('0'))
         .and_then(|number| number.parse::<u8>().ok())
         .is_some_and(|number| (1..=35).contains(&number));
-    if !(key.chars().count() == 1 && !key.chars().any(char::is_control)) && !named {
+    if !(key.len() == 1 && key.bytes().all(|byte| byte.is_ascii_alphanumeric())) && !named {
         return None;
     }
     Some(KeyBinding { modifiers, key })
@@ -281,11 +282,37 @@ pub trait Revocable: fmt::Debug {
     fn revoke(&mut self);
 }
 
+struct RevocationOwner(Option<Box<dyn Revocable>>);
+
+impl RevocationOwner {
+    fn new(handle: Box<dyn Revocable>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn revoke(&mut self) {
+        if let Some(mut handle) = self.0.take() {
+            handle.revoke();
+        }
+    }
+}
+
+impl fmt::Debug for RevocationOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RevocationOwner")
+    }
+}
+
+impl Drop for RevocationOwner {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
+
 #[derive(Default)]
 struct UnlockedModel {
     generation: u64,
-    workers: BTreeMap<u64, Box<dyn Revocable>>,
-    job_handles: BTreeMap<JobId, Box<dyn Revocable>>,
+    workers: BTreeMap<u64, RevocationOwner>,
+    job_handles: BTreeMap<JobId, RevocationOwner>,
     decrypted_labels: Vec<SecretString>,
     lock_status: Option<LockStatus>,
 }
@@ -415,9 +442,10 @@ impl ShellState {
 
     pub fn register_worker(&mut self, worker: u64, handle: Box<dyn Revocable>) -> bool {
         let Some(session) = &mut self.session else {
+            RevocationOwner::new(handle).revoke();
             return false;
         };
-        if let Some(mut replaced) = session.workers.insert(worker, handle) {
+        if let Some(mut replaced) = session.workers.insert(worker, RevocationOwner::new(handle)) {
             replaced.revoke();
         }
         true
@@ -428,7 +456,10 @@ impl ShellState {
         description: &'static str,
         handle: Box<dyn Revocable>,
     ) -> Option<(JobId, u64)> {
-        let generation = self.session.as_ref()?.generation;
+        let Some(generation) = self.session.as_ref().map(|session| session.generation) else {
+            RevocationOwner::new(handle).revoke();
+            return None;
+        };
         let id = JobId(self.next_job);
         self.next_job = self.next_job.saturating_add(1);
         self.jobs.insert(
@@ -440,7 +471,10 @@ impl ShellState {
                 state: JobState::Running,
             },
         );
-        self.session.as_mut()?.job_handles.insert(id, handle);
+        self.session
+            .as_mut()?
+            .job_handles
+            .insert(id, RevocationOwner::new(handle));
         Some((id, generation))
     }
 
@@ -481,6 +515,9 @@ impl ShellState {
         let Some(job) = self.jobs.get_mut(&id) else {
             return false;
         };
+        if job.state != JobState::Running {
+            return false;
+        }
         job.state = JobState::Failed;
         if let Some(session) = &mut self.session
             && let Some(mut handle) = session.job_handles.remove(&id)
@@ -512,6 +549,10 @@ impl ShellState {
 
     pub fn jobs(&self) -> impl Iterator<Item = &Job> {
         self.jobs.values()
+    }
+
+    pub fn job(&self, id: JobId) -> Option<&Job> {
+        self.jobs.get(&id)
     }
 
     /// Crosses the security boundary synchronously: all jobs are cancelled,
@@ -690,6 +731,28 @@ mod tests {
     }
 
     #[test]
+    fn every_authority_ownership_exit_revokes() {
+        let mut shell = ShellState::default();
+        let (rejected, rejected_flag) = handle();
+        assert!(!shell.register_worker(1, rejected));
+        assert!(rejected_flag.get());
+        let (rejected_job, rejected_job_flag) = handle();
+        assert!(shell.start_job("rejected", rejected_job).is_none());
+        assert!(rejected_job_flag.get());
+
+        shell.unlock();
+        let (worker, worker_flag) = handle();
+        assert!(shell.register_worker(2, worker));
+        shell.unlock();
+        assert!(worker_flag.get());
+
+        let (worker, drop_flag) = handle();
+        assert!(shell.register_worker(3, worker));
+        drop(shell);
+        assert!(drop_flag.get());
+    }
+
+    #[test]
     fn locked_navigation_cannot_enter_sensitive_routes() {
         let mut shell = ShellState::default();
         assert!(!shell.navigate(Route::Gallery));
@@ -753,6 +816,12 @@ mod tests {
             shortcuts.assign(Command::Gallery, "invalid>"),
             Err(ShortcutError::Invalid)
         );
+        for invalid in ["<Primary>,", "<Primary>F04", "<Primary>>"] {
+            assert_eq!(
+                shortcuts.assign(Command::Gallery, invalid),
+                Err(ShortcutError::Invalid)
+            );
+        }
         assert!(shortcuts.assign(Command::Gallery, "<Primary>1").is_ok());
     }
 
@@ -786,6 +855,18 @@ mod tests {
         let error = shell.error.expect("public error");
         assert!(!error.summary.is_empty());
         assert!(!format!("{error:?}").contains("probe"));
+    }
+
+    #[test]
+    fn completed_job_is_terminal() {
+        let mut shell = ShellState::default();
+        shell.unlock();
+        let (handle, revoked) = handle();
+        let (job, generation) = shell.start_job("complete", handle).expect("unlocked");
+        assert!(shell.update_job(job, generation, 100));
+        assert!(revoked.get());
+        assert!(!shell.fail_job(job, generation));
+        assert!(!shell.cancel_job(job));
     }
 
     #[test]

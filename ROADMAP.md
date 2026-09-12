@@ -1335,7 +1335,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Establish the redesigned UI without coupling it to storage details.
 
-**Completed 2026-09-12**
+**Implementation complete 2026-09-12; manual acceptance pending**
 
 **Progress**
 
@@ -1397,6 +1397,14 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   model rather than timing three sample labels. Automated frame-time, assistive
   technology, and real mixed-output measurements remain manual release gates as
   stated above rather than being inferred from the headless arithmetic tests.
+- The final GPT-6 re-review tightened authority ownership so rejection, session
+  replacement, shell drop, completion, failure, cancellation, and lock all
+  revoke through an RAII owner. It also made job terminal states monotonic,
+  prevents overlapping demo tasks from sharing presentation state, validates
+  user accelerators with GTK before assignment, normalizes dispatch modifiers,
+  and reuses the active window so global CSS providers remain single-instance.
+  Phase 9 is not open until the remaining native Wayland interaction,
+  accessibility, mixed-scale, and production-view performance gates are run.
 
 **Deliverables**
 
