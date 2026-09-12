@@ -1,9 +1,10 @@
 //! Storage-independent application state for the GTK shell.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+use std::collections::BTreeMap;
 use std::time::Instant;
-use zeroize::Zeroize;
+use std::{fmt, io};
+
+use osv_crypto::{LockStatus, SecretString};
 
 pub mod ui;
 
@@ -102,16 +103,17 @@ impl Appearance {
             Density::Spacious => 144,
         };
         format!(
-            ".osv-shell {{ --osv-accent: {}; background: {}; color: {}; font-family: \"{}\"; font-size: {}pt; }}\n\
+            ".osv-shell {{ background: {}; color: {}; font-family: \"{}\"; font-size: {}pt; }}\n\
              .osv-tile {{ min-height: {}px; }}\n\
+             .osv-gallery > child:selected .osv-tile {{ outline: 3px solid {}; }}\n\
              .osv-gallery {{ padding: {}px; }}\n\
              .osv-gallery > child {{ margin: {}px; }}",
-            self.accent,
             background,
             foreground,
             family,
             self.font_size,
             tile_height,
+            self.accent,
             self.spacing,
             self.spacing
         )
@@ -194,18 +196,18 @@ impl Default for Shortcuts {
 
 impl Shortcuts {
     pub fn assign(&mut self, command: Command, accelerator: &str) -> Result<(), ShortcutError> {
-        let canonical = accelerator.trim().to_ascii_lowercase();
-        if canonical.is_empty()
-            || !canonical.contains('>')
-            || canonical.chars().any(char::is_control)
-        {
+        let Some(binding) = parse_binding(accelerator) else {
             return Err(ShortcutError::Invalid);
-        }
-        if matches!(canonical.as_str(), "<alt>f4" | "<primary><alt>delete") {
+        };
+        let reserved = ["<Alt>F4", "<Primary><Alt>Delete"]
+            .into_iter()
+            .filter_map(parse_binding)
+            .any(|candidate| candidate == binding);
+        if reserved {
             return Err(ShortcutError::Reserved);
         }
         if let Some((used_by, _)) = self.0.iter().find(|(candidate, value)| {
-            **candidate != command && value.to_ascii_lowercase() == canonical
+            **candidate != command && parse_binding(value).is_some_and(|value| value == binding)
         }) {
             return Err(ShortcutError::Conflict(*used_by));
         }
@@ -216,6 +218,43 @@ impl Shortcuts {
     pub fn get(&self, command: Command) -> Option<&str> {
         self.0.get(&command).map(String::as_str)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KeyBinding {
+    modifiers: BTreeMap<&'static str, ()>,
+    key: String,
+}
+
+fn parse_binding(accelerator: &str) -> Option<KeyBinding> {
+    let mut remaining = accelerator.trim();
+    let mut modifiers = BTreeMap::new();
+    while let Some(after_open) = remaining.strip_prefix('<') {
+        let close = after_open.find('>')?;
+        let modifier = match after_open[..close].to_ascii_lowercase().as_str() {
+            "primary" | "control" | "ctrl" => "control",
+            "shift" => "shift",
+            "alt" => "alt",
+            "super" => "super",
+            _ => return None,
+        };
+        if modifiers.insert(modifier, ()).is_some() {
+            return None;
+        }
+        remaining = &after_open[close + 1..];
+    }
+    let key = remaining.to_ascii_lowercase();
+    let named = matches!(
+        key.as_str(),
+        "comma" | "delete" | "escape" | "space" | "home" | "end" | "page_up" | "page_down"
+    ) || key
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .is_some_and(|number| (1..=35).contains(&number));
+    if !(key.chars().count() == 1 && !key.chars().any(char::is_control)) && !named {
+        return None;
+    }
+    Some(KeyBinding { modifiers, key })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -237,19 +276,30 @@ pub struct Job {
     pub state: JobState,
 }
 
-#[derive(Debug, Default)]
-struct UnlockedModel {
-    generation: u64,
-    workers: BTreeSet<u64>,
-    decrypted_labels: Vec<String>,
+pub trait Revocable: fmt::Debug {
+    /// Cancels work and synchronously revokes its object-scoped authority.
+    fn revoke(&mut self);
 }
 
-impl Drop for UnlockedModel {
-    fn drop(&mut self) {
-        for label in &mut self.decrypted_labels {
-            label.zeroize();
-        }
-        self.decrypted_labels.clear();
+#[derive(Default)]
+struct UnlockedModel {
+    generation: u64,
+    workers: BTreeMap<u64, Box<dyn Revocable>>,
+    job_handles: BTreeMap<JobId, Box<dyn Revocable>>,
+    decrypted_labels: Vec<SecretString>,
+    lock_status: Option<LockStatus>,
+}
+
+impl fmt::Debug for UnlockedModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UnlockedModel")
+            .field("generation", &self.generation)
+            .field("workers", &self.workers.len())
+            .field("job_handles", &self.job_handles.len())
+            .field("decrypted_labels", &"[REDACTED]")
+            .field("lock_status", &self.lock_status)
+            .finish()
     }
 }
 
@@ -259,7 +309,6 @@ pub struct PublicError {
     pub recovery: &'static str,
 }
 
-#[derive(Debug)]
 pub struct ShellState {
     route: Route,
     generation: u64,
@@ -269,6 +318,21 @@ pub struct ShellState {
     pub appearance: Appearance,
     pub shortcuts: Shortcuts,
     pub error: Option<PublicError>,
+}
+
+impl fmt::Debug for ShellState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShellState")
+            .field("route", &self.route)
+            .field("generation", &self.generation)
+            .field("unlocked", &self.is_unlocked())
+            .field("job_count", &self.jobs.len())
+            .field("appearance", &self.appearance)
+            .field("shortcuts", &self.shortcuts)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl Default for ShellState {
@@ -325,29 +389,45 @@ impl ShellState {
         self.generation = self.generation.wrapping_add(1);
         self.session = Some(UnlockedModel {
             generation: self.generation,
-            workers: BTreeSet::new(),
+            workers: BTreeMap::new(),
+            job_handles: BTreeMap::new(),
             decrypted_labels: Vec::new(),
+            lock_status: None,
         });
         self.route = Route::Gallery;
         self.error = None;
     }
 
-    pub fn add_decrypted_label(&mut self, label: String) -> bool {
+    pub fn add_decrypted_label(&mut self, label: &str) -> io::Result<Option<LockStatus>> {
+        let Some(session) = &mut self.session else {
+            return Ok(None);
+        };
+        let label = SecretString::new(label)?;
+        let status = label.lock_status();
+        session.lock_status = Some(
+            session
+                .lock_status
+                .map_or(status, |current| current.combine(status)),
+        );
+        session.decrypted_labels.push(label);
+        Ok(Some(status))
+    }
+
+    pub fn register_worker(&mut self, worker: u64, handle: Box<dyn Revocable>) -> bool {
         let Some(session) = &mut self.session else {
             return false;
         };
-        session.decrypted_labels.push(label);
+        if let Some(mut replaced) = session.workers.insert(worker, handle) {
+            replaced.revoke();
+        }
         true
     }
 
-    pub fn register_worker(&mut self, worker: u64) -> bool {
-        let Some(session) = &mut self.session else {
-            return false;
-        };
-        session.workers.insert(worker)
-    }
-
-    pub fn start_job(&mut self, description: &'static str) -> Option<(JobId, u64)> {
+    pub fn start_job(
+        &mut self,
+        description: &'static str,
+        handle: Box<dyn Revocable>,
+    ) -> Option<(JobId, u64)> {
         let generation = self.session.as_ref()?.generation;
         let id = JobId(self.next_job);
         self.next_job = self.next_job.saturating_add(1);
@@ -360,6 +440,7 @@ impl ShellState {
                 state: JobState::Running,
             },
         );
+        self.session.as_mut()?.job_handles.insert(id, handle);
         Some((id, generation))
     }
 
@@ -380,6 +461,11 @@ impl ShellState {
         job.progress = progress.min(100);
         if job.progress == 100 {
             job.state = JobState::Complete;
+            if let Some(session) = &mut self.session
+                && let Some(mut handle) = session.job_handles.remove(&id)
+            {
+                handle.revoke();
+            }
         }
         true
     }
@@ -396,6 +482,11 @@ impl ShellState {
             return false;
         };
         job.state = JobState::Failed;
+        if let Some(session) = &mut self.session
+            && let Some(mut handle) = session.job_handles.remove(&id)
+        {
+            handle.revoke();
+        }
         self.error = Some(PublicError {
             summary: "A background operation stopped",
             recovery: "Review the task and retry. The vault remains locked if locking was requested.",
@@ -411,6 +502,11 @@ impl ShellState {
             return false;
         }
         job.state = JobState::Cancelling;
+        if let Some(session) = &mut self.session
+            && let Some(mut handle) = session.job_handles.remove(&id)
+        {
+            handle.revoke();
+        }
         true
     }
 
@@ -429,6 +525,13 @@ impl ShellState {
             job.state = JobState::Cancelling;
         }
         if let Some(session) = &mut self.session {
+            for handle in session.job_handles.values_mut() {
+                handle.revoke();
+            }
+            for handle in session.workers.values_mut() {
+                handle.revoke();
+            }
+            session.job_handles.clear();
             session.workers.clear();
         }
         self.session = None;
@@ -494,7 +597,11 @@ pub enum CssOutcome {
 /// Applies user CSS only after GTK has parsed it without an error. The callback
 /// keeps GTK parsing in the UI layer while this policy remains headless.
 pub fn accept_user_css(css: &str, parses: impl FnOnce(&str) -> bool) -> CssOutcome {
-    if css.len() <= 256 * 1024 && !css.contains("@import") && parses(css) {
+    // GTK accepts escaped and case-insensitive at-rules. Keep user CSS in a
+    // resource-free subset by rejecting every at-rule, escape, and URL token.
+    let folded = css.to_ascii_lowercase();
+    let has_resource_syntax = css.contains(['@', '\\']) || folded.contains("url");
+    if css.len() <= 256 * 1024 && !has_resource_syntax && parses(css) {
         CssOutcome::Applied
     } else {
         CssOutcome::Rejected {
@@ -511,28 +618,59 @@ pub struct PerformanceSample {
 
 pub fn synthetic_gallery_sample(entries: u32) -> Option<PerformanceSample> {
     let started = Instant::now();
-    let index = GalleryIndex::synthetic(entries)?;
-    for position in [0, entries / 2, entries.saturating_sub(1)] {
-        let _ = index.label(position);
-    }
+    let _labels = gallery_labels(entries)?;
     Some(PerformanceSample {
         entries,
         elapsed_micros: started.elapsed().as_micros(),
     })
 }
 
+pub fn gallery_labels(entries: u32) -> Option<Vec<String>> {
+    let index = GalleryIndex::synthetic(entries)?;
+    Some(
+        (0..entries)
+            .filter_map(|position| index.label(position))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    #[derive(Debug)]
+    struct TestHandle(Rc<Cell<bool>>);
+
+    impl Revocable for TestHandle {
+        fn revoke(&mut self) {
+            self.0.set(true);
+        }
+    }
+
+    fn handle() -> (Box<dyn Revocable>, Rc<Cell<bool>>) {
+        let revoked = Rc::new(Cell::new(false));
+        (Box::new(TestHandle(Rc::clone(&revoked))), revoked)
+    }
 
     #[test]
     fn lock_drops_decrypted_model_workers_and_jobs() {
         let mut shell = ShellState::default();
         shell.unlock();
-        assert!(shell.add_decrypted_label("private title".into()));
-        assert!(shell.register_worker(7));
-        let _ = shell.start_job("scan").expect("unlocked");
+        assert!(
+            shell
+                .add_decrypted_label("private title")
+                .expect("allocate")
+                .is_some()
+        );
+        let (worker, worker_revoked) = handle();
+        assert!(shell.register_worker(7, worker));
+        let (job, job_revoked) = handle();
+        let _ = shell.start_job("scan", job).expect("unlocked");
         shell.lock();
+        assert!(worker_revoked.get());
+        assert!(job_revoked.get());
         assert!(!shell.is_unlocked());
         assert_eq!(shell.route(), Route::Choose);
         assert_eq!(shell.decrypted_label_count(), 0);
@@ -544,7 +682,8 @@ mod tests {
     fn late_job_update_cannot_cross_lock_generation() {
         let mut shell = ShellState::default();
         shell.unlock();
-        let (job, generation) = shell.start_job("maintenance").expect("unlocked");
+        let (handle, _) = handle();
+        let (job, generation) = shell.start_job("maintenance", handle).expect("unlocked");
         shell.lock();
         shell.unlock();
         assert!(!shell.update_job(job, generation, 80));
@@ -567,6 +706,14 @@ mod tests {
         );
         assert!(matches!(
             accept_user_css("@import url(x);", |_| true),
+            CssOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            accept_user_css("@IMPORT 'x';", |_| true),
+            CssOutcome::Rejected { .. }
+        ));
+        assert!(matches!(
+            accept_user_css(r"@\69mport 'x';", |_| true),
             CssOutcome::Rejected { .. }
         ));
     }
@@ -595,8 +742,16 @@ mod tests {
             Err(ShortcutError::Conflict(Command::Search))
         );
         assert_eq!(
+            shortcuts.assign(Command::Gallery, "<Control>f"),
+            Err(ShortcutError::Conflict(Command::Search))
+        );
+        assert_eq!(
             shortcuts.assign(Command::Gallery, "<Alt>F4"),
             Err(ShortcutError::Reserved)
+        );
+        assert_eq!(
+            shortcuts.assign(Command::Gallery, "invalid>"),
+            Err(ShortcutError::Invalid)
         );
         assert!(shortcuts.assign(Command::Gallery, "<Primary>1").is_ok());
     }
@@ -625,7 +780,8 @@ mod tests {
     fn worker_failure_is_accessible_and_redacted() {
         let mut shell = ShellState::default();
         shell.unlock();
-        let (job, generation) = shell.start_job("probe").expect("unlocked");
+        let (handle, _) = handle();
+        let (job, generation) = shell.start_job("probe", handle).expect("unlocked");
         assert!(shell.fail_job(job, generation));
         let error = shell.error.expect("public error");
         assert!(!error.summary.is_empty());
@@ -636,6 +792,24 @@ mod tests {
     fn portal_cancellation_is_not_an_error() {
         let outcome: PortalOutcome<String> = PortalOutcome::Cancelled;
         assert_eq!(outcome, PortalOutcome::Cancelled);
+    }
+
+    #[test]
+    fn debug_output_redacts_decrypted_labels_and_locked_input_is_not_copied() {
+        let mut shell = ShellState::default();
+        assert_eq!(
+            shell
+                .add_decrypted_label("rejected private title")
+                .expect("no allocation"),
+            None
+        );
+        shell.unlock();
+        shell
+            .add_decrypted_label("private title")
+            .expect("allocate");
+        let debug = format!("{shell:?}");
+        assert!(!debug.contains("private title"));
+        assert!(debug.contains("unlocked"));
     }
 
     #[test]

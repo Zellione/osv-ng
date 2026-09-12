@@ -1357,6 +1357,19 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   provider, and is installed only when parsing reports no errors; otherwise the
   active built-in theme remains installed. GTK `GridView`/`ListItemFactory`
   supplies virtualized, labelled gallery children for a synthetic 100k model.
+- Remediated the post-commit GPT-6 review: the central route synchronizer wipes
+  the password widget on every lock; decrypted labels now use redacted,
+  best-effort locked `SecretString` owners; job and worker registrations own
+  synchronous revocation capabilities; and cancellation, failure, completion,
+  and lock observably revoke them. CSS policy rejects all at-rules, escapes, and
+  URL tokens and reloads two stable providers instead of accumulating them.
+- GTK dismissal and cancellation domains are handled separately from chooser
+  failure. Accelerator parsing normalizes modifier aliases and rejects malformed,
+  conflicting, and reserved bindings. Panel placement now reparents or hides the
+  live sidebar, accent styling is visible on selection, and the task surface
+  drives progress, cancellation, and redacted failure states from a synthetic
+  asynchronous job. Preference controls have explicit accessible labels and a
+  scrollable constrained-window layout.
 
 **Verification**
 
@@ -1380,6 +1393,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Native Wayland accessibility inspection, mixed-output scale movement, and
   portal interaction remain manual release gates; the Phase 1 measurements
   supporting GTK selection remain recorded in ADR 0007.
+- The 100k test now constructs the same bounded label vector consumed by the GTK
+  model rather than timing three sample labels. Automated frame-time, assistive
+  technology, and real mixed-output measurements remain manual release gates as
+  stated above rather than being inferred from the headless arithmetic tests.
 
 **Deliverables**
 
