@@ -35,6 +35,7 @@ repository = "https://github.com/zellione/osv-ng"
 argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false, features = ["alloc"] }
 getrandom = "0.3.4"
+gtk = { package = "gtk4", version = "0.11.4", features = ["v4_12"] }
 hkdf = "0.12.4"
 libc = "0.2.189"
 poly1305 = { version = "0.8.0", default-features = false, features = ["zeroize"] }

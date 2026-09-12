@@ -1335,6 +1335,52 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Establish the redesigned UI without coupling it to storage details.
 
+**Completed 2026-09-12**
+
+**Progress**
+
+- Promoted GTK4 0.11.4 into the production workspace and replaced the headless
+  application stub with a storage-independent shell. The shell provides
+  portal-backed choose/create entry points, an unlock form, explicit public
+  routes, virtualized grid navigation, task and search surfaces, preferences,
+  and an immediate lock transition.
+- Added a headless session/action model with generation-bound background jobs,
+  cancellation, redacted public worker failures, and a synchronous lock
+  boundary. Lock revokes tracked worker authority, drops and wipes
+  application-owned decrypted labels, clears jobs, invalidates late callbacks,
+  and returns to the non-sensitive chooser.
+- Added bounded appearance and shortcut models covering system/light/dark/high
+  contrast themes, accent color, compact/comfortable/spacious density, spacing,
+  font family and size, four panel placements, accelerator conflicts, and
+  desktop-reserved shortcuts. Invalid settings normalize to safe defaults.
+- User CSS is capped at 256 KiB, rejects imports, is parsed into a temporary GTK
+  provider, and is installed only when parsing reports no errors; otherwise the
+  active built-in theme remains installed. GTK `GridView`/`ListItemFactory`
+  supplies virtualized, labelled gallery children for a synthetic 100k model.
+
+**Verification**
+
+- Headless regressions cover locked and unlocked keyboard actions, invalid CSS,
+  theme input normalization, scale factors 1 through 4, lock during a job,
+  stale callbacks after relock, redacted worker failure, portal cancellation,
+  shortcut conflicts, and bounded 100k-entry index setup.
+- Workspace formatting, warnings-as-errors Clippy, all-target/all-feature tests,
+  the secret-canary regression, `cargo audit`, and dependency-policy gates pass.
+  The Flatpak dependency source lock was regenerated after adding GTK; the
+  clean offline release build/test gate and all three installed self-checks
+  pass. A native Wayland smoke launch reached the event loop and remained
+  responsive until its intentional timeout.
+
+**Deviations and follow-up**
+
+- Vault creation and authentication buttons terminate at explicit service
+  seams: Phase 8 owns interaction state, not storage orchestration. Phase 9
+  will connect those seams while delivering the first end-to-end media path.
+- Automated tests exercise GTK-independent policy so they run without a display.
+  Native Wayland accessibility inspection, mixed-output scale movement, and
+  portal interaction remain manual release gates; the Phase 1 measurements
+  supporting GTK selection remain recorded in ADR 0007.
+
 **Deliverables**
 
 - Unlock/create/choose flow, lock boundary, navigation/action model, background

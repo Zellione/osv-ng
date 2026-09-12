@@ -39,8 +39,13 @@ flatpak-builder --force-clean --disable-rofiles-fuse \
   build-aux/flatpak/io.github.osv_ng.Phase2.yml
 ```
 
+Verify the installed shell without opening a display with
+`flatpak-builder --run .flatpak-phase2
+build-aux/flatpak/io.github.osv_ng.Phase2.yml osv-app --self-check`. The two
+worker commands remain unchanged.
+
 The manifest builds all production workspace members, runs all tests in release
 mode, and installs the application plus both helper binaries. Because the
-application entry point is only a Phase 2 stub, successful execution proves SDK
-and packaging mechanics only; it does not prove GTK, media, portal, or release
-sandbox behavior.
+application entry point now contains the Phase 8 GTK shell, but successful
+non-interactive execution proves SDK and packaging mechanics only; it does not
+replace native Wayland, accessibility, portal, media, or release-sandbox gates.
