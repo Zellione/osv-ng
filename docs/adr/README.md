@@ -20,3 +20,4 @@ Start new decisions from [the ADR template](0000-template.md).
 | [0007](0007-gtk4-ui-stack.md) | GTK4 as the initial UI stack | Accepted |
 | [0008](0008-gstreamer-media-stack.md) | GStreamer as the initial media stack | Accepted |
 | [0009](0009-brokered-media-plaintext.md) | Brokered authenticated plaintext for media workers | Accepted |
+| [0010](0010-worker-protocol-and-sandbox.md) | Short-lived brokered worker sessions | Accepted |

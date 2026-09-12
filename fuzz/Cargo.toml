@@ -14,6 +14,7 @@ libfuzzer-sys = "=0.4.13"
 osv-crypto = { path = "../crates/osv-crypto", version = "=0.1.0" }
 osv-storage = { path = "../crates/osv-storage", version = "=0.1.0" }
 osv-test-support = { path = "../crates/osv-test-support", version = "=0.1.0" }
+osv-worker-protocol = { path = "../crates/osv-worker-protocol", version = "=0.1.0" }
 
 [[bin]]
 name = "secret-canary"
@@ -32,6 +33,13 @@ bench = false
 [[bin]]
 name = "object-preamble"
 path = "fuzz_targets/object-preamble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "worker-frame"
+path = "fuzz_targets/worker-frame.rs"
 test = false
 doc = false
 bench = false

@@ -241,6 +241,8 @@ version = "0.1.0"
 dependencies = [
  "osv-crypto",
  "osv-import",
+ "osv-isolation",
+ "osv-worker-protocol",
 ]
 
 [[package]]
@@ -278,6 +280,18 @@ name = "osv-import"
 version = "0.1.0"
 dependencies = [
  "osv-domain",
+ "osv-isolation",
+ "osv-worker-protocol",
+]
+
+[[package]]
+name = "osv-isolation"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "osv-crypto",
+ "osv-worker-protocol",
+ "zeroize",
 ]
 
 [[package]]
@@ -285,6 +299,8 @@ name = "osv-media"
 version = "0.1.0"
 dependencies = [
  "osv-domain",
+ "osv-isolation",
+ "osv-worker-protocol",
 ]
 
 [[package]]
@@ -292,7 +308,9 @@ name = "osv-media-worker"
 version = "0.1.0"
 dependencies = [
  "osv-crypto",
+ "osv-isolation",
  "osv-media",
+ "osv-worker-protocol",
 ]
 
 [[package]]
@@ -324,6 +342,14 @@ dependencies = [
  "osv-crypto",
  "osv-storage",
  "osv-test-support",
+]
+
+[[package]]
+name = "osv-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "osv-crypto",
+ "zeroize",
 ]
 
 [[package]]

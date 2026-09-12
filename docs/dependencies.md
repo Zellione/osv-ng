@@ -19,8 +19,9 @@ review checklist. Transitive versions remain pinned by the root `Cargo.lock`.
   exact-fill project interface.
 - `zeroize` 1.9.0 supplies compiler-resistant wipe operations with default
   features disabled; its derive macro is deliberately not included.
-- `libc` 0.2.189 exposes Linux memory, descriptor-relative filesystem, resource
-  limit, and dumpability syscalls within narrowly allowed unsafe adapters.
+- `libc` 0.2.189 exposes Linux memory, descriptor-relative filesystem,
+  descriptor-passing, polling, resource-limit, dumpability, Landlock, and
+  seccomp syscalls within narrowly allowed unsafe adapters.
 
 These direct crates are `MIT OR Apache-2.0`. Their versions, features, sources,
 MSRV, and known advisories were reviewed through package metadata, the lockfile,
@@ -29,6 +30,11 @@ MSRV, and known advisories were reviewed through package metadata, the lockfile,
 to both dependency-policy files. Upgrade review must rerun project vectors, the
 rewrap kill matrix, unsafe-boundary review, advisory audit, and dependency
 policy gates.
+
+Phase 7 adds no external production dependency. `osv-worker-protocol` uses the
+already-reviewed `zeroize`, while `osv-isolation` composes the already-reviewed
+`libc`, `zeroize`, and project crypto/protocol crates. This avoids a serializer
+or sandbox wrapper on the hostile protocol and syscall surfaces.
 
 ## `proptest` 1.11
 

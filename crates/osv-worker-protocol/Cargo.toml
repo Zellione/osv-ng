@@ -1,5 +1,5 @@
 [package]
-name = "osv-import"
+name = "osv-worker-protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-osv-domain.workspace = true
-osv-isolation.workspace = true
-osv-worker-protocol.workspace = true
+osv-crypto.workspace = true
+zeroize.workspace = true
 
 [lints]
 workspace = true
