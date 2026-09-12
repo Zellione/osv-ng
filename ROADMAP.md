@@ -1245,6 +1245,14 @@ explicitly excluding the remaining acceptance gaps from that approval:
   intermediate allocation; and cancellation sends best-effort without blocking
   before its single grace deadline. Added Landlock-present/degraded filesystem
   integrity, encoder-allocation, and saturated non-reading worker regressions.
+- Remediated the 2026-09-12 follow-up review: seccomp denies queued-signal
+  and pidfd signal syscall variants; protocol version 2 keeps received and
+  decoded data in protected storage and carries worker page-lock status;
+  channel, supervisor, and error APIs preserve transient degradation; and
+  descriptor intake verifies that socket authority belongs to `AF_UNIX`.
+  Subprocess coverage exercises peer-signal denial and forced transport lock
+  degradation, while descriptor coverage rejects an Internet socket sent over
+  `SCM_RIGHTS`.
 
 **Verification**
 
@@ -1256,6 +1264,11 @@ explicitly excluding the remaining acceptance gaps from that approval:
   and fuzz dependency policy/audit gates, and the offline Flatpak release
   build/tests plus installed stubs pass. The 20-second ASan `secret-canary`
   harness smoke completed 11,093,035 executions without a finding.
+- After the 2026-09-12 follow-up remediation, GPT-6 Astra approved the signal,
+  protected-memory, degradation-reporting, protocol-v2, and socket-domain
+  changes with no blocking findings. Workspace formatting, warnings-as-errors
+  Clippy, full workspace tests, the exact debug-redaction canary, `cargo audit`,
+  and production dependency policy checks pass.
 - Production and fuzz `cargo audit` and `cargo deny` gates pass. The ASan
   isolation target passes for protocol and descriptor FFI; subprocess cases
   intentionally skip under ASan because its shadow mapping exceeds the worker's

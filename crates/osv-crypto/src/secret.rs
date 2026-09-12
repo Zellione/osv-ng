@@ -55,6 +55,14 @@ pub struct SecretBytes {
     len: usize,
 }
 
+impl PartialEq for SecretBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.expose() == other.expose()
+    }
+}
+
+impl Eq for SecretBytes {}
+
 /// Typed page-isolated workspace for cryptographic algorithms.
 pub(crate) struct SecretArray<T: Default + Zeroize> {
     allocation: platform::ArrayAllocation<T>,

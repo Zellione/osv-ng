@@ -9,8 +9,8 @@ fn archive_worker_completes_a_bounded_stream_under_sandbox() {
         worker.sandbox_flags() & osv_isolation::DESCRIPTOR_ALLOWLIST,
         0
     );
-    worker
-        .send_authenticated(0, PlaintextBuffer::new(vec![4, 5, 6]).unwrap())
-        .unwrap();
+    let mut plaintext = PlaintextBuffer::zeroed(3).unwrap();
+    plaintext.as_mut_slice().copy_from_slice(&[4, 5, 6]);
+    worker.send_authenticated(0, plaintext).unwrap();
     assert_eq!(worker.finish().unwrap(), ExitClass::Success);
 }

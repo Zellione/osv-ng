@@ -7,7 +7,6 @@ use std::{
     os::unix::net::UnixStream,
     time::Instant,
 };
-use zeroize::Zeroize;
 
 #[derive(Debug)]
 pub enum TransportError {
@@ -53,26 +52,38 @@ impl From<ProtocolError> for TransportError {
 pub struct PlaintextBuffer(osv_crypto::SecretBytes);
 
 impl PlaintextBuffer {
-    pub fn new(mut bytes: Vec<u8>) -> Result<Self, TransportError> {
-        if bytes.len() > osv_worker_protocol::MAX_DATA_LEN {
-            bytes.as_mut_slice().zeroize();
+    pub fn zeroed(len: usize) -> Result<Self, TransportError> {
+        if len > osv_worker_protocol::MAX_DATA_LEN {
             return Err(ProtocolError::Oversized.into());
         }
-        osv_crypto::SecretBytes::take(bytes.as_mut_slice())
+        osv_crypto::SecretBytes::zeroed(len)
             .map(Self)
             .map_err(TransportError::Io)
+    }
+    pub fn from_secret(bytes: osv_crypto::SecretBytes) -> Result<Self, TransportError> {
+        if bytes.len() > osv_worker_protocol::MAX_DATA_LEN {
+            return Err(ProtocolError::Oversized.into());
+        }
+        Ok(Self(bytes))
     }
     pub fn as_slice(&self) -> &[u8] {
         self.0.expose()
     }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.0.expose_mut()
+    }
     pub fn lock_status(&self) -> osv_crypto::LockStatus {
         self.0.lock_status()
+    }
+    pub(crate) fn into_secret(self) -> osv_crypto::SecretBytes {
+        self.0
     }
 }
 
 pub struct FramedChannel {
     stream: UnixStream,
     deadline: Option<Instant>,
+    lock_status: osv_crypto::LockStatus,
 }
 
 impl FramedChannel {
@@ -80,6 +91,7 @@ impl FramedChannel {
         Self {
             stream,
             deadline: None,
+            lock_status: osv_crypto::LockStatus::Locked,
         }
     }
     pub fn stream(&self) -> &UnixStream {
@@ -90,39 +102,73 @@ impl FramedChannel {
         self.deadline = deadline;
     }
 
-    pub fn send(&mut self, frame: &Frame) -> Result<(), TransportError> {
-        let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
-        frame.encode_into(encoded.expose_mut())?;
-        self.write_all(encoded.expose()).map_err(Into::into)
+    pub fn lock_status(&self) -> osv_crypto::LockStatus {
+        self.lock_status
     }
 
-    pub(crate) fn send_nonblocking(&mut self, frame: &Frame) -> Result<(), TransportError> {
+    pub fn send(&mut self, frame: &Frame) -> Result<osv_crypto::LockStatus, TransportError> {
+        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+            let mut encoded = [0_u8; HEADER_LEN + 8];
+            let encoded_len = frame.encoded_len()?;
+            frame.encode_into(&mut encoded[..encoded_len])?;
+            self.write_all(&encoded[..encoded_len])?;
+            return Ok(osv_crypto::LockStatus::Locked);
+        }
         let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
+        let lock_status = encoded.lock_status();
+        self.lock_status = self.lock_status.combine(lock_status);
+        frame.encode_into(encoded.expose_mut())?;
+        self.write_all(encoded.expose())?;
+        Ok(lock_status)
+    }
+
+    pub(crate) fn send_nonblocking(
+        &mut self,
+        frame: &Frame,
+    ) -> Result<osv_crypto::LockStatus, TransportError> {
+        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+            let mut encoded = [0_u8; HEADER_LEN + 8];
+            let encoded_len = frame.encoded_len()?;
+            frame.encode_into(&mut encoded[..encoded_len])?;
+            let written = send_bytes_nonblocking(self.stream.as_raw_fd(), &encoded[..encoded_len])?;
+            return if written == encoded_len {
+                Ok(osv_crypto::LockStatus::Locked)
+            } else {
+                Err(io::Error::from(io::ErrorKind::WouldBlock).into())
+            };
+        }
+        let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
+        let lock_status = encoded.lock_status();
+        self.lock_status = self.lock_status.combine(lock_status);
         frame.encode_into(encoded.expose_mut())?;
         let written = send_bytes_nonblocking(self.stream.as_raw_fd(), encoded.expose())?;
         if written == encoded.len() {
-            Ok(())
+            Ok(lock_status)
         } else {
             Err(io::Error::from(io::ErrorKind::WouldBlock).into())
         }
     }
 
-    pub fn receive(&mut self) -> Result<Frame, TransportError> {
-        let mut encoded = vec![0_u8; HEADER_LEN];
-        self.read_exact(&mut encoded)?;
-        let length = u32::from_le_bytes(encoded[12..16].try_into().expect("fixed slice")) as usize;
+    pub fn receive(&mut self) -> Result<(Frame, osv_crypto::LockStatus), TransportError> {
+        let mut header = osv_crypto::SecretBytes::zeroed(HEADER_LEN)?;
+        self.lock_status = self.lock_status.combine(header.lock_status());
+        self.read_exact(header.expose_mut())?;
+        let length =
+            u32::from_le_bytes(header.expose()[12..16].try_into().expect("fixed slice")) as usize;
         if length > MAX_PAYLOAD_LEN {
-            encoded.zeroize();
             return Err(ProtocolError::Oversized.into());
         }
-        encoded.resize(HEADER_LEN + length, 0);
-        if let Err(error) = self.read_exact(&mut encoded[HEADER_LEN..]) {
-            encoded.zeroize();
-            return Err(error.into());
-        }
-        let decoded = Frame::decode(&encoded);
-        encoded.zeroize();
-        decoded.map_err(Into::into)
+        let mut encoded = osv_crypto::SecretBytes::zeroed(HEADER_LEN + length)?;
+        self.lock_status = self.lock_status.combine(encoded.lock_status());
+        encoded.expose_mut()[..HEADER_LEN].copy_from_slice(header.expose());
+        self.read_exact(&mut encoded.expose_mut()[HEADER_LEN..])?;
+        let frame = Frame::decode(encoded.expose())?;
+        let lock_status = header
+            .lock_status()
+            .combine(encoded.lock_status())
+            .combine(frame.lock_status());
+        self.lock_status = self.lock_status.combine(lock_status);
+        Ok((frame, lock_status))
     }
 
     fn read_exact(&mut self, mut bytes: &mut [u8]) -> io::Result<()> {
@@ -328,12 +374,31 @@ pub fn receive_descriptor(socket: &UnixStream) -> Result<OwnedFd, TransportError
     if !matches!(kind, libc::S_IFREG | libc::S_IFIFO | libc::S_IFSOCK) {
         return Err(TransportError::InvalidDescriptor);
     }
+    if kind == libc::S_IFSOCK {
+        let mut domain = 0_i32;
+        let mut domain_len = std::mem::size_of_val(&domain) as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                descriptor.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_DOMAIN,
+                (&mut domain as *mut i32).cast(),
+                &mut domain_len,
+            )
+        } != 0
+            || domain_len as usize != std::mem::size_of_val(&domain)
+            || domain != libc::AF_UNIX
+        {
+            return Err(TransportError::InvalidDescriptor);
+        }
+    }
     Ok(descriptor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::UdpSocket;
     use std::os::fd::AsFd;
 
     #[allow(unsafe_code)]
@@ -369,7 +434,7 @@ mod tests {
     #[test]
     fn bounded_plaintext_and_descriptor_contract() {
         assert!(matches!(
-            PlaintextBuffer::new(vec![0; osv_worker_protocol::MAX_DATA_LEN + 1]),
+            PlaintextBuffer::zeroed(osv_worker_protocol::MAX_DATA_LEN + 1),
             Err(TransportError::Protocol(ProtocolError::Oversized))
         ));
 
@@ -390,6 +455,14 @@ mod tests {
         let (left, right) = UnixStream::pair().unwrap();
         let directory = std::fs::File::open(".").unwrap();
         send_descriptor(&left, directory.as_raw_fd()).unwrap();
+        assert!(matches!(
+            receive_descriptor(&right),
+            Err(TransportError::InvalidDescriptor)
+        ));
+
+        let (left, right) = UnixStream::pair().unwrap();
+        let internet_socket = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        send_descriptor(&left, internet_socket.as_raw_fd()).unwrap();
         assert!(matches!(
             receive_descriptor(&right),
             Err(TransportError::InvalidDescriptor)

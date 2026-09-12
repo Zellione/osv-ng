@@ -1,10 +1,10 @@
 //! Allocation-bounded wire protocol shared by isolated workers and their broker.
 
+use osv_crypto::SecretBytes;
 use std::{error::Error, fmt};
-use zeroize::Zeroize;
 
 pub const MAGIC: [u8; 8] = *b"OSVWIPC\0";
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const MAX_DATA_LEN: usize = MAX_PAYLOAD_LEN - 9;
@@ -40,22 +40,41 @@ impl TryFrom<u8> for Kind {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Frame {
     pub request_id: u64,
     pub message: Message,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub enum Message {
-    Hello { minimum: u16, maximum: u16 },
-    Ready { version: u16, sandbox_flags: u32 },
-    Start { role: Role },
-    Data { sequence: u64, bytes: Vec<u8> },
-    End { chunks: u64 },
+    Hello {
+        minimum: u16,
+        maximum: u16,
+    },
+    Ready {
+        version: u16,
+        sandbox_flags: u32,
+        page_locks: osv_crypto::LockStatus,
+    },
+    Start {
+        role: Role,
+    },
+    Data {
+        sequence: u64,
+        bytes: SecretBytes,
+    },
+    End {
+        chunks: u64,
+    },
     Cancel,
-    Complete,
-    Failed { class: FailureClass },
+    Complete {
+        page_locks: osv_crypto::LockStatus,
+    },
+    Failed {
+        class: FailureClass,
+        page_locks: osv_crypto::LockStatus,
+    },
 }
 
 impl fmt::Debug for Message {
@@ -69,10 +88,12 @@ impl fmt::Debug for Message {
             Self::Ready {
                 version,
                 sandbox_flags,
+                page_locks,
             } => formatter
                 .debug_struct("Ready")
                 .field("version", version)
                 .field("sandbox_flags", sandbox_flags)
+                .field("page_locks", page_locks)
                 .finish(),
             Self::Start { role } => formatter.debug_struct("Start").field("role", role).finish(),
             Self::Data { sequence, bytes } => formatter
@@ -85,19 +106,15 @@ impl fmt::Debug for Message {
                 .field("chunks", chunks)
                 .finish(),
             Self::Cancel => formatter.write_str("Cancel"),
-            Self::Complete => formatter.write_str("Complete"),
-            Self::Failed { class } => formatter
+            Self::Complete { page_locks } => formatter
+                .debug_struct("Complete")
+                .field("page_locks", page_locks)
+                .finish(),
+            Self::Failed { class, page_locks } => formatter
                 .debug_struct("Failed")
                 .field("class", class)
+                .field("page_locks", page_locks)
                 .finish(),
-        }
-    }
-}
-
-impl Drop for Message {
-    fn drop(&mut self) {
-        if let Self::Data { bytes, .. } = self {
-            bytes.as_mut_slice().zeroize();
         }
     }
 }
@@ -128,6 +145,7 @@ pub enum ProtocolError {
     InvalidTransition,
     WrongRequest,
     OutOfSequence,
+    Memory,
 }
 
 impl fmt::Display for ProtocolError {
@@ -142,6 +160,7 @@ impl fmt::Display for ProtocolError {
             Self::InvalidTransition => "invalid worker protocol transition",
             Self::WrongRequest => "worker protocol request identity changed",
             Self::OutOfSequence => "worker protocol data sequence is invalid",
+            Self::Memory => "worker protocol protected allocation failed",
         })
     }
 }
@@ -149,6 +168,14 @@ impl fmt::Display for ProtocolError {
 impl Error for ProtocolError {}
 
 impl Frame {
+    #[must_use]
+    pub fn lock_status(&self) -> osv_crypto::LockStatus {
+        match &self.message {
+            Message::Data { bytes, .. } => bytes.lock_status(),
+            _ => osv_crypto::LockStatus::Locked,
+        }
+    }
+
     pub fn encoded_len(&self) -> Result<usize, ProtocolError> {
         HEADER_LEN
             .checked_add(payload_len(&self.message)?)
@@ -206,12 +233,14 @@ impl Frame {
 fn payload_len(message: &Message) -> Result<usize, ProtocolError> {
     match message {
         Message::Hello { .. } => Ok(4),
-        Message::Ready { .. } => Ok(6),
-        Message::Start { .. } | Message::Failed { .. } => Ok(1),
+        Message::Ready { .. } => Ok(7),
+        Message::Start { .. } => Ok(1),
+        Message::Failed { .. } => Ok(2),
         Message::Data { bytes, .. } if bytes.len() <= MAX_DATA_LEN => Ok(8 + bytes.len()),
         Message::Data { .. } => Err(ProtocolError::Oversized),
         Message::End { .. } => Ok(8),
-        Message::Cancel | Message::Complete => Ok(0),
+        Message::Cancel => Ok(0),
+        Message::Complete { .. } => Ok(1),
     }
 }
 
@@ -223,7 +252,7 @@ fn message_kind(message: &Message) -> Kind {
         Message::Data { .. } => Kind::Data,
         Message::End { .. } => Kind::End,
         Message::Cancel => Kind::Cancel,
-        Message::Complete => Kind::Complete,
+        Message::Complete { .. } => Kind::Complete,
         Message::Failed { .. } => Kind::Failed,
     }
 }
@@ -237,18 +266,24 @@ fn encode_payload(message: &Message, payload: &mut [u8]) {
         Message::Ready {
             version,
             sandbox_flags,
+            page_locks,
         } => {
             payload[..2].copy_from_slice(&version.to_le_bytes());
-            payload[2..].copy_from_slice(&sandbox_flags.to_le_bytes());
+            payload[2..6].copy_from_slice(&sandbox_flags.to_le_bytes());
+            payload[6] = encode_lock_status(*page_locks);
         }
         Message::Start { role } => payload[0] = *role as u8,
         Message::Data { sequence, bytes } => {
             payload[..8].copy_from_slice(&sequence.to_le_bytes());
-            payload[8..].copy_from_slice(bytes);
+            payload[8..].copy_from_slice(bytes.expose());
         }
         Message::End { chunks } => payload.copy_from_slice(&chunks.to_le_bytes()),
-        Message::Failed { class } => payload[0] = *class as u8,
-        Message::Cancel | Message::Complete => {}
+        Message::Failed { class, page_locks } => {
+            payload[0] = *class as u8;
+            payload[1] = encode_lock_status(*page_locks);
+        }
+        Message::Complete { page_locks } => payload[0] = encode_lock_status(*page_locks),
+        Message::Cancel => {}
     }
 }
 
@@ -258,9 +293,10 @@ fn decode_message(kind: Kind, bytes: &[u8]) -> Result<Message, ProtocolError> {
             minimum: u16::from_le_bytes(bytes[..2].try_into().expect("fixed slice")),
             maximum: u16::from_le_bytes(bytes[2..].try_into().expect("fixed slice")),
         },
-        Kind::Ready if bytes.len() == 6 => Message::Ready {
+        Kind::Ready if bytes.len() == 7 => Message::Ready {
             version: u16::from_le_bytes(bytes[..2].try_into().expect("fixed slice")),
-            sandbox_flags: u32::from_le_bytes(bytes[2..].try_into().expect("fixed slice")),
+            sandbox_flags: u32::from_le_bytes(bytes[2..6].try_into().expect("fixed slice")),
+            page_locks: decode_lock_status(bytes[6])?,
         },
         Kind::Start if bytes.len() == 1 => Message::Start {
             role: match bytes[0] {
@@ -271,23 +307,41 @@ fn decode_message(kind: Kind, bytes: &[u8]) -> Result<Message, ProtocolError> {
         },
         Kind::Data if bytes.len() >= 8 => Message::Data {
             sequence: u64::from_le_bytes(bytes[..8].try_into().expect("fixed slice")),
-            bytes: bytes[8..].to_vec(),
+            bytes: SecretBytes::new(&bytes[8..]).map_err(|_| ProtocolError::Memory)?,
         },
         Kind::End if bytes.len() == 8 => Message::End {
             chunks: u64::from_le_bytes(bytes.try_into().expect("fixed slice")),
         },
         Kind::Cancel if bytes.is_empty() => Message::Cancel,
-        Kind::Complete if bytes.is_empty() => Message::Complete,
-        Kind::Failed if bytes.len() == 1 => Message::Failed {
+        Kind::Complete if bytes.len() == 1 => Message::Complete {
+            page_locks: decode_lock_status(bytes[0])?,
+        },
+        Kind::Failed if bytes.len() == 2 => Message::Failed {
             class: match bytes[0] {
                 1 => FailureClass::InvalidInput,
                 2 => FailureClass::ResourceLimit,
                 3 => FailureClass::Internal,
                 _ => return Err(ProtocolError::Malformed),
             },
+            page_locks: decode_lock_status(bytes[1])?,
         },
         _ => return Err(ProtocolError::Malformed),
     })
+}
+
+const fn encode_lock_status(status: osv_crypto::LockStatus) -> u8 {
+    match status {
+        osv_crypto::LockStatus::Locked => 1,
+        osv_crypto::LockStatus::Degraded => 2,
+    }
+}
+
+fn decode_lock_status(value: u8) -> Result<osv_crypto::LockStatus, ProtocolError> {
+    match value {
+        1 => Ok(osv_crypto::LockStatus::Locked),
+        2 => Ok(osv_crypto::LockStatus::Degraded),
+        _ => Err(ProtocolError::Malformed),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,7 +411,7 @@ impl BrokerMachine {
                     version: VERSION, ..
                 },
             ) => BrokerState::Ready,
-            (BrokerState::AwaitingResult, Message::Complete | Message::Failed { .. }) => {
+            (BrokerState::AwaitingResult, Message::Complete { .. } | Message::Failed { .. }) => {
                 BrokerState::Finished
             }
             _ => return Err(ProtocolError::InvalidTransition),
@@ -381,6 +435,7 @@ mod tests {
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
     };
+    use zeroize::Zeroize;
 
     struct CountingAllocator;
 
@@ -412,23 +467,27 @@ mod tests {
     fn all_messages_round_trip() {
         let messages = [
             Message::Hello {
-                minimum: 1,
-                maximum: 1,
+                minimum: VERSION,
+                maximum: VERSION,
             },
             Message::Ready {
-                version: 1,
+                version: VERSION,
                 sandbox_flags: 7,
+                page_locks: osv_crypto::LockStatus::Locked,
             },
             Message::Start { role: Role::Media },
             Message::Data {
                 sequence: 3,
-                bytes: vec![1, 2, 3],
+                bytes: SecretBytes::new(&[1, 2, 3]).unwrap(),
             },
             Message::End { chunks: 4 },
             Message::Cancel,
-            Message::Complete,
+            Message::Complete {
+                page_locks: osv_crypto::LockStatus::Locked,
+            },
             Message::Failed {
                 class: FailureClass::InvalidInput,
+                page_locks: osv_crypto::LockStatus::Degraded,
             },
         ];
         for message in messages {
@@ -448,7 +507,7 @@ mod tests {
             request_id: 7,
             message: Message::Data {
                 sequence: 0,
-                bytes: vec![9; 32],
+                bytes: SecretBytes::new(&[9; 32]).unwrap(),
             },
         };
         let mut encoded = vec![0; frame.encoded_len().unwrap()];
@@ -468,8 +527,8 @@ mod tests {
             .sent(&Frame {
                 request_id: 9,
                 message: Message::Hello {
-                    minimum: 1,
-                    maximum: 1,
+                    minimum: VERSION,
+                    maximum: VERSION,
                 },
             })
             .unwrap();
@@ -477,8 +536,9 @@ mod tests {
             .received(&Frame {
                 request_id: 9,
                 message: Message::Ready {
-                    version: 1,
+                    version: VERSION,
                     sandbox_flags: 0,
+                    page_locks: osv_crypto::LockStatus::Locked,
                 },
             })
             .unwrap();
@@ -495,7 +555,7 @@ mod tests {
                 request_id: 9,
                 message: Message::Data {
                     sequence: 1,
-                    bytes: vec![]
+                    bytes: SecretBytes::new(&[]).unwrap()
                 }
             }),
             Err(ProtocolError::InvalidTransition)
@@ -505,7 +565,7 @@ mod tests {
                 request_id: 8,
                 message: Message::Data {
                     sequence: 0,
-                    bytes: vec![]
+                    bytes: SecretBytes::new(&[]).unwrap()
                 }
             }),
             Err(ProtocolError::WrongRequest)
@@ -516,7 +576,7 @@ mod tests {
     fn data_debug_never_exposes_plaintext() {
         let message = Message::Data {
             sequence: 0,
-            bytes: b"sensitive-pixels".to_vec(),
+            bytes: SecretBytes::new(b"sensitive-pixels").unwrap(),
         };
         let debug = format!("{message:?}");
         assert!(debug.contains("REDACTED"));
@@ -529,7 +589,7 @@ mod tests {
             request_id: 17,
             message: Message::Data {
                 sequence: 3,
-                bytes: vec![0xa5; 4096],
+                bytes: SecretBytes::new(&[0xa5; 4096]).unwrap(),
             },
         };
         let mut encoded = vec![0; frame.encoded_len().unwrap()];

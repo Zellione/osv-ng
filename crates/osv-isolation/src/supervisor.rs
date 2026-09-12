@@ -55,12 +55,14 @@ pub enum ExitClass {
 #[derive(Debug)]
 pub struct SupervisorError {
     pub class: ExitClass,
+    pub lock_status: osv_crypto::LockStatus,
     source: Option<Box<dyn Error + Send + Sync>>,
 }
 impl SupervisorError {
     fn new(class: ExitClass, source: impl Error + Send + Sync + 'static) -> Self {
         Self {
             class,
+            lock_status: osv_crypto::LockStatus::Locked,
             source: Some(Box::new(source)),
         }
     }
@@ -84,6 +86,7 @@ pub struct Supervisor {
     sandbox_flags: u32,
     request_id: u64,
     operation_deadline: Instant,
+    lock_status: osv_crypto::LockStatus,
 }
 
 impl Supervisor {
@@ -137,13 +140,28 @@ impl Supervisor {
                 maximum: VERSION,
             },
         };
-        machine.sent(&hello).map_err(protocol)?;
-        channel.send(&hello).map_err(transport)?;
-        let ready = channel.receive().map_err(transport)?;
-        machine.received(&ready).map_err(protocol)?;
-        let Message::Ready { sandbox_flags, .. } = ready.message else {
+        machine
+            .sent(&hello)
+            .map_err(|error| protocol(error, channel.lock_status()))?;
+        let mut lock_status = channel
+            .send(&hello)
+            .map_err(|error| transport(error, channel.lock_status()))?;
+        let (ready, ready_lock_status) = channel
+            .receive()
+            .map_err(|error| transport(error, channel.lock_status()))?;
+        lock_status = lock_status.combine(ready_lock_status);
+        machine
+            .received(&ready)
+            .map_err(|error| protocol(error, channel.lock_status()))?;
+        let Message::Ready {
+            sandbox_flags,
+            page_locks: worker_lock_status,
+            ..
+        } = ready.message
+        else {
             unreachable!()
         };
+        lock_status = lock_status.combine(worker_lock_status);
         let required = crate::NO_NEW_PRIVS
             | crate::RESOURCE_LIMITS
             | crate::SECCOMP
@@ -151,6 +169,7 @@ impl Supervisor {
         if sandbox_flags & required != required {
             return Err(SupervisorError {
                 class: ExitClass::Protocol,
+                lock_status,
                 source: None,
             });
         }
@@ -158,8 +177,14 @@ impl Supervisor {
             request_id,
             message: Message::Start { role },
         };
-        machine.sent(&start).map_err(protocol)?;
-        channel.send(&start).map_err(transport)?;
+        machine
+            .sent(&start)
+            .map_err(|error| protocol(error, lock_status))?;
+        lock_status = lock_status.combine(
+            channel
+                .send(&start)
+                .map_err(|error| transport(error, channel.lock_status()))?,
+        );
         let operation_deadline = Instant::now() + limits.operation;
         channel.set_deadline(Some(operation_deadline));
         Ok(Self {
@@ -170,11 +195,16 @@ impl Supervisor {
             sandbox_flags,
             request_id,
             operation_deadline,
+            lock_status,
         })
     }
 
     pub fn sandbox_flags(&self) -> u32 {
         self.sandbox_flags
+    }
+
+    pub fn lock_status(&self) -> osv_crypto::LockStatus {
+        self.lock_status.combine(self.channel.lock_status())
     }
 
     pub fn send_authenticated(
@@ -183,28 +213,33 @@ impl Supervisor {
         plaintext: PlaintextBuffer,
     ) -> Result<(), SupervisorError> {
         self.refresh_operation_timeout()?;
-        let mut frame = Frame {
+        self.lock_status = self.lock_status.combine(plaintext.lock_status());
+        let frame = Frame {
             request_id: self.request_id(),
             message: Message::Data {
                 sequence,
-                bytes: plaintext.as_slice().to_vec(),
+                bytes: plaintext.into_secret(),
             },
         };
-        self.machine.sent(&frame).map_err(protocol)?;
-        let result = self.channel.send(&frame).map_err(transport);
-        if let Message::Data { bytes, .. } = &mut frame.message {
-            zeroize::Zeroize::zeroize(bytes.as_mut_slice());
-        }
-        result
+        self.machine
+            .sent(&frame)
+            .map_err(|error| protocol(error, self.lock_status()))?;
+        let send_status = self
+            .channel
+            .send(&frame)
+            .map_err(|error| transport(error, self.lock_status()))?;
+        self.lock_status = self.lock_status.combine(send_status);
+        Ok(())
     }
 
-    pub fn finish(mut self) -> Result<ExitClass, SupervisorError> {
+    pub fn finish(&mut self) -> Result<ExitClass, SupervisorError> {
         self.refresh_operation_timeout()?;
         let chunks = match self.machine.state() {
             BrokerState::Streaming { next_sequence } => next_sequence,
             _ => {
                 return Err(SupervisorError {
                     class: ExitClass::Protocol,
+                    lock_status: self.lock_status(),
                     source: None,
                 });
             }
@@ -213,13 +248,31 @@ impl Supervisor {
             request_id: self.request_id(),
             message: Message::End { chunks },
         };
-        self.machine.sent(&end).map_err(protocol)?;
-        self.channel.send(&end).map_err(transport)?;
-        let result = self.channel.receive().map_err(transport)?;
-        self.machine.received(&result).map_err(protocol)?;
+        self.machine
+            .sent(&end)
+            .map_err(|error| protocol(error, self.lock_status()))?;
+        self.lock_status = self.lock_status.combine(
+            self.channel
+                .send(&end)
+                .map_err(|error| transport(error, self.lock_status()))?,
+        );
+        let (result, receive_status) = self
+            .channel
+            .receive()
+            .map_err(|error| transport(error, self.lock_status()))?;
+        self.lock_status = self.lock_status.combine(receive_status);
+        self.machine
+            .received(&result)
+            .map_err(|error| protocol(error, self.lock_status()))?;
         let response_class = match result.message {
-            Message::Complete => ExitClass::Success,
-            Message::Failed { .. } => ExitClass::WorkerFailure,
+            Message::Complete { page_locks } => {
+                self.lock_status = self.lock_status.combine(page_locks);
+                ExitClass::Success
+            }
+            Message::Failed { page_locks, .. } => {
+                self.lock_status = self.lock_status.combine(page_locks);
+                ExitClass::WorkerFailure
+            }
             _ => ExitClass::Protocol,
         };
         let status = self.wait_for_exit()?;
@@ -264,6 +317,7 @@ impl Supervisor {
         else {
             return Err(SupervisorError {
                 class: ExitClass::Deadline,
+                lock_status: self.lock_status(),
                 source: None,
             });
         };
@@ -273,11 +327,11 @@ impl Supervisor {
 
     fn wait_for_exit(&mut self) -> Result<ExitStatus, SupervisorError> {
         loop {
-            if let Some(status) = self
-                .child
-                .try_wait()
-                .map_err(|error| SupervisorError::new(ExitClass::WorkerFailure, error))?
-            {
+            if let Some(status) = self.child.try_wait().map_err(|error| {
+                let mut result = SupervisorError::new(ExitClass::WorkerFailure, error);
+                result.lock_status = self.lock_status();
+                result
+            })? {
                 return Ok(status);
             }
             let Some(remaining) = self
@@ -286,6 +340,7 @@ impl Supervisor {
             else {
                 return Err(SupervisorError {
                     class: ExitClass::Deadline,
+                    lock_status: self.lock_status(),
                     source: None,
                 });
             };
@@ -300,10 +355,15 @@ impl Drop for Supervisor {
     }
 }
 
-fn protocol(error: osv_worker_protocol::ProtocolError) -> SupervisorError {
-    SupervisorError::new(ExitClass::Protocol, error)
+fn protocol(
+    error: osv_worker_protocol::ProtocolError,
+    lock_status: osv_crypto::LockStatus,
+) -> SupervisorError {
+    let mut result = SupervisorError::new(ExitClass::Protocol, error);
+    result.lock_status = lock_status;
+    result
 }
-fn transport(error: TransportError) -> SupervisorError {
+fn transport(error: TransportError, lock_status: osv_crypto::LockStatus) -> SupervisorError {
     let class = match &error {
         TransportError::Io(source)
             if matches!(
@@ -316,7 +376,9 @@ fn transport(error: TransportError) -> SupervisorError {
         TransportError::Protocol(_) => ExitClass::Protocol,
         _ => ExitClass::WorkerFailure,
     };
-    SupervisorError::new(class, error)
+    let mut result = SupervisorError::new(class, error);
+    result.lock_status = lock_status;
+    result
 }
 fn classify_status(status: ExitStatus) -> ExitClass {
     if status.success() {
@@ -369,6 +431,7 @@ mod tests {
             sandbox_flags: 0,
             request_id: 1,
             operation_deadline: Instant::now() + Duration::from_secs(30),
+            lock_status: osv_crypto::LockStatus::Locked,
         };
 
         let started = Instant::now();

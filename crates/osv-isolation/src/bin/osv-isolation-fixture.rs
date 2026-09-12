@@ -55,8 +55,50 @@ fn channel_after_sandbox() -> FramedChannel {
     FramedChannel::new(unsafe { UnixStream::from_raw_fd(WORKER_CONTROL_FD) })
 }
 
+#[allow(unsafe_code)]
+fn queued_signal_is_denied(peer: libc::pid_t, pidfd: i32) -> bool {
+    let info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let queued = unsafe { libc::syscall(libc::SYS_rt_sigqueueinfo, peer, libc::SIGTERM, &info) };
+    let queued_errno = std::io::Error::last_os_error().raw_os_error();
+    let thread_queued = unsafe {
+        libc::syscall(
+            libc::SYS_rt_tgsigqueueinfo,
+            peer,
+            peer,
+            libc::SIGTERM,
+            &info,
+        )
+    };
+    let thread_queued_errno = std::io::Error::last_os_error().raw_os_error();
+    let pidfd_queued = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGTERM,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    let pidfd_queued_errno = std::io::Error::last_os_error().raw_os_error();
+    queued == -1
+        && queued_errno == Some(libc::EPERM)
+        && thread_queued == -1
+        && thread_queued_errno == Some(libc::EPERM)
+        && pidfd_queued == -1
+        && pidfd_queued_errno == Some(libc::EPERM)
+}
+
+#[allow(unsafe_code)]
+fn disable_page_locks() {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) }, 0);
+}
+
 fn handshake(channel: &mut FramedChannel, hello: &Frame) {
-    channel
+    let _ = channel
         .send(&Frame {
             request_id: hello.request_id,
             message: Message::Ready {
@@ -65,17 +107,18 @@ fn handshake(channel: &mut FramedChannel, hello: &Frame) {
                     | osv_isolation::RESOURCE_LIMITS
                     | osv_isolation::SECCOMP
                     | osv_isolation::DESCRIPTOR_ALLOWLIST,
+                page_locks: channel.lock_status(),
             },
         })
         .unwrap();
-    let start = channel.receive().unwrap();
+    let (start, _) = channel.receive().unwrap();
     assert_eq!(start.message, Message::Start { role: Role::Media });
 }
 
 #[allow(unsafe_code)]
 fn run_hostile_worker() {
     let mut channel = FramedChannel::new(unsafe { UnixStream::from_raw_fd(WORKER_CONTROL_FD) });
-    let hello = channel.receive().unwrap();
+    let (hello, _) = channel.receive().unwrap();
     match hello.request_id {
         1 => {
             apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
@@ -93,23 +136,25 @@ fn run_hostile_worker() {
         }
         3 => {
             apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
-            channel
+            let _ = channel
                 .send(&Frame {
                     request_id: hello.request_id,
                     message: Message::Ready {
                         version: 0,
                         sandbox_flags: u32::MAX,
+                        page_locks: channel.lock_status(),
                     },
                 })
                 .unwrap();
         }
         4 => {
-            channel
+            let _ = channel
                 .send(&Frame {
                     request_id: hello.request_id,
                     message: Message::Ready {
                         version: VERSION,
                         sandbox_flags: 0,
+                        page_locks: channel.lock_status(),
                     },
                 })
                 .unwrap();
@@ -122,15 +167,51 @@ fn run_hostile_worker() {
             apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
             handshake(&mut channel, &hello);
             let _ = channel.receive().unwrap();
-            channel
+            let _ = channel
                 .send(&Frame {
                     request_id: hello.request_id,
-                    message: Message::Complete,
+                    message: Message::Complete {
+                        page_locks: channel.lock_status(),
+                    },
                 })
                 .unwrap();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
             }
+        }
+        7 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            let _ = channel
+                .send(&Frame {
+                    request_id: hello.request_id,
+                    message: Message::Ready {
+                        version: VERSION,
+                        sandbox_flags: osv_isolation::NO_NEW_PRIVS
+                            | osv_isolation::RESOURCE_LIMITS
+                            | osv_isolation::SECCOMP
+                            | osv_isolation::DESCRIPTOR_ALLOWLIST,
+                        page_locks: osv_crypto::LockStatus::Degraded,
+                    },
+                })
+                .unwrap();
+            let _ = channel.receive().unwrap();
+            let _ = channel.receive().unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        8 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            let _ = channel
+                .send(&Frame {
+                    request_id: hello.request_id,
+                    message: Message::Ready {
+                        version: VERSION,
+                        sandbox_flags: 0,
+                        page_locks: osv_crypto::LockStatus::Degraded,
+                    },
+                })
+                .unwrap();
         }
         _ => std::process::exit(64),
     }
@@ -143,6 +224,14 @@ fn main() {
     if argument.as_deref() == Some("--worker") {
         run_hostile_worker();
         return;
+    }
+    if argument.as_deref() == Some("degraded-worker") {
+        disable_page_locks();
+        std::process::exit(if osv_isolation::run_worker(Role::Media).is_ok() {
+            0
+        } else {
+            1
+        });
     }
     let mode = argument.as_deref();
     match mode {
@@ -203,6 +292,38 @@ fn main() {
             let rename_denied = std::fs::rename(&path, &renamed).is_err();
             let unlink_denied = std::fs::remove_file(&path).is_err();
             if !(chmod_denied && rename_denied && unlink_denied) {
+                std::process::exit(1);
+            }
+        }
+        Some("signal-probe") => {
+            let peer: libc::pid_t = arguments.next().unwrap().parse().unwrap();
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            if !queued_signal_is_denied(peer, WORKER_CONTROL_FD) {
+                std::process::exit(1);
+            }
+        }
+        Some("transport-degraded-probe") => {
+            disable_page_locks();
+            let (left, right) = UnixStream::pair().unwrap();
+            let mut sender = FramedChannel::new(left);
+            let mut receiver = FramedChannel::new(right);
+            let frame = Frame {
+                request_id: 8,
+                message: Message::Data {
+                    sequence: 0,
+                    bytes: osv_crypto::SecretBytes::new(b"protected payload").unwrap(),
+                },
+            };
+            let send_status = sender.send(&frame).unwrap();
+            let (received, receive_status) = receiver.receive().unwrap();
+            let Message::Data { bytes, .. } = received.message else {
+                std::process::exit(1);
+            };
+            if send_status != osv_crypto::LockStatus::Degraded
+                || receive_status != osv_crypto::LockStatus::Degraded
+                || bytes.lock_status() != osv_crypto::LockStatus::Degraded
+                || bytes.expose() != b"protected payload"
+            {
                 std::process::exit(1);
             }
         }
