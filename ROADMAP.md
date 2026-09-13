@@ -1529,6 +1529,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   and the helper's 1 GiB address-space ceiling for opaque internal allocations.
   Paired JPEG ICC-marker fixtures also confirm profile presence does not alter
   output pixels under the version-1 display policy.
+- Added a genuine two-frame APNG produced by the pinned `png 0.18.1` encoder.
+  Probe count, full-canvas pixels, 100/50 ms timing, protected frame decode, and
+  the complete version-4 viewer result all pass. APNG is therefore explicitly
+  supported rather than inferred only from an `acTL` marker.
 
 **Verification**
 
@@ -1551,7 +1555,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases, animated WebP/APNG corpus evidence, and animation
+- Deeper malformed/bomb corpus cases, animated WebP corpus evidence, and animation
   cache/lock wipe tests
   remain required before Phase 9 can be marked complete.
 - Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests

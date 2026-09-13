@@ -829,6 +829,7 @@ dependencies = [
  "osv-domain",
  "osv-isolation",
  "osv-worker-protocol",
+ "png",
  "zeroize",
 ]
 

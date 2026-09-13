@@ -1393,4 +1393,37 @@ mod tests {
             hostile.zeroize();
         }
     }
+
+    #[test]
+    fn genuine_apng_decodes_full_canvas_frames_and_timing() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(2, 0).unwrap();
+            encoder.validate_sequence(true);
+            let mut writer = encoder.write_header().unwrap();
+            writer.set_frame_delay(1, 10).unwrap();
+            writer.write_image_data(&[1, 2, 3, 255].repeat(4)).unwrap();
+            writer.set_frame_delay(1, 20).unwrap();
+            writer.write_image_data(&[4, 5, 6, 255].repeat(4)).unwrap();
+            writer.finish().unwrap();
+        }
+        let probe = probe(&encoded).unwrap();
+        assert_eq!((probe.format, probe.frames), (ImageFormat::Png, 2));
+        let frames = animation_frames(&encoded, 512).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (2, 2));
+        assert_eq!((frames[0].delay_ms, frames[1].delay_ms), (100, 50));
+        assert_eq!(frames[0].pixels.expose()[..4], [1, 2, 3, 255]);
+        assert_eq!(frames[1].pixels.expose()[..4], [4, 5, 6, 255]);
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert_eq!((header.source.frames, header.output_frames), (2, 2));
+    }
 }
