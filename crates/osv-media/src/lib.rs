@@ -602,8 +602,23 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
     limits.max_image_height = Some(MAX_DIMENSION);
     limits.max_alloc = Some(400 * 1024 * 1024);
     reader.limits(limits);
-    let mut decoded = reader.decode().map_err(|_| ImageError::Decode)?;
-    decoded = match info.orientation {
+    let decoded = apply_orientation(
+        reader.decode().map_err(|_| ImageError::Decode)?,
+        info.orientation,
+    );
+    let scaled = if decoded.width() > edge || decoded.height() > edge {
+        decoded.thumbnail(edge, edge).to_rgba8()
+    } else {
+        decoded.to_rgba8()
+    };
+    encode_png_rgba(&scaled)
+}
+
+fn apply_orientation(
+    decoded: image::DynamicImage,
+    orientation: Orientation,
+) -> image::DynamicImage {
+    match orientation {
         Orientation::Normal => decoded,
         Orientation::MirrorHorizontal => decoded.fliph(),
         Orientation::Rotate180 => decoded.rotate180(),
@@ -612,12 +627,10 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
         Orientation::Rotate90 => decoded.rotate90(),
         Orientation::MirrorHorizontalRotate90 => decoded.fliph().rotate90(),
         Orientation::Rotate270 => decoded.rotate270(),
-    };
-    let scaled = if decoded.width() > edge || decoded.height() > edge {
-        decoded.thumbnail(edge, edge).to_rgba8()
-    } else {
-        decoded.to_rgba8()
-    };
+    }
+}
+
+fn encode_png_rgba(scaled: &image::RgbaImage) -> Result<SecretBytes, ImageError> {
     let mut encoded = Vec::new();
     PngEncoder::new(&mut encoded)
         .write_image(
@@ -1081,6 +1094,19 @@ mod tests {
         jpeg
     }
 
+    fn png_with_srgb(mut png: Vec<u8>) -> Vec<u8> {
+        let mut chunk = Vec::new();
+        chunk.extend(1u32.to_be_bytes());
+        chunk.extend(b"sRGB");
+        chunk.push(0);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(b"sRGB");
+        crc.update(&[0]);
+        chunk.extend(crc.finalize().to_be_bytes());
+        png.splice(33..33, chunk);
+        png
+    }
+
     fn encoded_formats() -> Vec<(ImageFormat, Vec<u8>)> {
         let image = rgba_fixture();
         let mut png = Vec::new();
@@ -1144,12 +1170,56 @@ mod tests {
         }
     }
     #[test]
+    fn all_exif_orientations_have_exact_pixel_mapping() {
+        let source = image::RgbaImage::from_fn(2, 3, |x, y| {
+            image::Rgba([u8::try_from(y * 2 + x + 1).unwrap(), 0, 0, 255])
+        });
+        let cases: [(Orientation, &[u8]); 8] = [
+            (Orientation::Normal, &[1, 2, 3, 4, 5, 6]),
+            (Orientation::MirrorHorizontal, &[2, 1, 4, 3, 6, 5]),
+            (Orientation::Rotate180, &[6, 5, 4, 3, 2, 1]),
+            (Orientation::MirrorVertical, &[5, 6, 3, 4, 1, 2]),
+            (Orientation::MirrorHorizontalRotate270, &[1, 3, 5, 2, 4, 6]),
+            (Orientation::Rotate90, &[5, 3, 1, 6, 4, 2]),
+            (Orientation::MirrorHorizontalRotate90, &[6, 4, 2, 5, 3, 1]),
+            (Orientation::Rotate270, &[2, 4, 6, 1, 3, 5]),
+        ];
+        for (orientation, expected) in cases {
+            let oriented =
+                apply_orientation(image::DynamicImage::ImageRgba8(source.clone()), orientation)
+                    .to_rgba8();
+            let actual: Vec<_> = oriented.pixels().map(|pixel| pixel[0]).collect();
+            assert_eq!(actual, expected, "{orientation:?}");
+        }
+    }
+    #[test]
+    fn srgb_profile_presence_does_not_transform_display_pixels() {
+        let plain = encoded_formats().remove(0).1;
+        let profiled = png_with_srgb(plain.clone());
+        assert!(!probe(&plain).unwrap().has_color_profile);
+        assert!(probe(&profiled).unwrap().has_color_profile);
+        let plain_thumbnail = thumbnail_png(&plain, 512).unwrap();
+        let profiled_thumbnail = thumbnail_png(&profiled, 512).unwrap();
+        assert_eq!(plain_thumbnail.expose(), profiled_thumbnail.expose());
+    }
+    #[test]
     fn corrupt_png_crc_and_truncation_are_rejected() {
         let mut corrupt = png(10, 20);
         corrupt[29] ^= 1;
         assert_eq!(probe(&corrupt), Err(ImageError::Malformed));
         let truncated = &png(10, 20)[..40];
         assert_eq!(probe(truncated), Err(ImageError::Malformed));
+    }
+    #[test]
+    fn truncated_jpeg_gif_and_webp_fail_complete_decode() {
+        for (format, mut bytes) in encoded_formats().into_iter().skip(1) {
+            let remove = (bytes.len() / 3).max(1);
+            bytes.truncate(bytes.len() - remove);
+            assert!(
+                image_worker_result(&bytes, THUMBNAIL_EDGE).is_err(),
+                "{format:?} truncation decoded"
+            );
+        }
     }
     #[test]
     fn cache_evicts_and_clears() {

@@ -1517,6 +1517,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Hostile-worker coverage exercises this path under a continuing chunk stream;
   animation-header mutations cover inflated frame count, invalid timing,
   inconsistent aggregate size, and nonzero reserved fields.
+- Added exact pixel-map coverage for all eight EXIF orientations, beyond the
+  existing geometry assertions. A valid PNG sRGB-chunk pair proves profile
+  presence is allowlisted while decoded display pixels remain identical under
+  the documented no-transform policy. Truncated genuine JPEG, GIF, and WebP
+  containers now also fail the complete decoder path.
 
 **Verification**
 
@@ -1539,8 +1544,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases, pixel-expected EXIF orientation cases,
-  ICC/sRGB policy fixtures, animated WebP/APNG corpus evidence, and animation
+- Deeper malformed/bomb corpus cases, ICC policy fixtures, animated WebP/APNG
+  corpus evidence, and animation
   cache/lock wipe tests
   remain required before Phase 9 can be marked complete.
 - Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
