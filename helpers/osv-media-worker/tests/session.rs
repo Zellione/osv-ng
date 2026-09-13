@@ -178,6 +178,20 @@ fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts
         .read_to_end(&mut thumbnail)
         .unwrap();
     assert!(thumbnail.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let reopened = osv_import::decode_image_object_cancellable(
+        &vault,
+        committed.thumbnail,
+        executable,
+        101,
+        &cancelled,
+    )
+    .unwrap();
+    assert_eq!(
+        (reopened.width, reopened.height, reopened.frames),
+        (2, 3, 1)
+    );
+    assert_eq!(reopened.pixels.len(), 2 * 3 * 4);
     for entry in walk_files(&path) {
         let artifact = std::fs::read(entry).unwrap();
         assert!(

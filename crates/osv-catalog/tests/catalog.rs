@@ -175,6 +175,59 @@ fn regeneration_query_finds_missing_and_stale_recipes_only() {
     );
 }
 
+#[test]
+fn bounded_image_and_gallery_records_expose_only_composition_facts() {
+    let directory = temp();
+    let path = directory.path().join("catalog.db");
+    let catalog_key = key(0x39);
+    let mut catalog = Catalog::create(&path, &catalog_key, &VAULT_ID, 1).unwrap();
+    let media = add_media(&mut catalog, 0x41, "private-original-name.png");
+    let thumbnail = descriptor(0x51, ObjectRole::Thumbnail);
+    let gallery = GalleryId::from_bytes([0x61; 16]);
+    let transaction = catalog.transaction().unwrap();
+    transaction
+        .insert_object(NewObject {
+            descriptor: &thumbnail,
+            locator: "derived/thumbnails/51/51.osvo",
+            state: ObjectState::Ready,
+        })
+        .unwrap();
+    transaction
+        .insert_derived_object(NewDerivedObject {
+            object_id: thumbnail.id(),
+            media_id: media,
+            recipe_version: 2,
+            width: 100,
+            height: 75,
+        })
+        .unwrap();
+    transaction
+        .create_gallery(NewGallery {
+            id: gallery,
+            name: "Private gallery",
+            created_at_ms: 2,
+        })
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let images = catalog.reader().image_records(2, 10).unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].id, media);
+    assert_eq!(
+        images[0].original_object_id,
+        ObjectId::from_bytes([0x41; 16])
+    );
+    assert_eq!(images[0].thumbnail_object_id, Some(thumbnail.id()));
+    assert_eq!((images[0].width, images[0].height), (800, 600));
+    assert_eq!(
+        catalog.reader().gallery_records(10).unwrap()[0].name,
+        "Private gallery"
+    );
+    assert!(catalog.reader().image_records(0, 10).is_err());
+    assert!(catalog.reader().image_records(2, 0).is_err());
+    assert!(catalog.reader().gallery_records(0).is_err());
+}
+
 #[cfg(feature = "test-fixtures")]
 #[test]
 fn degraded_raw_key_lock_status_is_reported() {

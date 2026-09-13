@@ -1468,6 +1468,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   or Import Another Copy. The helper returns a bounded RGBA display plane beside
   the durable PNG; GTK constructs a memory texture without invoking an image
   decoder, and lock revokes the session and drops the paintable.
+- Added bounded encrypted-catalog image and gallery summaries that omit original
+  filenames from tile composition. The production gallery now replaces its
+  synthetic model with catalog-backed image records; the 100k synthetic model
+  remains only as a performance regression. Selecting a tile authenticates and
+  decrypts its current versioned thumbnail into protected memory, sends only
+  those bytes to the confined helper, and rejects callbacks from an older
+  session generation before constructing a GTK memory texture.
 
 **Verification**
 
@@ -1485,7 +1492,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   gate. Dependency audit/policy checks and the Phase 2 Flatpak release build,
   installed app self-check, and both installed helper hardening checks pass.
   Background real-vault create/clean-close and pre-cancelled import paths have
-  dedicated regressions.
+  dedicated regressions. Catalog-backed composition bounds and authenticated
+  encrypted-thumbnail reopen have dedicated regressions.
 
 **Deviations and follow-up**
 

@@ -15,6 +15,7 @@ use osv_import::{DuplicateDecision, ImageImportError};
 use osv_vault::{OpenMode, VaultService};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenKind {
@@ -54,6 +55,36 @@ pub struct ImportedImage {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GalleryImage {
+    pub media_id: osv_catalog::MediaId,
+    pub width: u32,
+    pub height: u32,
+    pub favorite: bool,
+    pub has_thumbnail: bool,
+}
+
+pub struct OpenedImage {
+    pub media_id: osv_catalog::MediaId,
+    pub pixels: osv_crypto::SecretBytes,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+}
+
+impl std::fmt::Debug for OpenedImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenedImage")
+            .field("media_id", &self.media_id)
+            .field("pixels", &"[REDACTED]")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("frames", &self.frames)
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for ImportedImage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -69,6 +100,13 @@ impl std::fmt::Debug for ImportedImage {
 }
 
 enum Command {
+    ListImages {
+        response: mpsc::Sender<Result<Vec<GalleryImage>, RuntimeError>>,
+    },
+    OpenThumbnail {
+        media_id: osv_catalog::MediaId,
+        response: mpsc::Sender<Result<OpenedImage, RuntimeError>>,
+    },
     PrepareImport {
         request: ImportRequest,
         response: mpsc::Sender<Result<ImportPreview, RuntimeError>>,
@@ -82,6 +120,7 @@ enum Command {
 
 /// GTK owns this capability, never the vault keys/catalog themselves.
 pub struct VaultSession {
+    generation: u64,
     commands: mpsc::Sender<Command>,
     ready: mpsc::Receiver<Result<(), RuntimeError>>,
     cancelled: Arc<AtomicBool>,
@@ -97,6 +136,7 @@ impl std::fmt::Debug for VaultSession {
 impl VaultSession {
     #[must_use]
     pub fn begin(path: PathBuf, mut password_bytes: Vec<u8>, kind: OpenKind) -> Self {
+        let generation = SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let (commands, command_rx) = mpsc::channel();
         let (ready_tx, ready) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -130,6 +170,15 @@ impl VaultSession {
             let mut pending = None;
             while let Ok(command) = command_rx.recv() {
                 match command {
+                    Command::ListImages { response } => {
+                        let result = list_images(&vault);
+                        let _ = response.send(result);
+                    }
+                    Command::OpenThumbnail { media_id, response } => {
+                        worker_cancelled.store(false, Ordering::Release);
+                        let result = open_thumbnail(&vault, media_id, &worker_cancelled);
+                        let _ = response.send(result);
+                    }
                     Command::PrepareImport { request, response } => {
                         worker_cancelled.store(false, Ordering::Release);
                         pending = None;
@@ -155,11 +204,17 @@ impl VaultSession {
             let _ = vault.close();
         });
         Self {
+            generation,
             commands,
             ready,
             cancelled,
             thread: Some(thread),
         }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn try_ready(&self) -> Option<Result<(), RuntimeError>> {
@@ -177,6 +232,27 @@ impl VaultSession {
         let (response, receiver) = mpsc::channel();
         self.commands
             .send(Command::PrepareImport { request, response })
+            .map_err(|_| RuntimeError::Closed)?;
+        Ok(receiver)
+    }
+
+    pub fn list_images(
+        &self,
+    ) -> Result<mpsc::Receiver<Result<Vec<GalleryImage>, RuntimeError>>, RuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.commands
+            .send(Command::ListImages { response })
+            .map_err(|_| RuntimeError::Closed)?;
+        Ok(receiver)
+    }
+
+    pub fn open_thumbnail(
+        &self,
+        media_id: osv_catalog::MediaId,
+    ) -> Result<mpsc::Receiver<Result<OpenedImage, RuntimeError>>, RuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.commands
+            .send(Command::OpenThumbnail { media_id, response })
             .map_err(|_| RuntimeError::Closed)?;
         Ok(receiver)
     }
@@ -249,6 +325,55 @@ fn prepare_import(
         duplicate: prepared.preview.duplicate == osv_import::DuplicateState::AwaitingDecision,
     };
     Ok((prepared, request.original_name, preview))
+}
+
+fn list_images(vault: &VaultService) -> Result<Vec<GalleryImage>, RuntimeError> {
+    vault
+        .reader()
+        .image_records(osv_media::THUMBNAIL_RECIPE_VERSION, 10_000)
+        .map_err(|_| RuntimeError::Input)
+        .map(|records| {
+            records
+                .into_iter()
+                .map(|record| GalleryImage {
+                    media_id: record.id,
+                    width: record.width,
+                    height: record.height,
+                    favorite: record.favorite,
+                    has_thumbnail: record.thumbnail_object_id.is_some(),
+                })
+                .collect()
+        })
+}
+
+fn open_thumbnail(
+    vault: &VaultService,
+    media_id: osv_catalog::MediaId,
+    cancelled: &AtomicBool,
+) -> Result<OpenedImage, RuntimeError> {
+    let record = vault
+        .reader()
+        .image_records(osv_media::THUMBNAIL_RECIPE_VERSION, 10_000)
+        .map_err(|_| RuntimeError::Input)?
+        .into_iter()
+        .find(|record| record.id == media_id)
+        .ok_or(RuntimeError::Input)?;
+    let thumbnail = record.thumbnail_object_id.ok_or(RuntimeError::Input)?;
+    let decoded = osv_import::decode_image_object_cancellable(
+        vault,
+        thumbnail,
+        &media_worker_path(),
+        REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        cancelled,
+    )
+    .map_err(map_import_error)?;
+    Ok(OpenedImage {
+        media_id,
+        pixels: decoded.pixels,
+        width: decoded.width,
+        height: decoded.height,
+        frames: decoded.frames,
+    })
 }
 
 fn commit_import(
@@ -335,6 +460,9 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let images = session.list_images().unwrap().recv().unwrap().unwrap();
+        assert!(images.is_empty());
+        assert_ne!(session.generation(), 0);
         session.close();
         let password = Password::new(b"runtime test password").unwrap();
         VaultService::open(&path, &password, None, OpenMode::Writer)

@@ -115,6 +115,19 @@ pub struct CommittedImage {
     pub display_height: u32,
 }
 
+pub struct DecodedImage {
+    pub pixels: osv_crypto::SecretBytes,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+}
+
+impl std::fmt::Debug for DecodedImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DecodedImage([REDACTED])")
+    }
+}
+
 struct PreparedThumbnail {
     probe: osv_media::ImageProbe,
     bytes: osv_crypto::SecretBytes,
@@ -333,6 +346,59 @@ pub fn regenerate_image_thumbnail(
             now_ms,
         )
         .map_err(ImageImportError::Vault)
+}
+
+/// Reopens one catalog-authorized encrypted object, authenticates every chunk,
+/// and gives the confined media worker only the resulting object bytes.
+pub fn decode_image_object_cancellable(
+    vault: &osv_vault::VaultService,
+    object_id: osv_storage::ObjectId,
+    worker_executable: &Path,
+    request_id: u64,
+    cancelled: &AtomicBool,
+) -> Result<DecodedImage, ImageImportError> {
+    let logical_len = vault
+        .reader()
+        .object(object_id)
+        .map_err(|_| ImageImportError::Input)?
+        .descriptor
+        .logical_len();
+    let len = usize::try_from(logical_len).map_err(|_| ImageImportError::Input)?;
+    if len == 0 || len > osv_media::MAX_ENCODED_BYTES {
+        return Err(ImageImportError::Input);
+    }
+    let mut source = osv_crypto::SecretBytes::zeroed(len).map_err(|_| ImageImportError::Input)?;
+    let mut reader = vault
+        .open_object(object_id)
+        .map_err(ImageImportError::Vault)?;
+    let mut offset = 0;
+    while offset < len {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ImageImportError::Cancelled);
+        }
+        let end = (offset + osv_worker_protocol::MAX_DATA_LEN).min(len);
+        reader
+            .read_exact(&mut source.expose_mut()[offset..end])
+            .map_err(|_| ImageImportError::Input)?;
+        offset = end;
+    }
+    let mut excess = [0u8; 1];
+    if reader
+        .read(&mut excess)
+        .map_err(|_| ImageImportError::Input)?
+        != 0
+    {
+        return Err(ImageImportError::Input);
+    }
+    drop(reader);
+    let prepared =
+        prepare_thumbnail_cancellable(&source, worker_executable, request_id, Some(cancelled))?;
+    Ok(DecodedImage {
+        pixels: prepared.display_pixels,
+        width: prepared.width,
+        height: prepared.height,
+        frames: prepared.probe.frames,
+    })
 }
 
 impl ImportPreview {

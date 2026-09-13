@@ -17,6 +17,25 @@ pub struct SearchResult {
     pub favorite: bool,
 }
 
+/// Bounded image facts needed to compose a gallery and reopen authenticated
+/// content. Original names, fingerprints, codecs, and search text stay inside
+/// the encrypted catalog until a UI explicitly needs them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageRecord {
+    pub id: MediaId,
+    pub original_object_id: ObjectId,
+    pub thumbnail_object_id: Option<ObjectId>,
+    pub width: u32,
+    pub height: u32,
+    pub favorite: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GalleryRecord {
+    pub id: GalleryId,
+    pub name: String,
+}
+
 /// Minimum encrypted-catalog authority needed to regenerate a missing or stale
 /// derived object from its authenticated original.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +99,14 @@ impl<'connection> CatalogReader<'connection> {
 
     pub fn search_media(&self, query: &str, maximum: u32) -> Result<Vec<SearchResult>> {
         read_search_media(self.connection, query, maximum)
+    }
+
+    pub fn image_records(&self, recipe_version: u32, maximum: u32) -> Result<Vec<ImageRecord>> {
+        read_image_records(self.connection, recipe_version, maximum)
+    }
+
+    pub fn gallery_records(&self, maximum: u32) -> Result<Vec<GalleryRecord>> {
+        read_gallery_records(self.connection, maximum)
     }
 
     pub fn all_objects(&self) -> Result<Vec<StoredObject>> {
@@ -537,6 +564,88 @@ fn read_search_media(
             id: MediaId::parse(id)?,
             class: MediaClass::parse(class)?,
             favorite,
+        })
+    })
+    .collect()
+}
+
+fn read_image_records(
+    connection: &Connection,
+    recipe_version: u32,
+    maximum: u32,
+) -> Result<Vec<ImageRecord>> {
+    if recipe_version == 0 || maximum == 0 || maximum > MAX_QUERY_RESULTS {
+        return Err(CatalogError::InvalidInput("image result query"));
+    }
+    let mut statement = connection.prepare(
+        "SELECT m.id,m.original_object_id,m.width,m.height,m.favorite,(SELECT d.object_id FROM derived_objects d JOIN objects o ON o.id=d.object_id WHERE d.media_id=m.id AND o.role=?1 AND o.state=?2 AND d.recipe_version=?3 ORDER BY d.object_id LIMIT 1) FROM media m WHERE m.media_class=?4 ORDER BY m.imported_at_ms,m.id LIMIT ?5",
+    )?;
+    let rows = statement.query_map(
+        params![
+            ObjectRole::Thumbnail as i64,
+            ObjectState::Ready as i64,
+            i64::from(recipe_version),
+            MediaClass::Image as i64,
+            i64::from(maximum)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+            ))
+        },
+    )?;
+    rows.map(|row| {
+        let (id, original, width, height, favorite, thumbnail) = row?;
+        let width = u32::try_from(width.ok_or(CatalogError::IntegrityFailed)?)
+            .map_err(|_| CatalogError::IntegrityFailed)?;
+        let height = u32::try_from(height.ok_or(CatalogError::IntegrityFailed)?)
+            .map_err(|_| CatalogError::IntegrityFailed)?;
+        if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(CatalogError::IntegrityFailed);
+        }
+        Ok(ImageRecord {
+            id: MediaId::parse(id)?,
+            original_object_id: ObjectId::from_bytes(
+                original
+                    .try_into()
+                    .map_err(|_| CatalogError::IntegrityFailed)?,
+            ),
+            thumbnail_object_id: thumbnail
+                .map(|value| {
+                    value
+                        .try_into()
+                        .map(ObjectId::from_bytes)
+                        .map_err(|_| CatalogError::IntegrityFailed)
+                })
+                .transpose()?,
+            width,
+            height,
+            favorite,
+        })
+    })
+    .collect()
+}
+
+fn read_gallery_records(connection: &Connection, maximum: u32) -> Result<Vec<GalleryRecord>> {
+    if maximum == 0 || maximum > MAX_QUERY_RESULTS {
+        return Err(CatalogError::InvalidInput("gallery result limit"));
+    }
+    let mut statement =
+        connection.prepare("SELECT id,name FROM galleries ORDER BY created_at_ms,id LIMIT ?1")?;
+    let rows = statement.query_map([i64::from(maximum)], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (id, name) = row?;
+        validate_text(&name, MAX_NAME_BYTES, false, "gallery name")?;
+        Ok(GalleryRecord {
+            id: GalleryId::parse(id)?,
+            name,
         })
     })
     .collect()

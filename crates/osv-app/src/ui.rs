@@ -6,10 +6,10 @@ use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
 
-use crate::runtime::{ImportRequest, OpenKind, VaultSession};
+use crate::runtime::{GalleryImage, ImportRequest, OpenKind, VaultSession};
 use crate::{
     Appearance, Command, CssOutcome, Density, PanelPlacement, Revocable, Route, ShellState, Theme,
-    accept_user_css, gallery_labels,
+    accept_user_css,
 };
 
 const APP_ID: &str = "io.github.osv_ng.App";
@@ -678,6 +678,7 @@ fn gallery_view(
     });
 
     let session_for_import = Rc::clone(session);
+    let status_for_import = status.clone();
     import.connect_clicked(move |button| {
         let dialog = gtk::FileDialog::builder()
             .title("Choose an image to import")
@@ -693,7 +694,7 @@ fn gallery_view(
         dialog.set_filters(Some(&filters));
         let parent = button.root().and_downcast::<gtk::Window>();
         let session = Rc::clone(&session_for_import);
-        let status = status.clone();
+        let status = status_for_import.clone();
         let selected_authority = Rc::clone(&selected_authority);
         let confirm = confirm.clone();
         let skip = skip.clone();
@@ -770,11 +771,9 @@ fn gallery_view(
         });
     });
 
-    let items = 100_000;
-    let labels = gallery_labels(items).expect("bounded gallery size");
-    let references: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let model = gtk::StringList::new(&references);
-    let selection = gtk::SingleSelection::new(Some(model));
+    let model = gtk::StringList::new(&[]);
+    let selection = gtk::SingleSelection::new(Some(model.clone()));
+    let records = Rc::new(RefCell::new(Vec::<GalleryImage>::new()));
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
@@ -793,6 +792,64 @@ fn gallery_view(
         label.set_label(&value.string());
         item.set_accessible_label(&format!("Gallery {}", value.string()));
     });
+    {
+        let session = Rc::clone(session);
+        let records = Rc::clone(&records);
+        let picture = picture.clone();
+        let status = status.clone();
+        selection.connect_selected_notify(move |selection| {
+            let index = selection.selected();
+            let Some(record) = records.borrow().get(index as usize).copied() else {
+                return;
+            };
+            if !record.has_thumbnail {
+                status.set_label("This image thumbnail is being regenerated.");
+                return;
+            }
+            let (generation, receiver) = {
+                let borrowed = session.borrow();
+                let Some(active) = borrowed.as_ref() else {
+                    return;
+                };
+                let Ok(receiver) = active.open_thumbnail(record.media_id) else {
+                    return;
+                };
+                (active.generation(), receiver)
+            };
+            status.set_label("Authenticating and opening thumbnail…");
+            let session = Rc::clone(&session);
+            let picture = picture.clone();
+            let status = status.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(opened)) => {
+                        let still_current = session
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|active| active.generation() == generation);
+                        if !still_current {
+                            return glib::ControlFlow::Break;
+                        }
+                        if let Some(texture) =
+                            memory_texture(opened.pixels, opened.width, opened.height)
+                        {
+                            picture.set_paintable(Some(&texture));
+                            status.set_label("Thumbnail opened from authenticated vault data.");
+                        } else {
+                            status.set_label("The decoded thumbnail dimensions were rejected.");
+                        }
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("The thumbnail could not be opened safely.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        });
+    }
     let grid = gtk::GridView::new(Some(selection), Some(factory));
     grid.set_min_columns(2);
     grid.set_max_columns(12);
@@ -803,7 +860,87 @@ fn gallery_view(
         .vexpand(true)
         .build();
     root.append(&scroller);
+    {
+        let session = Rc::clone(session);
+        let records = Rc::clone(&records);
+        let model = model.clone();
+        let loading_generation = Rc::new(Cell::new(None::<u64>));
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let generation = session.borrow().as_ref().map(VaultSession::generation);
+            if generation.is_none() {
+                loading_generation.set(None);
+                records.borrow_mut().clear();
+                model.splice(0, model.n_items(), &[]);
+                return glib::ControlFlow::Continue;
+            }
+            if loading_generation.get() == generation {
+                return glib::ControlFlow::Continue;
+            }
+            let receiver = match session.borrow().as_ref().map(VaultSession::list_images) {
+                Some(Ok(receiver)) => receiver,
+                _ => return glib::ControlFlow::Continue,
+            };
+            loading_generation.set(generation);
+            let session = Rc::clone(&session);
+            let records = Rc::clone(&records);
+            let model = model.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(images)) => {
+                        let current = session.borrow().as_ref().map(VaultSession::generation);
+                        if current != generation {
+                            return glib::ControlFlow::Break;
+                        }
+                        let labels: Vec<String> = images
+                            .iter()
+                            .enumerate()
+                            .map(|(index, image)| {
+                                format!(
+                                    "Image {} — {} × {}{}",
+                                    index + 1,
+                                    image.width,
+                                    image.height,
+                                    if image.favorite { " — favorite" } else { "" }
+                                )
+                            })
+                            .collect();
+                        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+                        model.splice(0, model.n_items(), &labels);
+                        *records.borrow_mut() = images;
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+            glib::ControlFlow::Continue
+        });
+    }
     root.upcast()
+}
+
+fn memory_texture(
+    pixels: osv_crypto::SecretBytes,
+    width: u32,
+    height: u32,
+) -> Option<gdk::MemoryTexture> {
+    let width_i32 = i32::try_from(width).ok()?;
+    let height_i32 = i32::try_from(height).ok()?;
+    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
+    let expected = stride.checked_mul(usize::try_from(height).ok()?)?;
+    if pixels.len() != expected {
+        return None;
+    }
+    let bytes = glib::Bytes::from_owned(TexturePixels(pixels));
+    Some(gdk::MemoryTexture::new(
+        width_i32,
+        height_i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        stride,
+    ))
 }
 
 fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {

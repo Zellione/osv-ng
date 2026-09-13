@@ -15,8 +15,8 @@ mod types;
 pub use connection::{Catalog, CatalogConfig, CatalogMode, IntegrityReport};
 pub use error::{CatalogError, Result};
 pub use repository::{
-    CatalogReader, CatalogTransaction, CleanupObject, DerivedRegeneration, JournalEntry,
-    SearchResult,
+    CatalogReader, CatalogTransaction, CleanupObject, DerivedRegeneration, GalleryRecord,
+    ImageRecord, JournalEntry, SearchResult,
 };
 pub use schema::{MigrationFaultInjector, MigrationPoint, NoMigrationFault, SCHEMA_VERSION};
 pub use types::{
