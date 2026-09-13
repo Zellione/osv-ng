@@ -1475,6 +1475,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   decrypts its current versioned thumbnail into protected memory, sends only
   those bytes to the confined helper, and rejects callbacks from an older
   session generation before constructing a GTK memory texture.
+- Missing/stale thumbnail regeneration is now scheduled on the serial vault
+  owner after unlock, yields to queued UI commands between objects, reports a
+  bounded redacted task summary, and uses the same monotonic session revocation
+  flag through authenticated read and helper streaming. Lock can no longer be
+  undone by a queued command resetting cancellation. A completed maintenance
+  pass refreshes the catalog-backed gallery model.
 
 **Verification**
 
@@ -1498,7 +1504,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 **Deviations and follow-up**
 
 - Reopened-original viewing, zoom/pan/rotation/media navigation, decoded
-  animation-frame representation and controls, regeneration scheduling, deeper
+  animation-frame representation and controls, deeper
   color-profile fixtures, and Flatpak interactive display checks remain required
   before Phase 9 can be marked complete. Third-party decoder working
   allocations remain subject to the documented opaque-library limitation and

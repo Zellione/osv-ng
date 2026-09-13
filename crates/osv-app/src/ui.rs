@@ -864,14 +864,32 @@ fn gallery_view(
         let session = Rc::clone(session);
         let records = Rc::clone(&records);
         let model = model.clone();
+        let task_status = status.clone();
         let loading_generation = Rc::new(Cell::new(None::<u64>));
+        let refreshed_after_maintenance = Rc::new(Cell::new(false));
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             let generation = session.borrow().as_ref().map(VaultSession::generation);
             if generation.is_none() {
                 loading_generation.set(None);
+                refreshed_after_maintenance.set(false);
                 records.borrow_mut().clear();
                 model.splice(0, model.n_items(), &[]);
                 return glib::ControlFlow::Continue;
+            }
+            let maintenance = session
+                .borrow()
+                .as_ref()
+                .map(VaultSession::maintenance_status)
+                .unwrap_or_default();
+            let finished = maintenance.total > 0
+                && maintenance.completed.saturating_add(maintenance.failed) >= maintenance.total;
+            if maintenance.running {
+                task_status.set_label("Regenerating encrypted image thumbnails…");
+            } else if maintenance.failed > 0 && finished {
+                task_status.set_label("Some thumbnails could not be regenerated safely.");
+            }
+            if finished && !refreshed_after_maintenance.replace(true) {
+                loading_generation.set(None);
             }
             if loading_generation.get() == generation {
                 return glib::ControlFlow::Continue;

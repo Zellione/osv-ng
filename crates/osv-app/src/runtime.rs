@@ -1,9 +1,10 @@
 //! Serial background ownership for an unlocked production vault session.
 
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -72,6 +73,14 @@ pub struct OpenedImage {
     pub frames: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceStatus {
+    pub total: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub running: bool,
+}
+
 impl std::fmt::Debug for OpenedImage {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -124,6 +133,7 @@ pub struct VaultSession {
     commands: mpsc::Sender<Command>,
     ready: mpsc::Receiver<Result<(), RuntimeError>>,
     cancelled: Arc<AtomicBool>,
+    maintenance: Arc<Mutex<MaintenanceStatus>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -141,6 +151,8 @@ impl VaultSession {
         let (ready_tx, ready) = mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
+        let maintenance = Arc::new(Mutex::new(MaintenanceStatus::default()));
+        let worker_maintenance = Arc::clone(&maintenance);
         let thread = thread::spawn(move || {
             let password = match Password::take(&mut password_bytes) {
                 Ok(password) => password,
@@ -168,19 +180,66 @@ impl VaultSession {
                 return;
             }
             let mut pending = None;
-            while let Ok(command) = command_rx.recv() {
+            let mut regeneration: VecDeque<_> = vault
+                .reader()
+                .derived_needing_recipe(
+                    osv_storage::ObjectRole::Thumbnail,
+                    osv_media::THUMBNAIL_RECIPE_VERSION,
+                    10_000,
+                )
+                .unwrap_or_default()
+                .into();
+            if let Ok(mut status) = worker_maintenance.lock() {
+                status.total = u32::try_from(regeneration.len()).unwrap_or(u32::MAX);
+            }
+            loop {
+                let command = if regeneration.is_empty() {
+                    match command_rx.recv() {
+                        Ok(command) => Some(command),
+                        Err(_) => break,
+                    }
+                } else {
+                    match command_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok(command) => Some(command),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                };
+                let Some(command) = command else {
+                    let Some(target) = regeneration.pop_front() else {
+                        continue;
+                    };
+                    if let Ok(mut status) = worker_maintenance.lock() {
+                        status.running = true;
+                    }
+                    let result = osv_import::regenerate_image_thumbnail_cancellable(
+                        &mut vault,
+                        target,
+                        &media_worker_path(),
+                        REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+                        now_ms().unwrap_or(0),
+                        Some(&worker_cancelled),
+                    );
+                    if let Ok(mut status) = worker_maintenance.lock() {
+                        status.running = false;
+                        if result.is_ok() {
+                            status.completed = status.completed.saturating_add(1);
+                        } else if !worker_cancelled.load(Ordering::Acquire) {
+                            status.failed = status.failed.saturating_add(1);
+                        }
+                    }
+                    continue;
+                };
                 match command {
                     Command::ListImages { response } => {
                         let result = list_images(&vault);
                         let _ = response.send(result);
                     }
                     Command::OpenThumbnail { media_id, response } => {
-                        worker_cancelled.store(false, Ordering::Release);
                         let result = open_thumbnail(&vault, media_id, &worker_cancelled);
                         let _ = response.send(result);
                     }
                     Command::PrepareImport { request, response } => {
-                        worker_cancelled.store(false, Ordering::Release);
                         pending = None;
                         match prepare_import(&vault, request, &worker_cancelled) {
                             Ok((prepared, original_name, preview)) => {
@@ -208,6 +267,7 @@ impl VaultSession {
             commands,
             ready,
             cancelled,
+            maintenance,
             thread: Some(thread),
         }
     }
@@ -215,6 +275,17 @@ impl VaultSession {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[must_use]
+    pub fn maintenance_status(&self) -> MaintenanceStatus {
+        self.maintenance.lock().map_or_else(
+            |_| MaintenanceStatus {
+                failed: 1,
+                ..MaintenanceStatus::default()
+            },
+            |status| *status,
+        )
     }
 
     pub fn try_ready(&self) -> Option<Result<(), RuntimeError>> {
@@ -398,11 +469,7 @@ fn commit_import(
         .fill(&mut id)
         .map_err(|_| RuntimeError::Input)?;
     let media_id = osv_catalog::MediaId::from_bytes(id);
-    let imported_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .ok_or(RuntimeError::Input)?;
+    let imported_at_ms = now_ms().ok_or(RuntimeError::Input)?;
     let committed = prepared
         .commit(vault, media_id, &original_name, imported_at_ms)
         .map_err(map_import_error)?;
@@ -414,6 +481,13 @@ fn commit_import(
         width: committed.display_width,
         height: committed.display_height,
     }))
+}
+
+fn now_ms() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 fn map_import_error(error: ImageImportError) -> RuntimeError {
@@ -463,6 +537,15 @@ mod tests {
         let images = session.list_images().unwrap().recv().unwrap().unwrap();
         assert!(images.is_empty());
         assert_ne!(session.generation(), 0);
+        assert_eq!(session.maintenance_status(), MaintenanceStatus::default());
+        session.revoke();
+        if let Ok(receiver) = session.list_images() {
+            assert!(
+                receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .is_err()
+            );
+        }
         session.close();
         let password = Password::new(b"runtime test password").unwrap();
         VaultService::open(&path, &password, None, OpenMode::Writer)

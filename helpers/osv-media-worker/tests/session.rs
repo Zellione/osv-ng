@@ -133,6 +133,72 @@ fn missing_thumbnail_regenerates_without_replacing_the_original() {
 }
 
 #[test]
+fn cancelled_regeneration_preserves_original_and_prior_thumbnail() {
+    let parent = osv_test_support::TempVault::create_in(std::path::Path::new("/tmp")).unwrap();
+    let password = osv_crypto::Password::new(b"cancel regeneration password").unwrap();
+    let mut vault = osv_vault::VaultService::create(
+        &parent.path().join("cancel-regeneration"),
+        &password,
+        None,
+        osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+        1,
+    )
+    .unwrap();
+    let image = valid_png();
+    let media_id = osv_catalog::MediaId::from_bytes([0x74; 16]);
+    let mut source = std::io::Cursor::new(&image);
+    let original = vault
+        .import(
+            &mut source,
+            image.len() as u64,
+            osv_vault::ImportMetadata {
+                id: media_id,
+                original_name: "cancel.png",
+                class: osv_catalog::MediaClass::Image,
+                mime: "image/png",
+                width: Some(2),
+                height: Some(3),
+                duration_ms: None,
+                codecs: "png",
+                imported_at_ms: 1,
+                fingerprint: &[0x92; 32],
+            },
+        )
+        .unwrap();
+    let mut prior_source = std::io::Cursor::new(&image);
+    let prior = vault
+        .replace_derived(
+            &mut prior_source,
+            image.len() as u64,
+            media_id,
+            osv_storage::ObjectRole::Thumbnail,
+            osv_media::THUMBNAIL_RECIPE_VERSION,
+            2,
+            3,
+            2,
+        )
+        .unwrap();
+    let target = osv_catalog::DerivedRegeneration {
+        media_id,
+        original_object_id: original,
+    };
+    let cancelled = std::sync::atomic::AtomicBool::new(true);
+    assert!(matches!(
+        osv_import::regenerate_image_thumbnail_cancellable(
+            &mut vault,
+            target,
+            std::path::Path::new(env!("CARGO_BIN_EXE_osv-media-worker")),
+            75,
+            3,
+            Some(&cancelled),
+        ),
+        Err(osv_import::ImageImportError::Cancelled)
+    ));
+    assert!(vault.reader().object(original).is_ok());
+    assert!(vault.reader().object(prior).is_ok());
+}
+
+#[test]
 fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts() {
     let parent = osv_test_support::TempVault::create_in(std::path::Path::new("/tmp")).unwrap();
     let path = parent.path().join("image-import");

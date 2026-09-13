@@ -136,14 +136,6 @@ struct PreparedThumbnail {
     display_pixels: osv_crypto::SecretBytes,
 }
 
-fn prepare_thumbnail(
-    source: &osv_crypto::SecretBytes,
-    worker_executable: &Path,
-    request_id: u64,
-) -> Result<PreparedThumbnail, ImageImportError> {
-    prepare_thumbnail_cancellable(source, worker_executable, request_id, None)
-}
-
 fn prepare_thumbnail_cancellable(
     source: &osv_crypto::SecretBytes,
     worker_executable: &Path,
@@ -304,6 +296,24 @@ pub fn regenerate_image_thumbnail(
     request_id: u64,
     now_ms: i64,
 ) -> Result<osv_storage::ObjectId, ImageImportError> {
+    regenerate_image_thumbnail_cancellable(
+        vault,
+        target,
+        worker_executable,
+        request_id,
+        now_ms,
+        None,
+    )
+}
+
+pub fn regenerate_image_thumbnail_cancellable(
+    vault: &mut osv_vault::VaultService,
+    target: osv_catalog::DerivedRegeneration,
+    worker_executable: &Path,
+    request_id: u64,
+    now_ms: i64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<osv_storage::ObjectId, ImageImportError> {
     let logical_len = vault
         .reader()
         .object(target.original_object_id)
@@ -319,9 +329,17 @@ pub fn regenerate_image_thumbnail(
         let mut reader = vault
             .open_object(target.original_object_id)
             .map_err(ImageImportError::Vault)?;
-        reader
-            .read_exact(source.expose_mut())
-            .map_err(|_| ImageImportError::Input)?;
+        let mut offset = 0;
+        while offset < len {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(ImageImportError::Cancelled);
+            }
+            let end = (offset + osv_worker_protocol::MAX_DATA_LEN).min(len);
+            reader
+                .read_exact(&mut source.expose_mut()[offset..end])
+                .map_err(|_| ImageImportError::Input)?;
+            offset = end;
+        }
         let mut excess = [0u8; 1];
         if reader
             .read(&mut excess)
@@ -331,7 +349,11 @@ pub fn regenerate_image_thumbnail(
             return Err(ImageImportError::Input);
         }
     }
-    let prepared = prepare_thumbnail(&source, worker_executable, request_id)?;
+    let prepared =
+        prepare_thumbnail_cancellable(&source, worker_executable, request_id, cancelled)?;
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(ImageImportError::Cancelled);
+    }
     let logical_len = u64::try_from(prepared.bytes.len()).map_err(|_| ImageImportError::Input)?;
     let mut reader = std::io::Cursor::new(prepared.bytes.expose());
     vault
