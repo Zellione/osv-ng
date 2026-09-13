@@ -2,7 +2,7 @@
 //! Parsing and decoding consume bytes only: callers stream already-authenticated
 //! object chunks and never grant a decoder vault paths or key authority.
 
-use image::{AnimationDecoder, ImageEncoder, ImageReader, codecs::png::PngEncoder};
+use image::{AnimationDecoder, ImageDecoder, ImageEncoder, ImageReader, codecs::png::PngEncoder};
 use osv_crypto::SecretBytes;
 use std::{collections::VecDeque, error::Error, fmt, path::Path};
 use zeroize::Zeroize;
@@ -19,6 +19,15 @@ pub const WORKER_RESULT_HEADER_LEN: usize = 64;
 pub const WORKER_REQUEST_HEADER_LEN: usize = 16;
 pub const THUMBNAIL_EDGE: u32 = 512;
 pub const MAX_VIEWER_EDGE: u32 = 4096;
+const MAX_DECODER_ALLOC: u64 = 400 * 1024 * 1024;
+
+fn decoder_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODER_ALLOC);
+    limits
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -144,17 +153,29 @@ pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationF
     }
     let cursor = std::io::Cursor::new(bytes);
     let frames = match info.format {
-        ImageFormat::Gif => image::codecs::gif::GifDecoder::new(std::io::BufReader::new(cursor))
-            .map_err(|_| ImageError::Decode)?
-            .into_frames()
-            .collect_frames(),
-        ImageFormat::Webp => image::codecs::webp::WebPDecoder::new(std::io::BufReader::new(cursor))
-            .map_err(|_| ImageError::Decode)?
-            .into_frames()
-            .collect_frames(),
-        ImageFormat::Png => {
-            let decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(cursor))
+        ImageFormat::Gif => {
+            let mut decoder = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(cursor))
                 .map_err(|_| ImageError::Decode)?;
+            decoder
+                .set_limits(decoder_limits())
+                .map_err(|_| ImageError::ResourceLimit)?;
+            decoder.into_frames().collect_frames()
+        }
+        ImageFormat::Webp => {
+            let mut decoder =
+                image::codecs::webp::WebPDecoder::new(std::io::BufReader::new(cursor))
+                    .map_err(|_| ImageError::Decode)?;
+            decoder
+                .set_limits(decoder_limits())
+                .map_err(|_| ImageError::ResourceLimit)?;
+            decoder.into_frames().collect_frames()
+        }
+        ImageFormat::Png => {
+            let decoder = image::codecs::png::PngDecoder::with_limits(
+                std::io::BufReader::new(cursor),
+                decoder_limits(),
+            )
+            .map_err(|_| ImageError::Decode)?;
             if !decoder.is_apng().map_err(|_| ImageError::Decode)? {
                 return Err(ImageError::Unsupported);
             }
@@ -597,11 +618,7 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
     let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|_| ImageError::Decode)?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DIMENSION);
-    limits.max_image_height = Some(MAX_DIMENSION);
-    limits.max_alloc = Some(400 * 1024 * 1024);
-    reader.limits(limits);
+    reader.limits(decoder_limits());
     let decoded = apply_orientation(
         reader.decode().map_err(|_| ImageError::Decode)?,
         info.orientation,
@@ -1107,6 +1124,15 @@ mod tests {
         png
     }
 
+    fn jpeg_with_icc(mut jpeg: Vec<u8>) -> Vec<u8> {
+        let payload = b"ICC_PROFILE\0\x01\x01test-profile";
+        let mut segment = vec![0xff, 0xe2];
+        segment.extend(u16::try_from(payload.len() + 2).unwrap().to_be_bytes());
+        segment.extend(payload);
+        jpeg.splice(2..2, segment);
+        jpeg
+    }
+
     fn encoded_formats() -> Vec<(ImageFormat, Vec<u8>)> {
         let image = rgba_fixture();
         let mut png = Vec::new();
@@ -1196,6 +1222,16 @@ mod tests {
     fn srgb_profile_presence_does_not_transform_display_pixels() {
         let plain = encoded_formats().remove(0).1;
         let profiled = png_with_srgb(plain.clone());
+        assert!(!probe(&plain).unwrap().has_color_profile);
+        assert!(probe(&profiled).unwrap().has_color_profile);
+        let plain_thumbnail = thumbnail_png(&plain, 512).unwrap();
+        let profiled_thumbnail = thumbnail_png(&profiled, 512).unwrap();
+        assert_eq!(plain_thumbnail.expose(), profiled_thumbnail.expose());
+    }
+    #[test]
+    fn jpeg_icc_presence_does_not_transform_display_pixels() {
+        let plain = jpeg_with_orientation(1);
+        let profiled = jpeg_with_icc(plain.clone());
         assert!(!probe(&plain).unwrap().has_color_profile);
         assert!(probe(&profiled).unwrap().has_color_profile);
         let plain_thumbnail = thumbnail_png(&plain, 512).unwrap();

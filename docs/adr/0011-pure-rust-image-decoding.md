@@ -39,6 +39,14 @@ sRGB-assumed PNG result and never decodes an original.
   claim colorimetric accuracy.
 - The broker validates the returned PNG structure, CRCs, dimensions, and recipe
   header before encrypted publication.
+- `image::Limits::max_alloc` is non-strict. In `image 0.25.10`, PNG forwards the
+  400 MiB value to `png`'s decoder byte limit, GIF reserves its canvas and frame
+  buffers against it, and JPEG retains it in the zune decoder options. WebP's
+  default `ImageDecoder::set_limits` checks dimensions but does not account its
+  internal allocations against `max_alloc`. The preliminary pixel/frame limits
+  and the helper's 1 GiB address-space ceiling therefore remain authoritative
+  for WebP and backstop every decoder. This is a documented degraded resource
+  guarantee, not a claim that opaque allocations are exactly bounded.
 
 ## Alternatives considered
 
@@ -51,8 +59,9 @@ would substantially increase format-specific security code.
 ## Validation and reversal
 
 The Phase 9 corpus exercises genuine PNG, JPEG, GIF, and extended-WebP decode,
-malformed structures and PNG CRCs, resource ceilings, and all eight EXIF
-orientations. Flatpak and dependency-policy gates remain release requirements.
+malformed structures and PNG CRCs, resource ceilings, all eight EXIF
+orientations, and sRGB/ICC presence under the no-transform policy. Flatpak and
+dependency-policy gates remain release requirements.
 
 Reconsider this decision if the enabled decoders cannot enforce allocation
 ceilings, the required animation behavior cannot be implemented within the

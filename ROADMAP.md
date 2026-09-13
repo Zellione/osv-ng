@@ -1522,6 +1522,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   presence is allowlisted while decoded display pixels remain identical under
   the documented no-transform policy. Truncated genuine JPEG, GIF, and WebP
   containers now also fail the complete decoder path.
+- Applied the same 400 MiB non-strict `image::Limits` value to still, GIF, WebP,
+  and APNG decoder construction and documented the audited per-decoder behavior
+  in ADR 0011. PNG, GIF, and JPEG consume the limit in their implementations;
+  WebP checks strict dimensions but relies on the preliminary pixel/frame caps
+  and the helper's 1 GiB address-space ceiling for opaque internal allocations.
+  Paired JPEG ICC-marker fixtures also confirm profile presence does not alter
+  output pixels under the version-1 display policy.
 
 **Verification**
 
@@ -1544,8 +1551,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases, ICC policy fixtures, animated WebP/APNG
-  corpus evidence, and animation
+- Deeper malformed/bomb corpus cases, animated WebP/APNG corpus evidence, and animation
   cache/lock wipe tests
   remain required before Phase 9 can be marked complete.
 - Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
