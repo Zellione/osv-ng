@@ -1491,6 +1491,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   as a native GSK child transform over the protected texture owner, avoiding a
   second application pixel buffer. Page, arrow, plus/minus, and rotation keys
   invoke the same controls, with Ctrl/Alt combinations left to global shortcuts.
+- Added the helper-side bounded animation-frame decoder foundation for GIF,
+  WebP, and APNG dispatch. It requires the probed frame count, full-canvas frame
+  geometry, bounded 10–60000 ms normalized timing, per-frame scaling, and a
+  cumulative protected-pixel ceiling. A genuine two-frame GIF regression
+  verifies composited RGBA pixels and timing. Frame IPC and playback remain
+  follow-up work, so animated display is not yet claimed.
 
 **Verification**
 

@@ -2,7 +2,7 @@
 //! Parsing and decoding consume bytes only: callers stream already-authenticated
 //! object chunks and never grant a decoder vault paths or key authority.
 
-use image::{ImageEncoder, ImageReader, codecs::png::PngEncoder};
+use image::{AnimationDecoder, ImageEncoder, ImageReader, codecs::png::PngEncoder};
 use osv_crypto::SecretBytes;
 use std::{collections::VecDeque, error::Error, fmt, path::Path};
 use zeroize::Zeroize;
@@ -119,6 +119,101 @@ pub enum ImageError {
     Malformed,
     ResourceLimit,
     Decode,
+}
+
+pub struct DecodedAnimationFrame {
+    pub pixels: SecretBytes,
+    pub width: u32,
+    pub height: u32,
+    pub delay_ms: u32,
+}
+
+impl fmt::Debug for DecodedAnimationFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DecodedAnimationFrame([REDACTED])")
+    }
+}
+
+pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationFrame>, ImageError> {
+    let info = probe(bytes)?;
+    if info.frames <= 1 || !(THUMBNAIL_EDGE..=MAX_VIEWER_EDGE).contains(&edge) {
+        return Err(ImageError::Unsupported);
+    }
+    let cursor = std::io::Cursor::new(bytes);
+    let frames = match info.format {
+        ImageFormat::Gif => image::codecs::gif::GifDecoder::new(std::io::BufReader::new(cursor))
+            .map_err(|_| ImageError::Decode)?
+            .into_frames()
+            .collect_frames(),
+        ImageFormat::Webp => image::codecs::webp::WebPDecoder::new(std::io::BufReader::new(cursor))
+            .map_err(|_| ImageError::Decode)?
+            .into_frames()
+            .collect_frames(),
+        ImageFormat::Png => {
+            let decoder = image::codecs::png::PngDecoder::new(std::io::BufReader::new(cursor))
+                .map_err(|_| ImageError::Decode)?;
+            if !decoder.is_apng().map_err(|_| ImageError::Decode)? {
+                return Err(ImageError::Unsupported);
+            }
+            decoder
+                .apng()
+                .map_err(|_| ImageError::Decode)?
+                .into_frames()
+                .collect_frames()
+        }
+        ImageFormat::Jpeg => return Err(ImageError::Unsupported),
+    }
+    .map_err(|_| ImageError::Decode)?;
+    if frames.len() != info.frames as usize || frames.len() > MAX_ANIMATION_FRAMES as usize {
+        return Err(ImageError::Malformed);
+    }
+    let mut protected = Vec::with_capacity(frames.len());
+    let mut total = 0usize;
+    for frame in frames {
+        if frame.left() != 0
+            || frame.top() != 0
+            || frame.buffer().width() != info.width
+            || frame.buffer().height() != info.height
+        {
+            return Err(ImageError::Malformed);
+        }
+        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        if denominator == 0 {
+            return Err(ImageError::Malformed);
+        }
+        let delay_ms = numerator
+            .checked_add(denominator - 1)
+            .ok_or(ImageError::ResourceLimit)?
+            / denominator;
+        let delay_ms = delay_ms.max(10);
+        if delay_ms > 60_000 {
+            return Err(ImageError::ResourceLimit);
+        }
+        let buffer = frame.into_buffer();
+        let scaled = if buffer.width() > edge || buffer.height() > edge {
+            image::DynamicImage::ImageRgba8(buffer)
+                .thumbnail(edge, edge)
+                .to_rgba8()
+        } else {
+            buffer
+        };
+        let width = scaled.width();
+        let height = scaled.height();
+        let mut raw = scaled.into_raw();
+        total = total
+            .checked_add(raw.len())
+            .filter(|total| *total <= MAX_VIEWER_RESULT_BYTES)
+            .ok_or(ImageError::ResourceLimit)?;
+        let pixels = SecretBytes::new(&raw).map_err(|_| ImageError::Decode)?;
+        raw.zeroize();
+        protected.push(DecodedAnimationFrame {
+            pixels,
+            width,
+            height,
+            delay_ms,
+        });
+    }
+    Ok(protected)
 }
 impl fmt::Display for ImageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1039,5 +1134,25 @@ mod tests {
         ));
         assert!(encode_worker_request(ImagePurpose::Thumbnail, 513).is_err());
         assert!(encode_worker_request(ImagePurpose::Viewer, 4097).is_err());
+    }
+
+    #[test]
+    fn animated_gif_frames_are_full_canvas_timed_and_protected() {
+        let first = image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255]));
+        let second = image::RgbaImage::from_pixel(3, 2, image::Rgba([4, 5, 6, 255]));
+        let frames = [
+            image::Frame::from_parts(first, 0, 0, image::Delay::from_numer_denom_ms(25, 1)),
+            image::Frame::from_parts(second, 0, 0, image::Delay::from_numer_denom_ms(50, 1)),
+        ];
+        let mut encoded = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut encoded)
+            .encode_frames(frames)
+            .unwrap();
+        let decoded = animation_frames(&encoded, 512).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!((decoded[0].width, decoded[0].height), (3, 2));
+        assert_eq!((decoded[0].delay_ms, decoded[1].delay_ms), (20, 50));
+        assert_eq!(decoded[0].pixels.expose()[..4], [1, 2, 3, 255]);
+        assert!(!format!("{decoded:?}").contains("1, 2, 3"));
     }
 }
