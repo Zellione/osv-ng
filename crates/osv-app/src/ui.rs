@@ -28,6 +28,7 @@ struct CssSlots {
 }
 
 struct TexturePixels(osv_crypto::SecretBytes);
+type SensitiveAnimations = Rc<RefCell<Vec<Rc<RefCell<Vec<gdk::MemoryTexture>>>>>>;
 
 impl AsRef<[u8]> for TexturePixels {
     fn as_ref(&self) -> &[u8] {
@@ -85,6 +86,7 @@ fn build_window(app: &gtk::Application) {
     let vault_authority = Rc::new(RefCell::new(None::<gio::File>));
     let session = Rc::new(RefCell::new(None::<VaultSession>));
     let sensitive_pictures = Rc::new(RefCell::new(Vec::<gtk::Picture>::new()));
+    let sensitive_animations: SensitiveAnimations = Rc::new(RefCell::new(Vec::new()));
     css.set_appearance(&state.borrow().appearance);
     let password = gtk::PasswordEntry::builder()
         .placeholder_text("Password")
@@ -112,6 +114,7 @@ fn build_window(app: &gtk::Application) {
             &css,
             &session,
             &sensitive_pictures,
+            &sensitive_animations,
         ),
         Some("vault"),
     );
@@ -129,6 +132,7 @@ fn build_window(app: &gtk::Application) {
         &stack,
         &password,
         &sensitive_pictures,
+        &sensitive_animations,
         &session,
     );
     window.present();
@@ -140,6 +144,7 @@ fn install_keyboard(
     outer: &gtk::Stack,
     password: &gtk::PasswordEntry,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
     session: &Rc<RefCell<Option<VaultSession>>>,
 ) {
     let keys = gtk::EventControllerKey::new();
@@ -147,6 +152,7 @@ fn install_keyboard(
     let outer = outer.clone();
     let password = password.clone();
     let sensitive_pictures = Rc::clone(sensitive_pictures);
+    let sensitive_animations = Rc::clone(sensitive_animations);
     let session = Rc::clone(session);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let command = [
@@ -178,6 +184,7 @@ fn install_keyboard(
                     session.revoke();
                 }
                 clear_sensitive_pictures(&sensitive_pictures);
+                clear_sensitive_animations(&sensitive_animations);
             }
             sync_route(&outer, state.borrow().route(), &password);
             glib::Propagation::Stop
@@ -444,13 +451,17 @@ fn vault_page(
     css: &Rc<CssSlots>,
     session: &Rc<RefCell<Option<VaultSession>>>,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sidebar.add_css_class("osv-sidebar");
     let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     content.set_widget_name("osv-vault-content");
-    content.add_named(&gallery_view(session, sensitive_pictures), Some("gallery"));
+    content.add_named(
+        &gallery_view(session, sensitive_pictures, sensitive_animations),
+        Some("gallery"),
+    );
     content.add_named(
         &simple_page("Search", "Search is ready for catalog integration."),
         Some("search"),
@@ -506,11 +517,13 @@ fn vault_page(
     let password_for_lock = password.clone();
     let session_for_lock = Rc::clone(session);
     let sensitive_pictures_for_lock = Rc::clone(sensitive_pictures);
+    let sensitive_animations_for_lock = Rc::clone(sensitive_animations);
     lock.connect_clicked(move |_| {
         if let Some(session) = session_for_lock.borrow_mut().take() {
             session.revoke();
         }
         clear_sensitive_pictures(&sensitive_pictures_for_lock);
+        clear_sensitive_animations(&sensitive_animations_for_lock);
         state_for_lock.borrow_mut().lock();
         sync_route(&outer_for_lock, Route::Choose, &password_for_lock);
     });
@@ -562,6 +575,7 @@ fn begin_vault_session(
 fn gallery_view(
     session: &Rc<RefCell<Option<VaultSession>>>,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let import = gtk::Button::with_mnemonic("_Import image…");
@@ -591,18 +605,36 @@ fn gallery_view(
     viewer.set_size_request(640, 380);
     viewer.put(&picture, 0.0, 0.0);
     let viewer_state = Rc::new(RefCell::new(osv_media::ViewerState::new(1)));
+    let animation_frames = Rc::new(RefCell::new(Vec::<gdk::MemoryTexture>::new()));
+    sensitive_animations
+        .borrow_mut()
+        .push(Rc::clone(&animation_frames));
+    let frame_delays = Rc::new(RefCell::new(Vec::<u32>::new()));
+    let next_frame_at = Rc::new(Cell::new(std::time::Instant::now()));
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let previous = gtk::Button::with_mnemonic("_Previous");
     let next = gtk::Button::with_mnemonic("_Next");
     let zoom_out = gtk::Button::with_label("Zoom out");
     let zoom_in = gtk::Button::with_label("Zoom in");
     let rotate = gtk::Button::with_label("Rotate clockwise");
+    let play_pause = gtk::Button::with_label("Pause animation");
+    let step_frame = gtk::Button::with_label("Next frame");
     let pan_left = gtk::Button::with_label("Pan left");
     let pan_right = gtk::Button::with_label("Pan right");
     let pan_up = gtk::Button::with_label("Pan up");
     let pan_down = gtk::Button::with_label("Pan down");
     for button in [
-        &previous, &next, &zoom_out, &zoom_in, &rotate, &pan_left, &pan_right, &pan_up, &pan_down,
+        &previous,
+        &next,
+        &zoom_out,
+        &zoom_in,
+        &rotate,
+        &play_pause,
+        &step_frame,
+        &pan_left,
+        &pan_right,
+        &pan_up,
+        &pan_down,
     ] {
         controls.append(button);
     }
@@ -650,6 +682,63 @@ fn gallery_view(
         button.connect_clicked(move |_| {
             state.borrow_mut().pan_by(x, y);
             apply();
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let frame_delays = Rc::clone(&frame_delays);
+        play_pause.connect_clicked(move |button| {
+            state.borrow_mut().toggle_animation();
+            let playing = state.borrow().playing();
+            button.set_label(if playing {
+                "Pause animation"
+            } else {
+                "Play animation"
+            });
+            if playing {
+                let frame = state.borrow().frame() as usize;
+                let delay = frame_delays.borrow().get(frame).copied().unwrap_or(10);
+                next_frame_at.set(
+                    std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
+                );
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let frames = Rc::clone(&animation_frames);
+        let picture = picture.clone();
+        step_frame.connect_clicked(move |_| {
+            state.borrow_mut().step_forward();
+            let frame = state.borrow().frame() as usize;
+            if let Some(texture) = frames.borrow().get(frame) {
+                picture.set_paintable(Some(texture));
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let frames = Rc::clone(&animation_frames);
+        let delays = Rc::clone(&frame_delays);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let picture = picture.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+            if frames.borrow().len() > 1
+                && state.borrow().playing()
+                && std::time::Instant::now() >= next_frame_at.get()
+            {
+                state.borrow_mut().advance();
+                let frame = state.borrow().frame() as usize;
+                if let Some(texture) = frames.borrow().get(frame) {
+                    picture.set_paintable(Some(texture));
+                }
+                let delay = delays.borrow().get(frame).copied().unwrap_or(10);
+                next_frame_at.set(
+                    std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
+                );
+            }
+            glib::ControlFlow::Continue
         });
     }
 
@@ -881,6 +970,11 @@ fn gallery_view(
         let status = status.clone();
         let viewer_state = Rc::clone(&viewer_state);
         let apply_transform = Rc::clone(&apply_transform);
+        let animation_frames = Rc::clone(&animation_frames);
+        let frame_delays = Rc::clone(&frame_delays);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let play_pause = play_pause.clone();
+        let step_frame = step_frame.clone();
         selection.connect_selected_notify(move |selection| {
             let index = selection.selected();
             let Some(record) = records.borrow().get(index as usize).copied() else {
@@ -906,6 +1000,11 @@ fn gallery_view(
             let status = status.clone();
             let viewer_state = Rc::clone(&viewer_state);
             let apply_transform = Rc::clone(&apply_transform);
+            let animation_frames = Rc::clone(&animation_frames);
+            let frame_delays = Rc::clone(&frame_delays);
+            let next_frame_at = Rc::clone(&next_frame_at);
+            let play_pause = play_pause.clone();
+            let step_frame = step_frame.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 match receiver.try_recv() {
                     Ok(Ok(opened)) => {
@@ -916,11 +1015,42 @@ fn gallery_view(
                         if !still_current {
                             return glib::ControlFlow::Break;
                         }
+                        let mut textures = Vec::with_capacity(opened.frames as usize);
+                        let mut delays = Vec::with_capacity(opened.frames as usize);
+                        let first_delay = opened.first_delay_ms;
                         if let Some(texture) =
                             memory_texture(opened.pixels, opened.width, opened.height)
                         {
+                            textures.push(texture.clone());
+                            delays.push(first_delay);
+                            for frame in opened.additional_frames {
+                                let Some(frame_texture) =
+                                    memory_texture(frame.pixels, opened.width, opened.height)
+                                else {
+                                    status.set_label("An animation frame was rejected safely.");
+                                    return glib::ControlFlow::Break;
+                                };
+                                textures.push(frame_texture);
+                                delays.push(frame.delay_ms);
+                            }
+                            if textures.len() != opened.frames as usize {
+                                status.set_label("The animation frame count was rejected safely.");
+                                return glib::ControlFlow::Break;
+                            }
                             *viewer_state.borrow_mut() = osv_media::ViewerState::new(opened.frames);
                             picture.set_paintable(Some(&texture));
+                            *animation_frames.borrow_mut() = textures;
+                            *frame_delays.borrow_mut() = delays;
+                            let animated = opened.frames > 1;
+                            play_pause.set_sensitive(animated);
+                            step_frame.set_sensitive(animated);
+                            play_pause.set_label("Pause animation");
+                            next_frame_at.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(u64::from(
+                                        first_delay.max(10),
+                                    )),
+                            );
                             apply_transform();
                             status.set_label("Original opened through the isolated viewer path.");
                         } else {
@@ -949,6 +1079,8 @@ fn gallery_view(
         let zoom_out = zoom_out.clone();
         let zoom_in = zoom_in.clone();
         let rotate = rotate.clone();
+        let play_pause = play_pause.clone();
+        let step_frame = step_frame.clone();
         let pan_left = pan_left.clone();
         let pan_right = pan_right.clone();
         let pan_up = pan_up.clone();
@@ -963,6 +1095,8 @@ fn gallery_view(
                 gdk::Key::plus | gdk::Key::KP_Add => Some(&zoom_in),
                 gdk::Key::minus | gdk::Key::KP_Subtract => Some(&zoom_out),
                 gdk::Key::r | gdk::Key::R => Some(&rotate),
+                gdk::Key::space => Some(&play_pause),
+                gdk::Key::period => Some(&step_frame),
                 gdk::Key::Left => Some(&pan_left),
                 gdk::Key::Right => Some(&pan_right),
                 gdk::Key::Up => Some(&pan_up),
@@ -1088,6 +1222,12 @@ fn memory_texture(
 fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {
     for picture in pictures.borrow().iter() {
         picture.set_paintable(gtk::gdk::Paintable::NONE);
+    }
+}
+
+fn clear_sensitive_animations(animations: &SensitiveAnimations) {
+    for frames in animations.borrow().iter() {
+        frames.borrow_mut().clear();
     }
 }
 

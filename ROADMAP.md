@@ -1501,8 +1501,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   The first plane carries validated timing and subsequent records carry a
   bounded delay plus exact full-canvas RGBA bytes. The broker independently
   validates frame count, timing, per-plane length, aggregate length, and result
-  purpose before copying every plane into protected storage. GTK playback and
-  explicit controls remain follow-up work.
+  purpose before copying every plane into protected storage.
+- GTK now owns bounded animation frames as protected-memory-backed textures,
+  advances them using validated frame delays, and exposes play/pause and manual
+  frame-step controls plus Space/period shortcuts. Both lock paths synchronously
+  clear the current paintable and the complete animation texture registry; the
+  continuing UI timer retains only the emptied registry rather than frame data.
 
 **Verification**
 
