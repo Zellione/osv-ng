@@ -1481,6 +1481,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   flag through authenticated read and helper streaming. Lock can no longer be
   undone by a queued command resetting cancellation. A completed maintenance
   pass refreshes the catalog-backed gallery model.
+- Versioned the media transform contract with a broker-authored request envelope
+  that binds thumbnail versus viewer purpose and the requested edge. Helper
+  results echo both fields and are rejected on mismatch. Catalog tile selection
+  now authenticates the encrypted original and requests a separately capped
+  4096-edge viewer rendition instead of enlarging the stored 512-edge thumbnail.
 
 **Verification**
 
@@ -1503,8 +1508,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Reopened-original viewing, zoom/pan/rotation/media navigation, decoded
-  animation-frame representation and controls, deeper
+- Visible zoom/pan/rotation/media navigation, decoded animation-frame
+  representation and controls, deeper
   color-profile fixtures, and Flatpak interactive display checks remain required
   before Phase 9 can be marked complete. Third-party decoder working
   allocations remain subject to the documented opaque-library limitation and

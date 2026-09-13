@@ -116,6 +116,10 @@ enum Command {
         media_id: osv_catalog::MediaId,
         response: mpsc::Sender<Result<OpenedImage, RuntimeError>>,
     },
+    OpenViewer {
+        media_id: osv_catalog::MediaId,
+        response: mpsc::Sender<Result<OpenedImage, RuntimeError>>,
+    },
     PrepareImport {
         request: ImportRequest,
         response: mpsc::Sender<Result<ImportPreview, RuntimeError>>,
@@ -239,6 +243,10 @@ impl VaultSession {
                         let result = open_thumbnail(&vault, media_id, &worker_cancelled);
                         let _ = response.send(result);
                     }
+                    Command::OpenViewer { media_id, response } => {
+                        let result = open_viewer(&vault, media_id, &worker_cancelled);
+                        let _ = response.send(result);
+                    }
                     Command::PrepareImport { request, response } => {
                         pending = None;
                         match prepare_import(&vault, request, &worker_cancelled) {
@@ -324,6 +332,17 @@ impl VaultSession {
         let (response, receiver) = mpsc::channel();
         self.commands
             .send(Command::OpenThumbnail { media_id, response })
+            .map_err(|_| RuntimeError::Closed)?;
+        Ok(receiver)
+    }
+
+    pub fn open_viewer(
+        &self,
+        media_id: osv_catalog::MediaId,
+    ) -> Result<mpsc::Receiver<Result<OpenedImage, RuntimeError>>, RuntimeError> {
+        let (response, receiver) = mpsc::channel();
+        self.commands
+            .send(Command::OpenViewer { media_id, response })
             .map_err(|_| RuntimeError::Closed)?;
         Ok(receiver)
     }
@@ -433,6 +452,35 @@ fn open_thumbnail(
     let decoded = osv_import::decode_image_object_cancellable(
         vault,
         thumbnail,
+        &media_worker_path(),
+        REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+        cancelled,
+    )
+    .map_err(map_import_error)?;
+    Ok(OpenedImage {
+        media_id,
+        pixels: decoded.pixels,
+        width: decoded.width,
+        height: decoded.height,
+        frames: decoded.frames,
+    })
+}
+
+fn open_viewer(
+    vault: &VaultService,
+    media_id: osv_catalog::MediaId,
+    cancelled: &AtomicBool,
+) -> Result<OpenedImage, RuntimeError> {
+    let record = vault
+        .reader()
+        .image_records(osv_media::THUMBNAIL_RECIPE_VERSION, 10_000)
+        .map_err(|_| RuntimeError::Input)?
+        .into_iter()
+        .find(|record| record.id == media_id)
+        .ok_or(RuntimeError::Input)?;
+    let decoded = osv_import::decode_image_original_view_cancellable(
+        vault,
+        record.original_object_id,
         &media_worker_path(),
         REQUEST_ID.fetch_add(1, Ordering::Relaxed),
         cancelled,

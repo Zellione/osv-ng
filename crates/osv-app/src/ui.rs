@@ -811,12 +811,12 @@ fn gallery_view(
                 let Some(active) = borrowed.as_ref() else {
                     return;
                 };
-                let Ok(receiver) = active.open_thumbnail(record.media_id) else {
+                let Ok(receiver) = active.open_viewer(record.media_id) else {
                     return;
                 };
                 (active.generation(), receiver)
             };
-            status.set_label("Authenticating and opening thumbnail…");
+            status.set_label("Authenticating and opening original…");
             let session = Rc::clone(&session);
             let picture = picture.clone();
             let status = status.clone();
@@ -834,13 +834,13 @@ fn gallery_view(
                             memory_texture(opened.pixels, opened.width, opened.height)
                         {
                             picture.set_paintable(Some(&texture));
-                            status.set_label("Thumbnail opened from authenticated vault data.");
+                            status.set_label("Original opened through the isolated viewer path.");
                         } else {
-                            status.set_label("The decoded thumbnail dimensions were rejected.");
+                            status.set_label("The decoded viewer dimensions were rejected.");
                         }
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        status.set_label("The thumbnail could not be opened safely.");
+                        status.set_label("The original could not be opened safely.");
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return glib::ControlFlow::Continue;

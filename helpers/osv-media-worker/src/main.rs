@@ -3,9 +3,9 @@ fn main() {
     let result = if worker_mode {
         osv_isolation::run_worker_transformed(
             osv_worker_protocol::Role::Media,
-            osv_media::MAX_ENCODED_BYTES,
+            osv_media::MAX_ENCODED_BYTES + osv_media::WORKER_REQUEST_HEADER_LEN,
             |bytes| {
-                osv_media::image_worker_result(bytes, 512).map_err(|error| match error {
+                osv_media::image_worker_result_from_request(bytes).map_err(|error| match error {
                     osv_media::ImageError::ResourceLimit => {
                         osv_worker_protocol::FailureClass::ResourceLimit
                     }

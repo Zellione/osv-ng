@@ -17,9 +17,17 @@ fn media_worker_completes_a_bounded_stream_under_sandbox() {
     let mut worker = osv_media::spawn_worker(executable, 41, SupervisorLimits::default()).unwrap();
     assert_ne!(worker.sandbox_flags() & osv_isolation::SECCOMP, 0);
     let image = valid_png();
+    let request = osv_media::encode_worker_request(
+        osv_media::ImagePurpose::Thumbnail,
+        osv_media::THUMBNAIL_EDGE,
+    )
+    .unwrap();
+    let mut request_buffer = PlaintextBuffer::zeroed(request.len()).unwrap();
+    request_buffer.as_mut_slice().copy_from_slice(&request);
+    worker.send_authenticated(0, request_buffer).unwrap();
     let mut plaintext = PlaintextBuffer::zeroed(image.len()).unwrap();
     plaintext.as_mut_slice().copy_from_slice(&image);
-    worker.send_authenticated(0, plaintext).unwrap();
+    worker.send_authenticated(1, plaintext).unwrap();
     let (class, output) = worker
         .finish_with_output(osv_media::MAX_THUMBNAIL_RESULT_BYTES)
         .unwrap();
@@ -258,6 +266,16 @@ fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts
         (2, 3, 1)
     );
     assert_eq!(reopened.pixels.len(), 2 * 3 * 4);
+    let viewer = osv_import::decode_image_original_view_cancellable(
+        &vault,
+        committed.original,
+        executable,
+        102,
+        &cancelled,
+    )
+    .unwrap();
+    assert_eq!((viewer.width, viewer.height), (2, 3));
+    assert_eq!(viewer.pixels.len(), 2 * 3 * 4);
     for entry in walk_files(&path) {
         let artifact = std::fs::read(entry).unwrap();
         assert!(

@@ -142,6 +142,27 @@ fn prepare_thumbnail_cancellable(
     request_id: u64,
     cancelled: Option<&AtomicBool>,
 ) -> Result<PreparedThumbnail, ImageImportError> {
+    prepare_rendition_cancellable(
+        source,
+        worker_executable,
+        request_id,
+        cancelled,
+        osv_media::ImagePurpose::Thumbnail,
+        osv_media::THUMBNAIL_EDGE,
+        osv_media::MAX_THUMBNAIL_RESULT_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_rendition_cancellable(
+    source: &osv_crypto::SecretBytes,
+    worker_executable: &Path,
+    request_id: u64,
+    cancelled: Option<&AtomicBool>,
+    purpose: osv_media::ImagePurpose,
+    edge: u32,
+    maximum_result: usize,
+) -> Result<PreparedThumbnail, ImageImportError> {
     // This broker-side pass is deliberately allocation-free. It rejects gross
     // resource abuse before IPC; the confined helper independently performs a
     // complete decode before any result is accepted.
@@ -152,6 +173,17 @@ fn prepare_thumbnail_cancellable(
         osv_isolation::SupervisorLimits::default(),
     )
     .map_err(ImageImportError::Worker)?;
+    let request =
+        osv_media::encode_worker_request(purpose, edge).map_err(|_| ImageImportError::Input)?;
+    worker
+        .send_authenticated(
+            0,
+            osv_isolation::PlaintextBuffer::from_secret(
+                osv_crypto::SecretBytes::new(&request).map_err(|_| ImageImportError::Input)?,
+            )
+            .map_err(|_| ImageImportError::Input)?,
+        )
+        .map_err(ImageImportError::Worker)?;
     for (sequence, chunk) in source
         .expose()
         .chunks(osv_worker_protocol::MAX_DATA_LEN)
@@ -161,7 +193,10 @@ fn prepare_thumbnail_cancellable(
             worker.cancel();
             return Err(ImageImportError::Cancelled);
         }
-        let sequence = u64::try_from(sequence).map_err(|_| ImageImportError::Input)?;
+        let sequence = u64::try_from(sequence)
+            .ok()
+            .and_then(|sequence| sequence.checked_add(1))
+            .ok_or(ImageImportError::Input)?;
         let bytes = osv_crypto::SecretBytes::new(chunk).map_err(|_| ImageImportError::Input)?;
         worker
             .send_authenticated(
@@ -176,7 +211,7 @@ fn prepare_thumbnail_cancellable(
         return Err(ImageImportError::Cancelled);
     }
     let (class, derived) = worker
-        .finish_with_output(osv_media::MAX_THUMBNAIL_RESULT_BYTES)
+        .finish_with_output(maximum_result)
         .map_err(ImageImportError::Worker)?;
     if class != osv_isolation::ExitClass::Success {
         return Err(ImageImportError::Input);
@@ -185,6 +220,9 @@ fn prepare_thumbnail_cancellable(
     let worker_result =
         osv_media::decode_worker_result_header(header).map_err(|_| ImageImportError::Input)?;
     if worker_result.source != probe {
+        return Err(ImageImportError::Input);
+    }
+    if worker_result.purpose != purpose || worker_result.requested_edge != edge {
         return Err(ImageImportError::Input);
     }
     let png_len =
@@ -379,6 +417,48 @@ pub fn decode_image_object_cancellable(
     request_id: u64,
     cancelled: &AtomicBool,
 ) -> Result<DecodedImage, ImageImportError> {
+    decode_image_object_for(
+        vault,
+        object_id,
+        worker_executable,
+        request_id,
+        cancelled,
+        osv_media::ImagePurpose::Thumbnail,
+        osv_media::THUMBNAIL_EDGE,
+        osv_media::MAX_THUMBNAIL_RESULT_BYTES,
+    )
+}
+
+pub fn decode_image_original_view_cancellable(
+    vault: &osv_vault::VaultService,
+    object_id: osv_storage::ObjectId,
+    worker_executable: &Path,
+    request_id: u64,
+    cancelled: &AtomicBool,
+) -> Result<DecodedImage, ImageImportError> {
+    decode_image_object_for(
+        vault,
+        object_id,
+        worker_executable,
+        request_id,
+        cancelled,
+        osv_media::ImagePurpose::Viewer,
+        osv_media::MAX_VIEWER_EDGE,
+        osv_media::MAX_VIEWER_RESULT_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_image_object_for(
+    vault: &osv_vault::VaultService,
+    object_id: osv_storage::ObjectId,
+    worker_executable: &Path,
+    request_id: u64,
+    cancelled: &AtomicBool,
+    purpose: osv_media::ImagePurpose,
+    edge: u32,
+    maximum_result: usize,
+) -> Result<DecodedImage, ImageImportError> {
     let logical_len = vault
         .reader()
         .object(object_id)
@@ -413,8 +493,15 @@ pub fn decode_image_object_cancellable(
         return Err(ImageImportError::Input);
     }
     drop(reader);
-    let prepared =
-        prepare_thumbnail_cancellable(&source, worker_executable, request_id, Some(cancelled))?;
+    let prepared = prepare_rendition_cancellable(
+        &source,
+        worker_executable,
+        request_id,
+        Some(cancelled),
+        purpose,
+        edge,
+        maximum_result,
+    )?;
     Ok(DecodedImage {
         pixels: prepared.display_pixels,
         width: prepared.width,

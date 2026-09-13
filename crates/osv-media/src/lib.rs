@@ -14,7 +14,18 @@ pub const MAX_PIXELS: u64 = 100_000_000;
 pub const MAX_ANIMATION_PIXEL_FRAMES: u64 = 200_000_000;
 pub const MAX_ANIMATION_FRAMES: u32 = 1_000;
 pub const MAX_THUMBNAIL_RESULT_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_VIEWER_RESULT_BYTES: usize = 96 * 1024 * 1024;
 pub const WORKER_RESULT_HEADER_LEN: usize = 48;
+pub const WORKER_REQUEST_HEADER_LEN: usize = 16;
+pub const THUMBNAIL_EDGE: u32 = 512;
+pub const MAX_VIEWER_EDGE: u32 = 4096;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ImagePurpose {
+    Thumbnail = 1,
+    Viewer = 2,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImageFormat {
@@ -64,6 +75,42 @@ pub struct WorkerImageResult {
     pub thumbnail_height: u32,
     pub thumbnail_png_len: u32,
     pub rgba_len: u32,
+    pub purpose: ImagePurpose,
+    pub requested_edge: u32,
+}
+
+pub fn encode_worker_request(purpose: ImagePurpose, edge: u32) -> Result<[u8; 16], ImageError> {
+    if (purpose == ImagePurpose::Thumbnail && edge != THUMBNAIL_EDGE)
+        || (purpose == ImagePurpose::Viewer && !(THUMBNAIL_EDGE..=MAX_VIEWER_EDGE).contains(&edge))
+    {
+        return Err(ImageError::ResourceLimit);
+    }
+    let mut header = [0; WORKER_REQUEST_HEADER_LEN];
+    header[..8].copy_from_slice(b"OSVREQ1\0");
+    header[8] = purpose as u8;
+    header[12..16].copy_from_slice(&edge.to_le_bytes());
+    Ok(header)
+}
+
+pub fn image_worker_result_from_request(request: &[u8]) -> Result<SecretBytes, ImageError> {
+    if request.len() <= WORKER_REQUEST_HEADER_LEN
+        || &request[..8] != b"OSVREQ1\0"
+        || request[9..12] != [0; 3]
+    {
+        return Err(ImageError::Malformed);
+    }
+    let purpose = match request[8] {
+        1 => ImagePurpose::Thumbnail,
+        2 => ImagePurpose::Viewer,
+        _ => return Err(ImageError::Malformed),
+    };
+    let edge = u32::from_le_bytes(
+        request[12..16]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    encode_worker_request(purpose, edge)?;
+    image_worker_result_for(&request[WORKER_REQUEST_HEADER_LEN..], purpose, edge)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -500,6 +547,14 @@ fn thumbnail_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
 
 /// Fully decodes the input and packages allowlisted facts with a derived PNG.
 pub fn image_worker_result(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError> {
+    image_worker_result_for(bytes, ImagePurpose::Thumbnail, edge)
+}
+
+fn image_worker_result_for(
+    bytes: &[u8],
+    purpose: ImagePurpose,
+    edge: u32,
+) -> Result<SecretBytes, ImageError> {
     let info = probe(bytes)?;
     let thumbnail = thumbnail_png(bytes, edge)?;
     let (thumbnail_width, thumbnail_height) = thumbnail_dimensions(thumbnail.expose())?;
@@ -522,17 +577,24 @@ pub fn image_worker_result(bytes: &[u8], edge: u32) -> Result<SecretBytes, Image
     let total = WORKER_RESULT_HEADER_LEN
         .checked_add(thumbnail.len())
         .and_then(|size| size.checked_add(rgba.len()))
-        .filter(|size| *size <= MAX_THUMBNAIL_RESULT_BYTES)
+        .filter(|size| {
+            *size
+                <= match purpose {
+                    ImagePurpose::Thumbnail => MAX_THUMBNAIL_RESULT_BYTES,
+                    ImagePurpose::Viewer => MAX_VIEWER_RESULT_BYTES,
+                }
+        })
         .ok_or(ImageError::ResourceLimit)?;
     let mut result = SecretBytes::zeroed(total).map_err(|_| ImageError::Decode)?;
     let header = &mut result.expose_mut()[..WORKER_RESULT_HEADER_LEN];
-    header[..8].copy_from_slice(b"OSVIMG2\0");
+    header[..8].copy_from_slice(b"OSVIMG3\0");
     header[8..12].copy_from_slice(&info.width.to_le_bytes());
     header[12..16].copy_from_slice(&info.height.to_le_bytes());
     header[16..20].copy_from_slice(&info.frames.to_le_bytes());
     header[20] = info.format as u8;
     header[21] = info.orientation as u8;
     header[22] = u8::from(info.has_color_profile);
+    header[23] = purpose as u8;
     header[24..28].copy_from_slice(&THUMBNAIL_RECIPE_VERSION.to_le_bytes());
     header[28..32].copy_from_slice(&thumbnail_width.to_le_bytes());
     header[32..36].copy_from_slice(&thumbnail_height.to_le_bytes());
@@ -541,6 +603,7 @@ pub fn image_worker_result(bytes: &[u8], edge: u32) -> Result<SecretBytes, Image
     let rgba_len = u32::try_from(rgba.len()).map_err(|_| ImageError::ResourceLimit)?;
     header[36..40].copy_from_slice(&thumbnail_png_len.to_le_bytes());
     header[40..44].copy_from_slice(&rgba_len.to_le_bytes());
+    header[44..48].copy_from_slice(&edge.to_le_bytes());
     let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
     result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
     result.expose_mut()[png_end..].copy_from_slice(rgba.as_raw());
@@ -548,11 +611,7 @@ pub fn image_worker_result(bytes: &[u8], edge: u32) -> Result<SecretBytes, Image
 }
 
 pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, ImageError> {
-    if bytes.len() < WORKER_RESULT_HEADER_LEN
-        || &bytes[..8] != b"OSVIMG2\0"
-        || bytes[23] != 0
-        || bytes[44..48] != [0; 4]
-    {
+    if bytes.len() < WORKER_RESULT_HEADER_LEN || &bytes[..8] != b"OSVIMG3\0" {
         return Err(ImageError::Malformed);
     }
     let format = match bytes[20] {
@@ -573,6 +632,17 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
         7 => Orientation::Rotate270,
         _ => return Err(ImageError::Malformed),
     };
+    let purpose = match bytes[23] {
+        1 => ImagePurpose::Thumbnail,
+        2 => ImagePurpose::Viewer,
+        _ => return Err(ImageError::Malformed),
+    };
+    let requested_edge = u32::from_le_bytes(
+        bytes[44..48]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    encode_worker_request(purpose, requested_edge)?;
     if bytes[22] > 1
         || u32::from_le_bytes(
             bytes[24..28]
@@ -644,6 +714,8 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
             thumbnail_height,
             thumbnail_png_len,
             rgba_len,
+            purpose,
+            requested_edge,
         })
     }
 }
@@ -947,5 +1019,25 @@ mod tests {
                 .width,
             2
         );
+    }
+
+    #[test]
+    fn rendition_request_binds_purpose_and_edge() {
+        let image = encoded_formats().remove(0).1;
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 2048)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&image);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert_eq!(header.purpose, ImagePurpose::Viewer);
+        assert_eq!(header.requested_edge, 2048);
+        request[9] = 1;
+        assert!(matches!(
+            image_worker_result_from_request(&request),
+            Err(ImageError::Malformed)
+        ));
+        assert!(encode_worker_request(ImagePurpose::Thumbnail, 513).is_err());
+        assert!(encode_worker_request(ImagePurpose::Viewer, 4097).is_err());
     }
 }
