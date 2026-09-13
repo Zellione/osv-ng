@@ -1529,12 +1529,20 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Decoded animation-frame representation and controls, deeper
-  color-profile fixtures, and Flatpak interactive display checks remain required
-  before Phase 9 can be marked complete. Third-party decoder working
-  allocations remain subject to the documented opaque-library limitation and
-  the helper's process resource ceiling; protected IPC and broker-owned buffers
-  report their page-lock state explicitly.
+- Deeper malformed/bomb corpus cases, pixel-expected EXIF orientation cases,
+  ICC/sRGB policy fixtures, animated WebP/APNG corpus evidence, hostile animation
+  result tests, result-stream cancellation, and animation cache/lock wipe tests
+  remain required before Phase 9 can be marked complete.
+- Production composition still needs nested gallery presentation and an explicit
+  refresh after a successful import. Regeneration replacement fault/crash tests
+  at the orchestration layer and session close-during-transition lifecycle
+  evidence also remain.
+- Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
+  accessibility interaction evidence, and a fresh GPT-6 adversarial review are
+  still required. Third-party decoder working allocations remain subject to the
+  documented opaque-library limitation and the helper's process resource
+  ceiling; protected IPC and broker-owned buffers report their page-lock state
+  explicitly.
 
 **Deliverables**
 

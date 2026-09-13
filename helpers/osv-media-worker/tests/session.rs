@@ -11,6 +11,28 @@ fn valid_png() -> Vec<u8> {
     encoded
 }
 
+fn animated_gif() -> Vec<u8> {
+    let frames = [
+        image::Frame::from_parts(
+            image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(20, 1),
+        ),
+        image::Frame::from_parts(
+            image::RgbaImage::from_pixel(3, 2, image::Rgba([4, 5, 6, 255])),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(50, 1),
+        ),
+    ];
+    let mut encoded = Vec::new();
+    image::codecs::gif::GifEncoder::new(&mut encoded)
+        .encode_frames(frames)
+        .unwrap();
+    encoded
+}
+
 #[test]
 fn media_worker_completes_a_bounded_stream_under_sandbox() {
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_osv-media-worker"));
@@ -37,6 +59,35 @@ fn media_worker_completes_a_bounded_stream_under_sandbox() {
     let probe = osv_media::decode_worker_result_header(first).unwrap();
     assert_eq!((probe.source.width, probe.source.height), (2, 3));
     assert_eq!((probe.thumbnail_width, probe.thumbnail_height), (2, 3));
+}
+
+#[test]
+fn media_worker_streams_bounded_animation_frames() {
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_osv-media-worker"));
+    let mut worker = osv_media::spawn_worker(executable, 44, SupervisorLimits::default()).unwrap();
+    let request = osv_media::encode_worker_request(osv_media::ImagePurpose::Viewer, 512).unwrap();
+    let mut request_buffer = PlaintextBuffer::zeroed(request.len()).unwrap();
+    request_buffer.as_mut_slice().copy_from_slice(&request);
+    worker.send_authenticated(0, request_buffer).unwrap();
+    let animation = animated_gif();
+    let mut input = PlaintextBuffer::zeroed(animation.len()).unwrap();
+    input.as_mut_slice().copy_from_slice(&animation);
+    worker.send_authenticated(1, input).unwrap();
+    let (class, output) = worker
+        .finish_with_output(osv_media::MAX_VIEWER_RESULT_BYTES)
+        .unwrap();
+    assert_eq!(class, ExitClass::Success);
+    let header = osv_media::decode_worker_result_header(output.chunks().next().unwrap()).unwrap();
+    assert_eq!(header.output_frames, 2);
+    assert_eq!(header.first_delay_ms, 20);
+    assert_eq!(header.additional_frames_len, 28);
+    assert_eq!(
+        output.logical_len(),
+        osv_media::WORKER_RESULT_HEADER_LEN
+            + header.thumbnail_png_len as usize
+            + header.rgba_len as usize
+            + header.additional_frames_len as usize
+    );
 }
 
 #[test]
