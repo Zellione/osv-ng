@@ -748,6 +748,9 @@ impl ViewerState {
             self.frame = (self.frame + 1) % self.frames
         }
     }
+    pub fn step_forward(&mut self) {
+        self.frame = (self.frame + 1) % self.frames
+    }
     #[must_use]
     pub const fn zoom(&self) -> f64 {
         self.zoom
@@ -755,6 +758,10 @@ impl ViewerState {
     #[must_use]
     pub const fn rotation(&self) -> u16 {
         self.rotation
+    }
+    #[must_use]
+    pub const fn pan(&self) -> (f64, f64) {
+        (self.pan_x, self.pan_y)
     }
     #[must_use]
     pub const fn frame(&self) -> u32 {
@@ -918,7 +925,11 @@ mod tests {
         v.advance();
         assert_eq!((v.zoom(), v.rotation(), v.frame()), (64.0, 90, 1));
         v.toggle_animation();
-        assert!(!v.playing())
+        assert!(!v.playing());
+        v.step_forward();
+        assert_eq!(v.frame(), 0);
+        v.pan_by(12.0, -7.0);
+        assert_eq!(v.pan(), (12.0, -7.0));
     }
 
     #[test]
