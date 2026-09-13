@@ -1507,6 +1507,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   frame-step controls plus Space/period shortcuts. Both lock paths synchronously
   clear the current paintable and the complete animation texture registry; the
   continuing UI timer retains only the emptied registry rather than frame data.
+- The serial session publishes a monotonic catalog revision after successful
+  import or derived regeneration. Production composition observes that revision
+  and reruns its bounded image query, so newly imported and regenerated items
+  appear without synthetic state or an unrelated maintenance trigger.
 
 **Verification**
 
@@ -1533,8 +1537,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   ICC/sRGB policy fixtures, animated WebP/APNG corpus evidence, hostile animation
   result tests, result-stream cancellation, and animation cache/lock wipe tests
   remain required before Phase 9 can be marked complete.
-- Production composition still needs nested gallery presentation and an explicit
-  refresh after a successful import. Regeneration replacement fault/crash tests
+- Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
   at the orchestration layer and session close-during-transition lifecycle
   evidence also remain.
 - Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and

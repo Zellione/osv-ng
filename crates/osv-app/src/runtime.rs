@@ -141,6 +141,7 @@ pub struct VaultSession {
     ready: mpsc::Receiver<Result<(), RuntimeError>>,
     cancelled: Arc<AtomicBool>,
     maintenance: Arc<Mutex<MaintenanceStatus>>,
+    catalog_revision: Arc<AtomicU64>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -160,6 +161,8 @@ impl VaultSession {
         let worker_cancelled = Arc::clone(&cancelled);
         let maintenance = Arc::new(Mutex::new(MaintenanceStatus::default()));
         let worker_maintenance = Arc::clone(&maintenance);
+        let catalog_revision = Arc::new(AtomicU64::new(0));
+        let worker_catalog_revision = Arc::clone(&catalog_revision);
         let thread = thread::spawn(move || {
             let password = match Password::take(&mut password_bytes) {
                 Ok(password) => password,
@@ -231,6 +234,7 @@ impl VaultSession {
                         status.running = false;
                         if result.is_ok() {
                             status.completed = status.completed.saturating_add(1);
+                            worker_catalog_revision.fetch_add(1, Ordering::Release);
                         } else if !worker_cancelled.load(Ordering::Acquire) {
                             status.failed = status.failed.saturating_add(1);
                         }
@@ -266,6 +270,9 @@ impl VaultSession {
                         let result = pending.take().ok_or(RuntimeError::Input).and_then(
                             |(prepared, name)| commit_import(&mut vault, prepared, name, decision),
                         );
+                        if matches!(result, Ok(Some(_))) {
+                            worker_catalog_revision.fetch_add(1, Ordering::Release);
+                        }
                         let _ = response.send(result);
                     }
                     Command::Close => break,
@@ -279,6 +286,7 @@ impl VaultSession {
             ready,
             cancelled,
             maintenance,
+            catalog_revision,
             thread: Some(thread),
         }
     }
@@ -297,6 +305,11 @@ impl VaultSession {
             },
             |status| *status,
         )
+    }
+
+    #[must_use]
+    pub fn catalog_revision(&self) -> u64 {
+        self.catalog_revision.load(Ordering::Acquire)
     }
 
     pub fn try_ready(&self) -> Option<Result<(), RuntimeError>> {
@@ -592,6 +605,7 @@ mod tests {
         let images = session.list_images().unwrap().recv().unwrap().unwrap();
         assert!(images.is_empty());
         assert_ne!(session.generation(), 0);
+        assert_eq!(session.catalog_revision(), 0);
         assert_eq!(session.maintenance_status(), MaintenanceStatus::default());
         session.revoke();
         if let Ok(receiver) = session.list_images() {
