@@ -120,6 +120,19 @@ pub struct DecodedImage {
     pub width: u32,
     pub height: u32,
     pub frames: u32,
+    pub first_delay_ms: u32,
+    pub additional_frames: Vec<DecodedFrame>,
+}
+
+pub struct DecodedFrame {
+    pub pixels: osv_crypto::SecretBytes,
+    pub delay_ms: u32,
+}
+
+impl std::fmt::Debug for DecodedFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DecodedFrame([REDACTED])")
+    }
 }
 
 impl std::fmt::Debug for DecodedImage {
@@ -134,6 +147,8 @@ struct PreparedThumbnail {
     width: u32,
     height: u32,
     display_pixels: osv_crypto::SecretBytes,
+    first_delay_ms: u32,
+    additional_frames: Vec<DecodedFrame>,
 }
 
 fn prepare_thumbnail_cancellable(
@@ -234,11 +249,37 @@ fn prepare_rendition_cancellable(
     let display_pixels = derived
         .copy_span(osv_media::WORKER_RESULT_HEADER_LEN + png_len, rgba_len)
         .map_err(ImageImportError::Worker)?;
-    if derived.logical_len()
-        != osv_media::WORKER_RESULT_HEADER_LEN
-            .checked_add(png_len)
-            .and_then(|len| len.checked_add(rgba_len))
-            .ok_or(ImageImportError::Input)?
+    let mut offset = osv_media::WORKER_RESULT_HEADER_LEN + png_len + rgba_len;
+    let mut additional_frames = Vec::with_capacity(
+        usize::try_from(worker_result.output_frames.saturating_sub(1))
+            .map_err(|_| ImageImportError::Input)?,
+    );
+    for _ in 1..worker_result.output_frames {
+        let delay = derived
+            .copy_span(offset, 4)
+            .map_err(ImageImportError::Worker)?;
+        let delay_ms = u32::from_le_bytes(
+            delay
+                .expose()
+                .try_into()
+                .map_err(|_| ImageImportError::Input)?,
+        );
+        if !(10..=60_000).contains(&delay_ms) {
+            return Err(ImageImportError::Input);
+        }
+        offset = offset.checked_add(4).ok_or(ImageImportError::Input)?;
+        let pixels = derived
+            .copy_span(offset, rgba_len)
+            .map_err(ImageImportError::Worker)?;
+        offset = offset
+            .checked_add(rgba_len)
+            .ok_or(ImageImportError::Input)?;
+        additional_frames.push(DecodedFrame { pixels, delay_ms });
+    }
+    if derived.logical_len() != offset
+        || usize::try_from(worker_result.additional_frames_len)
+            .map_err(|_| ImageImportError::Input)?
+            != offset - (osv_media::WORKER_RESULT_HEADER_LEN + png_len + rgba_len)
     {
         return Err(ImageImportError::Input);
     }
@@ -256,6 +297,8 @@ fn prepare_rendition_cancellable(
         width: worker_result.thumbnail_width,
         height: worker_result.thumbnail_height,
         display_pixels,
+        first_delay_ms: worker_result.first_delay_ms,
+        additional_frames,
     })
 }
 
@@ -502,12 +545,21 @@ fn decode_image_object_for(
         edge,
         maximum_result,
     )?;
+    let frames = worker_result_count(&prepared);
     Ok(DecodedImage {
         pixels: prepared.display_pixels,
         width: prepared.width,
         height: prepared.height,
-        frames: prepared.probe.frames,
+        frames,
+        first_delay_ms: prepared.first_delay_ms,
+        additional_frames: prepared.additional_frames,
     })
+}
+
+fn worker_result_count(prepared: &PreparedThumbnail) -> u32 {
+    u32::try_from(prepared.additional_frames.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
 impl ImportPreview {

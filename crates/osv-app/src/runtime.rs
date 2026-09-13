@@ -71,6 +71,8 @@ pub struct OpenedImage {
     pub width: u32,
     pub height: u32,
     pub frames: u32,
+    pub first_delay_ms: u32,
+    pub additional_frames: Vec<osv_import::DecodedFrame>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -90,6 +92,7 @@ impl std::fmt::Debug for OpenedImage {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("frames", &self.frames)
+            .field("additional_frames", &"[REDACTED]")
             .finish()
     }
 }
@@ -463,6 +466,8 @@ fn open_thumbnail(
         width: decoded.width,
         height: decoded.height,
         frames: decoded.frames,
+        first_delay_ms: decoded.first_delay_ms,
+        additional_frames: decoded.additional_frames,
     })
 }
 
@@ -492,6 +497,8 @@ fn open_viewer(
         width: decoded.width,
         height: decoded.height,
         frames: decoded.frames,
+        first_delay_ms: decoded.first_delay_ms,
+        additional_frames: decoded.additional_frames,
     })
 }
 

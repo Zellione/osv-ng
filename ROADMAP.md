@@ -1497,6 +1497,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   cumulative protected-pixel ceiling. A genuine two-frame GIF regression
   verifies composited RGBA pixels and timing. Frame IPC and playback remain
   follow-up work, so animated display is not yet claimed.
+- Extended the purpose-bound helper result to version 4 for viewer animation.
+  The first plane carries validated timing and subsequent records carry a
+  bounded delay plus exact full-canvas RGBA bytes. The broker independently
+  validates frame count, timing, per-plane length, aggregate length, and result
+  purpose before copying every plane into protected storage. GTK playback and
+  explicit controls remain follow-up work.
 
 **Verification**
 

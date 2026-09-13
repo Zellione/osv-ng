@@ -15,7 +15,7 @@ pub const MAX_ANIMATION_PIXEL_FRAMES: u64 = 200_000_000;
 pub const MAX_ANIMATION_FRAMES: u32 = 1_000;
 pub const MAX_THUMBNAIL_RESULT_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_VIEWER_RESULT_BYTES: usize = 96 * 1024 * 1024;
-pub const WORKER_RESULT_HEADER_LEN: usize = 48;
+pub const WORKER_RESULT_HEADER_LEN: usize = 64;
 pub const WORKER_REQUEST_HEADER_LEN: usize = 16;
 pub const THUMBNAIL_EDGE: u32 = 512;
 pub const MAX_VIEWER_EDGE: u32 = 4096;
@@ -77,6 +77,9 @@ pub struct WorkerImageResult {
     pub rgba_len: u32,
     pub purpose: ImagePurpose,
     pub requested_edge: u32,
+    pub output_frames: u32,
+    pub first_delay_ms: u32,
+    pub additional_frames_len: u32,
 }
 
 pub fn encode_worker_request(purpose: ImagePurpose, edge: u32) -> Result<[u8; 16], ImageError> {
@@ -669,9 +672,34 @@ fn image_worker_result_for(
     if rgba.len() != expected_rgba_len {
         return Err(ImageError::Decode);
     }
+    let animation = if purpose == ImagePurpose::Viewer && info.frames > 1 {
+        animation_frames(bytes, edge)?
+    } else {
+        Vec::new()
+    };
+    let output_frames = if animation.is_empty() {
+        1
+    } else {
+        animation.len()
+    };
+    let first_delay_ms = animation.first().map_or(0, |frame| frame.delay_ms);
+    let mut additional_frames_len = 0usize;
+    for frame in animation.iter().skip(1) {
+        if frame.width != thumbnail_width
+            || frame.height != thumbnail_height
+            || frame.pixels.len() != expected_rgba_len
+        {
+            return Err(ImageError::Malformed);
+        }
+        additional_frames_len = additional_frames_len
+            .checked_add(4)
+            .and_then(|length| length.checked_add(frame.pixels.len()))
+            .ok_or(ImageError::ResourceLimit)?;
+    }
     let total = WORKER_RESULT_HEADER_LEN
         .checked_add(thumbnail.len())
         .and_then(|size| size.checked_add(rgba.len()))
+        .and_then(|size| size.checked_add(additional_frames_len))
         .filter(|size| {
             *size
                 <= match purpose {
@@ -682,7 +710,7 @@ fn image_worker_result_for(
         .ok_or(ImageError::ResourceLimit)?;
     let mut result = SecretBytes::zeroed(total).map_err(|_| ImageError::Decode)?;
     let header = &mut result.expose_mut()[..WORKER_RESULT_HEADER_LEN];
-    header[..8].copy_from_slice(b"OSVIMG3\0");
+    header[..8].copy_from_slice(b"OSVIMG4\0");
     header[8..12].copy_from_slice(&info.width.to_le_bytes());
     header[12..16].copy_from_slice(&info.height.to_le_bytes());
     header[16..20].copy_from_slice(&info.frames.to_le_bytes());
@@ -699,14 +727,36 @@ fn image_worker_result_for(
     header[36..40].copy_from_slice(&thumbnail_png_len.to_le_bytes());
     header[40..44].copy_from_slice(&rgba_len.to_le_bytes());
     header[44..48].copy_from_slice(&edge.to_le_bytes());
+    header[48..52].copy_from_slice(
+        &u32::try_from(output_frames)
+            .map_err(|_| ImageError::ResourceLimit)?
+            .to_le_bytes(),
+    );
+    header[52..56].copy_from_slice(&first_delay_ms.to_le_bytes());
+    header[56..60].copy_from_slice(
+        &u32::try_from(additional_frames_len)
+            .map_err(|_| ImageError::ResourceLimit)?
+            .to_le_bytes(),
+    );
     let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
     result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
-    result.expose_mut()[png_end..].copy_from_slice(rgba.as_raw());
+    result.expose_mut()[png_end..png_end + rgba.len()].copy_from_slice(rgba.as_raw());
+    let mut offset = png_end + rgba.len();
+    for frame in animation.iter().skip(1) {
+        result.expose_mut()[offset..offset + 4].copy_from_slice(&frame.delay_ms.to_le_bytes());
+        offset += 4;
+        result.expose_mut()[offset..offset + frame.pixels.len()]
+            .copy_from_slice(frame.pixels.expose());
+        offset += frame.pixels.len();
+    }
     Ok(result)
 }
 
 pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, ImageError> {
-    if bytes.len() < WORKER_RESULT_HEADER_LEN || &bytes[..8] != b"OSVIMG3\0" {
+    if bytes.len() < WORKER_RESULT_HEADER_LEN
+        || &bytes[..8] != b"OSVIMG4\0"
+        || bytes[60..64] != [0; 4]
+    {
         return Err(ImageError::Malformed);
     }
     let format = match bytes[20] {
@@ -790,6 +840,25 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
         .checked_mul(thumbnail_height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(ImageError::ResourceLimit)?;
+    let output_frames = u32::from_le_bytes(
+        bytes[48..52]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let first_delay_ms = u32::from_le_bytes(
+        bytes[52..56]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let additional_frames_len = u32::from_le_bytes(
+        bytes[56..60]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let expected_additional = output_frames
+        .checked_sub(1)
+        .and_then(|frames| frames.checked_mul(rgba_len.checked_add(4)?))
+        .ok_or(ImageError::ResourceLimit)?;
     if info.width == 0
         || info.height == 0
         || info.frames == 0
@@ -800,6 +869,11 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
         || thumbnail_height > 4096
         || thumbnail_png_len == 0
         || rgba_len != expected_rgba_len
+        || output_frames == 0
+        || output_frames > info.frames
+        || additional_frames_len != expected_additional
+        || (output_frames == 1 && first_delay_ms != 0)
+        || (output_frames > 1 && !(10..=60_000).contains(&first_delay_ms))
     {
         Err(ImageError::ResourceLimit)
     } else {
@@ -811,6 +885,9 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
             rgba_len,
             purpose,
             requested_edge,
+            output_frames,
+            first_delay_ms,
+            additional_frames_len,
         })
     }
 }
@@ -1154,5 +1231,22 @@ mod tests {
         assert_eq!((decoded[0].delay_ms, decoded[1].delay_ms), (20, 50));
         assert_eq!(decoded[0].pixels.expose()[..4], [1, 2, 3, 255]);
         assert!(!format!("{decoded:?}").contains("1, 2, 3"));
+
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert_eq!(header.output_frames, 2);
+        assert_eq!(header.first_delay_ms, 20);
+        assert_eq!(header.additional_frames_len, 4 + 3 * 2 * 4);
+        assert_eq!(
+            result.len(),
+            WORKER_RESULT_HEADER_LEN
+                + usize::try_from(header.thumbnail_png_len).unwrap()
+                + usize::try_from(header.rgba_len).unwrap()
+                + usize::try_from(header.additional_frames_len).unwrap()
+        );
     }
 }
