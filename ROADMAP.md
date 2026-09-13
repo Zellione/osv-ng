@@ -1511,6 +1511,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   import or derived regeneration. Production composition observes that revision
   and reruns its bounded image query, so newly imported and regenerated items
   appear without synthetic state or an unrelated maintenance trigger.
+- Added cancellation inside the supervisor's result receive loop. Cancellation
+  between authenticated output chunks revokes and reaps the helper, discards all
+  accumulated protected output, and is translated to a cancelled image task.
+  Hostile-worker coverage exercises this path under a continuing chunk stream;
+  animation-header mutations cover inflated frame count, invalid timing,
+  inconsistent aggregate size, and nonzero reserved fields.
 
 **Verification**
 
@@ -1534,8 +1540,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 **Deviations and follow-up**
 
 - Deeper malformed/bomb corpus cases, pixel-expected EXIF orientation cases,
-  ICC/sRGB policy fixtures, animated WebP/APNG corpus evidence, hostile animation
-  result tests, result-stream cancellation, and animation cache/lock wipe tests
+  ICC/sRGB policy fixtures, animated WebP/APNG corpus evidence, and animation
+  cache/lock wipe tests
   remain required before Phase 9 can be marked complete.
 - Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
   at the orchestration layer and session close-during-transition lifecycle

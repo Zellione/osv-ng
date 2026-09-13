@@ -1249,4 +1249,42 @@ mod tests {
                 + usize::try_from(header.additional_frames_len).unwrap()
         );
     }
+
+    #[test]
+    fn hostile_animation_result_headers_fail_closed() {
+        let frames = [
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(20, 1),
+            ),
+            image::Frame::from_parts(
+                image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 255])),
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(30, 1),
+            ),
+        ];
+        let mut encoded = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut encoded)
+            .encode_frames(frames)
+            .unwrap();
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let valid = image_worker_result_from_request(&request).unwrap();
+        for mutate in [
+            (48usize, [3, 0, 0, 0]),
+            (52, [0, 0, 0, 0]),
+            (56, [1, 0, 0, 0]),
+            (60, [1, 0, 0, 0]),
+        ] {
+            let mut hostile = valid.expose().to_vec();
+            hostile[mutate.0..mutate.0 + 4].copy_from_slice(&mutate.1);
+            assert!(decode_worker_result_header(&hostile).is_err());
+            hostile.zeroize();
+        }
+    }
 }

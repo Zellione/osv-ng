@@ -233,6 +233,26 @@ fn run_hostile_worker() {
                 });
             }
         }
+        11 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            handshake(&mut channel, &hello);
+            let _ = channel.receive().unwrap();
+            for sequence in 0..osv_worker_protocol::MAX_RESULT_CHUNKS {
+                if channel
+                    .send(&Frame {
+                        request_id: hello.request_id,
+                        message: Message::ResultData {
+                            sequence,
+                            bytes: osv_crypto::SecretBytes::new(&[0x5a; 1024]).unwrap(),
+                        },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         _ => std::process::exit(64),
     }
 }

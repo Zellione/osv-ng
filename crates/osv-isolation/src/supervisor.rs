@@ -8,6 +8,7 @@ use std::{
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -337,6 +338,22 @@ impl Supervisor {
         &mut self,
         maximum_output: usize,
     ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
+        self.finish_with_output_inner(maximum_output, None)
+    }
+
+    pub fn finish_with_output_cancellable(
+        &mut self,
+        maximum_output: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
+        self.finish_with_output_inner(maximum_output, Some(cancelled))
+    }
+
+    fn finish_with_output_inner(
+        &mut self,
+        maximum_output: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
         self.refresh_operation_timeout()?;
         let chunks = match self.machine.state() {
             BrokerState::Streaming { next_sequence } => next_sequence,
@@ -365,6 +382,18 @@ impl Supervisor {
         let mut output_chunks = 0u64;
         let mut failure_class = None;
         let response_class = loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                let class = self.cancel();
+                return Ok((
+                    class,
+                    WorkerOutput {
+                        chunks: Vec::new(),
+                        logical_len: 0,
+                        lock_status: self.lock_status(),
+                        failure_class: None,
+                    },
+                ));
+            }
             let (result, receive_status) = self
                 .channel
                 .receive()

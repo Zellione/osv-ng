@@ -225,9 +225,15 @@ fn prepare_rendition_cancellable(
         worker.cancel();
         return Err(ImageImportError::Cancelled);
     }
-    let (class, derived) = worker
-        .finish_with_output(maximum_result)
-        .map_err(ImageImportError::Worker)?;
+    let result = if let Some(cancelled) = cancelled {
+        worker.finish_with_output_cancellable(maximum_result, cancelled)
+    } else {
+        worker.finish_with_output(maximum_result)
+    };
+    let (class, derived) = result.map_err(ImageImportError::Worker)?;
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(ImageImportError::Cancelled);
+    }
     if class != osv_isolation::ExitClass::Success {
         return Err(ImageImportError::Input);
     }

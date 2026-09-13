@@ -245,6 +245,29 @@ fn hostile_result_sequence_and_chunk_flood_fail_closed() {
 }
 
 #[test]
+fn cancellation_during_result_streaming_revokes_and_discards_output() {
+    let _guard = TEST_PROCESSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut worker = Supervisor::spawn(fixture(), Role::Media, 11, limits()).unwrap();
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trigger = std::sync::Arc::clone(&cancelled);
+    let setter = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(10));
+        trigger.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let started = std::time::Instant::now();
+    let (class, output) = worker
+        .finish_with_output_cancellable(16 * 1024 * 1024, &cancelled)
+        .unwrap();
+    setter.join().unwrap();
+    assert!(matches!(class, ExitClass::Success | ExitClass::Deadline));
+    assert_eq!(output.logical_len(), 0);
+    assert!(output.chunks().next().is_none());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
 fn sandbox_denies_path_mutation_with_and_without_landlock() {
     if address_sanitizer_active() {
         return;
