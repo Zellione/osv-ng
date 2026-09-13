@@ -1,8 +1,10 @@
 use crate::{FramedChannel, PlaintextBuffer, TransportError};
+use osv_crypto::SecretBytes;
 use osv_worker_protocol::{BrokerMachine, BrokerState, Frame, Message, Role, VERSION};
 use std::{
     error::Error,
-    fmt, io,
+    fmt,
+    io::{self, Read},
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
@@ -87,6 +89,101 @@ pub struct Supervisor {
     request_id: u64,
     operation_deadline: Instant,
     lock_status: osv_crypto::LockStatus,
+}
+
+pub struct WorkerOutput {
+    chunks: Vec<SecretBytes>,
+    logical_len: usize,
+    lock_status: osv_crypto::LockStatus,
+    failure_class: Option<osv_worker_protocol::FailureClass>,
+}
+
+impl WorkerOutput {
+    pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(SecretBytes::expose)
+    }
+    #[must_use]
+    pub const fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+    #[must_use]
+    pub const fn lock_status(&self) -> osv_crypto::LockStatus {
+        self.lock_status
+    }
+    #[must_use]
+    pub const fn failure_class(&self) -> Option<osv_worker_protocol::FailureClass> {
+        self.failure_class
+    }
+
+    pub fn body(&self, skip: usize) -> Result<WorkerOutputReader<'_>, SupervisorError> {
+        if skip > self.logical_len {
+            return Err(protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            ));
+        }
+        Ok(WorkerOutputReader {
+            output: self,
+            position: skip,
+        })
+    }
+
+    pub fn copy_range(&self, skip: usize) -> Result<SecretBytes, SupervisorError> {
+        let length = self.logical_len.checked_sub(skip).ok_or_else(|| {
+            protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            )
+        })?;
+        self.copy_span(skip, length)
+    }
+
+    pub fn copy_span(&self, skip: usize, length: usize) -> Result<SecretBytes, SupervisorError> {
+        if skip
+            .checked_add(length)
+            .is_none_or(|end| end > self.logical_len)
+        {
+            return Err(protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            ));
+        }
+        let mut copied = SecretBytes::zeroed(length)
+            .map_err(|_| protocol(osv_worker_protocol::ProtocolError::Memory, self.lock_status))?;
+        let mut reader = self.body(skip)?;
+        reader.read_exact(copied.expose_mut()).map_err(|error| {
+            let mut failure = SupervisorError::new(ExitClass::Protocol, error);
+            failure.lock_status = self.lock_status.combine(copied.lock_status());
+            failure
+        })?;
+        Ok(copied)
+    }
+}
+
+pub struct WorkerOutputReader<'a> {
+    output: &'a WorkerOutput,
+    position: usize,
+}
+
+impl io::Read for WorkerOutputReader<'_> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if target.is_empty() || self.position == self.output.logical_len {
+            return Ok(0);
+        }
+        let mut base = 0usize;
+        for chunk in &self.output.chunks {
+            let end = base + chunk.len();
+            if self.position < end {
+                let offset = self.position - base;
+                let copied = target.len().min(chunk.len() - offset);
+                target[..copied].copy_from_slice(&chunk.expose()[offset..offset + copied]);
+                self.position += copied;
+                return Ok(copied);
+            }
+            base = end;
+        }
+        Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
 }
 
 impl Supervisor {
@@ -233,6 +330,13 @@ impl Supervisor {
     }
 
     pub fn finish(&mut self) -> Result<ExitClass, SupervisorError> {
+        self.finish_with_output(0).map(|(class, _)| class)
+    }
+
+    pub fn finish_with_output(
+        &mut self,
+        maximum_output: usize,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
         self.refresh_operation_timeout()?;
         let chunks = match self.machine.state() {
             BrokerState::Streaming { next_sequence } => next_sequence,
@@ -256,30 +360,77 @@ impl Supervisor {
                 .send(&end)
                 .map_err(|error| transport(error, self.lock_status()))?,
         );
-        let (result, receive_status) = self
-            .channel
-            .receive()
-            .map_err(|error| transport(error, self.lock_status()))?;
-        self.lock_status = self.lock_status.combine(receive_status);
-        self.machine
-            .received(&result)
-            .map_err(|error| protocol(error, self.lock_status()))?;
-        let response_class = match result.message {
-            Message::Complete { page_locks } => {
-                self.lock_status = self.lock_status.combine(page_locks);
-                ExitClass::Success
+        let mut output = Vec::new();
+        let mut output_len = 0usize;
+        let mut output_chunks = 0u64;
+        let mut failure_class = None;
+        let response_class = loop {
+            let (result, receive_status) = self
+                .channel
+                .receive()
+                .map_err(|error| transport(error, self.lock_status()))?;
+            self.lock_status = self.lock_status.combine(receive_status);
+            self.machine
+                .received(&result)
+                .map_err(|error| protocol(error, self.lock_status()))?;
+            match result.message {
+                Message::ResultData { bytes, .. } => {
+                    output_chunks = output_chunks
+                        .checked_add(1)
+                        .filter(|count| *count <= osv_worker_protocol::MAX_RESULT_CHUNKS)
+                        .ok_or_else(|| {
+                            protocol(
+                                osv_worker_protocol::ProtocolError::Oversized,
+                                self.lock_status(),
+                            )
+                        })?;
+                    output_len = output_len
+                        .checked_add(bytes.len())
+                        .filter(|len| *len <= maximum_output)
+                        .ok_or_else(|| {
+                            protocol(
+                                osv_worker_protocol::ProtocolError::Oversized,
+                                self.lock_status(),
+                            )
+                        })?;
+                    self.lock_status = self.lock_status.combine(bytes.lock_status());
+                    output.push(bytes);
+                }
+                Message::ResultEnd { .. } => {}
+                Message::Complete { page_locks } => {
+                    self.lock_status = self.lock_status.combine(page_locks);
+                    break ExitClass::Success;
+                }
+                Message::Failed { class, page_locks } => {
+                    failure_class = Some(class);
+                    self.lock_status = self.lock_status.combine(page_locks);
+                    break ExitClass::WorkerFailure;
+                }
+                _ => break ExitClass::Protocol,
             }
-            Message::Failed { page_locks, .. } => {
-                self.lock_status = self.lock_status.combine(page_locks);
-                ExitClass::WorkerFailure
-            }
-            _ => ExitClass::Protocol,
         };
         let status = self.wait_for_exit()?;
         if response_class == ExitClass::Success {
-            Ok(classify_status(status))
+            let class = classify_status(status);
+            Ok((
+                class,
+                WorkerOutput {
+                    chunks: output,
+                    logical_len: output_len,
+                    lock_status: self.lock_status(),
+                    failure_class,
+                },
+            ))
         } else {
-            Ok(response_class)
+            Ok((
+                response_class,
+                WorkerOutput {
+                    chunks: output,
+                    logical_len: output_len,
+                    lock_status: self.lock_status(),
+                    failure_class,
+                },
+            ))
         }
     }
 

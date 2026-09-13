@@ -1423,6 +1423,80 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
+**Status (2026-09-13): In progress**
+
+**Delivered scope**
+
+- Added allocation-free preliminary PNG, JPEG, GIF, and extended-WebP probing with MIME
+  identification, dimensions, animation frame counts, JPEG EXIF orientation,
+  and an allowlist-only color-profile presence flag. Encoded size, dimensions,
+  canvas pixels, cumulative canvas pixel-frames, animation frames, and worker
+  chunk counts are rejected before decoder allocation. Per-frame geometry and
+  full structural validation remain follow-up work below.
+- The media helper now retains authenticated IPC chunks only in protected,
+  wipe-on-drop storage, validates the reconstructed object under the existing
+  seccomp/resource/descriptor sandbox, and reports malformed and resource-limit
+  failures without accepting a path, key, or vault-directory descriptor.
+- Added bounded, pure-Rust image decoding and PNG thumbnail generation with a
+  versioned recipe. EXIF orientation is applied before scaling and the encoder's
+  application-owned output is wiped after transfer to protected storage. Added
+  conservatively allocation-bounded protected caches and UI-independent bounded
+  zoom, pan, rotation, animation pause, and frame-advance state.
+- Added SHA-256 import previews and an explicit duplicate state machine: an
+  existing fingerprint cannot proceed until Skip or Import Another Copy is
+  selected. Fingerprint existence is queried only inside the encrypted catalog.
+- Versioned IPC now streams bounded protected worker results back to the broker.
+  The image coordinator publishes the original durably, then publishes the
+  thumbnail as an independently encrypted derived object through the existing
+  crash-safe catalog transition. Neither helper nor decoder receives a path,
+  vault key, or vault-directory descriptor.
+- The worker-result contract carries actual derived dimensions, caps both total
+  bytes and chunk count, and requires broker-side PNG structure, CRC, recipe,
+  and dimension validation before publication. Checked conversions keep the
+  import protocol correct on 32-bit targets.
+- Added an encrypted-catalog query for missing/stale recipes and regeneration
+  from an authenticated original. Regeneration failure happens before
+  publication; successful replacement retains the existing crash-safe
+  durable-object-before-catalog transition.
+- Decoder features are exactly pinned to PNG, JPEG, GIF, and WebP. ADR 0011
+  records the pure-Rust helper decision, opaque decoder-allocation limitation,
+  and the initial sRGB-assumed/no-profile-transform display policy.
+- The production GTK shell now retains portal-returned `gio::File` authority,
+  creates/unlocks a real writer `VaultService` on a serial background owner,
+  and performs isolated prepare/explicit confirm/atomic commit without blocking
+  GTK. Duplicate previews expose only allowlisted display facts and require Skip
+  or Import Another Copy. The helper returns a bounded RGBA display plane beside
+  the durable PNG; GTK constructs a memory texture without invoking an image
+  decoder, and lock revokes the session and drops the paintable.
+
+**Verification**
+
+- Unit and helper-session regressions cover malformed input, oversized pixel
+  geometry, allowlisted probing, duplicate decisions, cache eviction/clear,
+  viewer bounds/animation, authenticated worker streaming, rejection, and
+  cancellation, encrypted original/thumbnail reopen, duplicate blocking, and
+  recursive plaintext-artifact scanning. Genuine PNG/JPEG/GIF/extended-WebP,
+  PNG CRC/truncation, all eight EXIF orientation geometries, missing-derived
+  regeneration, pre-publication worker failure, hostile output sequence, and
+  output chunk flooding are also covered. Workspace formatting and
+  warnings-as-errors Clippy pass. The full serial workspace command again
+  reached the known debug-build isolation-test process interference; both
+  affected isolation library tests pass when run in their documented isolated
+  gate. Dependency audit/policy checks and the Phase 2 Flatpak release build,
+  installed app self-check, and both installed helper hardening checks pass.
+  Background real-vault create/clean-close and pre-cancelled import paths have
+  dedicated regressions.
+
+**Deviations and follow-up**
+
+- Reopened-original viewing, zoom/pan/rotation/media navigation, decoded
+  animation-frame representation and controls, regeneration scheduling, deeper
+  color-profile fixtures, and Flatpak interactive display checks remain required
+  before Phase 9 can be marked complete. Third-party decoder working
+  allocations remain subject to the documented opaque-library limitation and
+  the helper's process resource ceiling; protected IPC and broker-owned buffers
+  report their page-lock state explicitly.
+
 **Deliverables**
 
 - Bounded isolated probe/decode, import preview, duplicate decision UI,

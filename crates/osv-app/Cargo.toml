@@ -15,7 +15,11 @@ osv-domain.workspace = true
 osv-import.workspace = true
 osv-media.workspace = true
 osv-storage.workspace = true
+osv-vault.workspace = true
 zeroize.workspace = true
+
+[dev-dependencies]
+osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }
 
 [lints]
 workspace = true

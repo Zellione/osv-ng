@@ -1,8 +1,771 @@
-//! Media-worker protocol and decoded-media abstractions.
+//! Bounded image probing, derived-image generation, caches, and viewer state.
+//! Parsing and decoding consume bytes only: callers stream already-authenticated
+//! object chunks and never grant a decoder vault paths or key authority.
 
-use std::path::Path;
+use image::{ImageEncoder, ImageReader, codecs::png::PngEncoder};
+use osv_crypto::SecretBytes;
+use std::{collections::VecDeque, error::Error, fmt, path::Path};
+use zeroize::Zeroize;
 
-/// Starts one short-lived, object-scoped media parser.
+pub const THUMBNAIL_RECIPE_VERSION: u32 = 1;
+pub const MAX_ENCODED_BYTES: usize = 256 * 1024 * 1024;
+pub const MAX_DIMENSION: u32 = 65_535;
+pub const MAX_PIXELS: u64 = 100_000_000;
+pub const MAX_ANIMATION_PIXEL_FRAMES: u64 = 200_000_000;
+pub const MAX_ANIMATION_FRAMES: u32 = 1_000;
+pub const MAX_THUMBNAIL_RESULT_BYTES: usize = 16 * 1024 * 1024;
+pub const WORKER_RESULT_HEADER_LEN: usize = 48;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+impl ImageFormat {
+    #[must_use]
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Orientation {
+    Normal,
+    MirrorHorizontal,
+    Rotate180,
+    MirrorVertical,
+    MirrorHorizontalRotate270,
+    Rotate90,
+    MirrorHorizontalRotate90,
+    Rotate270,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageProbe {
+    pub format: ImageFormat,
+    pub width: u32,
+    pub height: u32,
+    pub frames: u32,
+    pub orientation: Orientation,
+    pub has_color_profile: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerImageResult {
+    pub source: ImageProbe,
+    pub thumbnail_width: u32,
+    pub thumbnail_height: u32,
+    pub thumbnail_png_len: u32,
+    pub rgba_len: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ImageError {
+    Unsupported,
+    Malformed,
+    ResourceLimit,
+    Decode,
+}
+impl fmt::Display for ImageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("image input was rejected safely")
+    }
+}
+impl Error for ImageError {}
+
+/// Probes allowlisted metadata without decoder allocation, then applies limits.
+pub fn probe(bytes: &[u8]) -> Result<ImageProbe, ImageError> {
+    if bytes.len() > MAX_ENCODED_BYTES {
+        return Err(ImageError::ResourceLimit);
+    }
+    let info = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        probe_png(bytes)
+    } else if bytes.starts_with(b"\xff\xd8") {
+        probe_jpeg(bytes)
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        probe_gif(bytes)
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        probe_webp(bytes)
+    } else {
+        Err(ImageError::Unsupported)
+    }?;
+    let pixels = u64::from(info.width)
+        .checked_mul(u64::from(info.height))
+        .ok_or(ImageError::ResourceLimit)?;
+    if info.width == 0
+        || info.height == 0
+        || info.width > MAX_DIMENSION
+        || info.height > MAX_DIMENSION
+        || pixels > MAX_PIXELS
+        || pixels
+            .checked_mul(u64::from(info.frames))
+            .is_none_or(|total| total > MAX_ANIMATION_PIXEL_FRAMES)
+        || info.frames == 0
+        || info.frames > MAX_ANIMATION_FRAMES
+    {
+        Err(ImageError::ResourceLimit)
+    } else {
+        Ok(info)
+    }
+}
+fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
+    if b.len() < 33 || &b[12..16] != b"IHDR" {
+        return Err(ImageError::Malformed);
+    }
+    let width = u32::from_be_bytes(b[16..20].try_into().map_err(|_| ImageError::Malformed)?);
+    let height = u32::from_be_bytes(b[20..24].try_into().map_err(|_| ImageError::Malformed)?);
+    let mut p = 8usize;
+    let mut frames = 1;
+    let mut profile = false;
+    let mut saw_idat = false;
+    let mut saw_iend = false;
+    while p.checked_add(12).is_some_and(|x| x <= b.len()) {
+        let n =
+            u32::from_be_bytes(b[p..p + 4].try_into().map_err(|_| ImageError::Malformed)?) as usize;
+        let end = p
+            .checked_add(12)
+            .and_then(|x| x.checked_add(n))
+            .filter(|x| *x <= b.len())
+            .ok_or(ImageError::Malformed)?;
+        let kind = &b[p + 4..p + 8];
+        let expected_crc = u32::from_be_bytes(
+            b[end - 4..end]
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        );
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(kind);
+        crc.update(&b[p + 8..end - 4]);
+        if crc.finalize() != expected_crc {
+            return Err(ImageError::Malformed);
+        }
+        if kind == b"acTL" {
+            if n != 8 {
+                return Err(ImageError::Malformed);
+            }
+            frames = u32::from_be_bytes(
+                b[p + 8..p + 12]
+                    .try_into()
+                    .map_err(|_| ImageError::Malformed)?,
+            )
+        }
+        profile |= matches!(kind, b"iCCP" | b"sRGB" | b"cHRM" | b"gAMA");
+        saw_idat |= kind == b"IDAT";
+        p = end;
+        if kind == b"IEND" {
+            if n != 0 || p != b.len() {
+                return Err(ImageError::Malformed);
+            }
+            saw_iend = true;
+            break;
+        }
+    }
+    if !saw_idat || !saw_iend {
+        return Err(ImageError::Malformed);
+    }
+    Ok(ImageProbe {
+        format: ImageFormat::Png,
+        width,
+        height,
+        frames,
+        orientation: Orientation::Normal,
+        has_color_profile: profile,
+    })
+}
+fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
+    if b.len() < 13 {
+        return Err(ImageError::Malformed);
+    }
+    let width = u16::from_le_bytes([b[6], b[7]]) as u32;
+    let height = u16::from_le_bytes([b[8], b[9]]) as u32;
+    let mut frames = 0u32;
+    let mut p = 13usize;
+    if b[10] & 0x80 != 0 {
+        p = p
+            .checked_add(3 * (1usize << (usize::from(b[10] & 7) + 1)))
+            .ok_or(ImageError::Malformed)?
+    }
+    while p < b.len() {
+        match b[p] {
+            0x2c => {
+                frames = frames.checked_add(1).ok_or(ImageError::ResourceLimit)?;
+                if frames > MAX_ANIMATION_FRAMES {
+                    return Err(ImageError::ResourceLimit);
+                }
+                p = skip_gif_image(b, p, width, height)?
+            }
+            0x21 => {
+                if p + 2 > b.len() {
+                    return Err(ImageError::Malformed);
+                }
+                p = skip_sub_blocks(b, p + 2)?
+            }
+            0x3b => break,
+            _ => return Err(ImageError::Malformed),
+        }
+    }
+    if frames == 0 {
+        return Err(ImageError::Malformed);
+    }
+    Ok(ImageProbe {
+        format: ImageFormat::Gif,
+        width,
+        height,
+        frames,
+        orientation: Orientation::Normal,
+        has_color_profile: false,
+    })
+}
+fn skip_gif_image(
+    b: &[u8],
+    p: usize,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<usize, ImageError> {
+    if p + 10 > b.len() {
+        return Err(ImageError::Malformed);
+    }
+    let left = u32::from(u16::from_le_bytes([b[p + 1], b[p + 2]]));
+    let top = u32::from(u16::from_le_bytes([b[p + 3], b[p + 4]]));
+    let width = u32::from(u16::from_le_bytes([b[p + 5], b[p + 6]]));
+    let height = u32::from(u16::from_le_bytes([b[p + 7], b[p + 8]]));
+    if width == 0
+        || height == 0
+        || left.checked_add(width).is_none_or(|x| x > canvas_width)
+        || top.checked_add(height).is_none_or(|x| x > canvas_height)
+    {
+        return Err(ImageError::ResourceLimit);
+    }
+    let packed = b[p + 9];
+    let mut x = p + 10;
+    if packed & 0x80 != 0 {
+        x = x
+            .checked_add(3 * (1usize << (usize::from(packed & 7) + 1)))
+            .ok_or(ImageError::Malformed)?
+    }
+    if x >= b.len() {
+        return Err(ImageError::Malformed);
+    }
+    skip_sub_blocks(b, x + 1)
+}
+fn skip_sub_blocks(b: &[u8], mut p: usize) -> Result<usize, ImageError> {
+    loop {
+        let n = usize::from(*b.get(p).ok_or(ImageError::Malformed)?);
+        p += 1;
+        if n == 0 {
+            return Ok(p);
+        }
+        p = p
+            .checked_add(n)
+            .filter(|x| *x <= b.len())
+            .ok_or(ImageError::Malformed)?
+    }
+}
+fn probe_jpeg(b: &[u8]) -> Result<ImageProbe, ImageError> {
+    let mut p = 2usize;
+    let mut geometry = None;
+    let mut orientation = Orientation::Normal;
+    let mut profile = false;
+    while p + 4 <= b.len() {
+        if b[p] != 0xff {
+            return Err(ImageError::Malformed);
+        }
+        while p < b.len() && b[p] == 0xff {
+            p += 1
+        }
+        let marker = *b.get(p).ok_or(ImageError::Malformed)?;
+        p += 1;
+        if marker == 0xd9 || marker == 0xda {
+            break;
+        }
+        if matches!(marker, 0x01 | 0xd0..=0xd7) {
+            continue;
+        }
+        let n = u16::from_be_bytes(
+            b.get(p..p + 2)
+                .ok_or(ImageError::Malformed)?
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        ) as usize;
+        if n < 2 || p.checked_add(n).is_none_or(|x| x > b.len()) {
+            return Err(ImageError::Malformed);
+        }
+        let data = &b[p + 2..p + n];
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if data.len() < 5 {
+                return Err(ImageError::Malformed);
+            }
+            geometry = Some((
+                u16::from_be_bytes([data[3], data[4]]) as u32,
+                u16::from_be_bytes([data[1], data[2]]) as u32,
+            ))
+        }
+        if marker == 0xe1 && data.starts_with(b"Exif\0\0") {
+            orientation = parse_exif_orientation(&data[6..]).unwrap_or(Orientation::Normal)
+        }
+        profile |= marker == 0xe2 && data.starts_with(b"ICC_PROFILE\0");
+        p += n
+    }
+    let (width, height) = geometry.ok_or(ImageError::Malformed)?;
+    Ok(ImageProbe {
+        format: ImageFormat::Jpeg,
+        width,
+        height,
+        frames: 1,
+        orientation,
+        has_color_profile: profile,
+    })
+}
+fn parse_exif_orientation(t: &[u8]) -> Option<Orientation> {
+    if t.len() < 8 {
+        return None;
+    }
+    let le = match &t[..2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return None,
+    };
+    let u16at = |p| {
+        let a: [u8; 2] = t.get(p..p + 2)?.try_into().ok()?;
+        Some(if le {
+            u16::from_le_bytes(a)
+        } else {
+            u16::from_be_bytes(a)
+        })
+    };
+    let u32at = |p| {
+        let a: [u8; 4] = t.get(p..p + 4)?.try_into().ok()?;
+        Some(if le {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        })
+    };
+    if u16at(2)? != 42 {
+        return None;
+    }
+    let base = usize::try_from(u32at(4)?).ok()?;
+    for x in 0..usize::from(u16at(base)?) {
+        let p = base + 2 + x * 12;
+        if u16at(p)? == 0x112 && u16at(p + 2)? == 3 && u32at(p + 4)? == 1 {
+            return match u16at(p + 8)? {
+                1 => Some(Orientation::Normal),
+                2 => Some(Orientation::MirrorHorizontal),
+                3 => Some(Orientation::Rotate180),
+                4 => Some(Orientation::MirrorVertical),
+                5 => Some(Orientation::MirrorHorizontalRotate270),
+                6 => Some(Orientation::Rotate90),
+                7 => Some(Orientation::MirrorHorizontalRotate90),
+                8 => Some(Orientation::Rotate270),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+fn probe_webp(b: &[u8]) -> Result<ImageProbe, ImageError> {
+    if b.len() < 30 || &b[12..16] != b"VP8X" {
+        return Err(ImageError::Unsupported);
+    }
+    let flags = b[20];
+    let width = 1 + u32::from_le_bytes([b[24], b[25], b[26], 0]);
+    let height = 1 + u32::from_le_bytes([b[27], b[28], b[29], 0]);
+    let frames = if flags & 2 != 0 {
+        count_webp_frames(b, width, height)?
+    } else {
+        1
+    };
+    Ok(ImageProbe {
+        format: ImageFormat::Webp,
+        width,
+        height,
+        frames,
+        orientation: Orientation::Normal,
+        has_color_profile: flags & 0x20 != 0,
+    })
+}
+fn count_webp_frames(b: &[u8], canvas_width: u32, canvas_height: u32) -> Result<u32, ImageError> {
+    let mut p = 12usize;
+    let mut count = 0u32;
+    while p + 8 <= b.len() {
+        let n = u32::from_le_bytes(
+            b[p + 4..p + 8]
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        ) as usize;
+        let chunk_end = p
+            .checked_add(8 + n + (n & 1))
+            .filter(|end| *end <= b.len())
+            .ok_or(ImageError::Malformed)?;
+        if &b[p..p + 4] == b"ANMF" {
+            if n < 16 {
+                return Err(ImageError::Malformed);
+            }
+            let data = &b[p + 8..p + 8 + n];
+            let x = 2 * u32::from_le_bytes([data[0], data[1], data[2], 0]);
+            let y = 2 * u32::from_le_bytes([data[3], data[4], data[5], 0]);
+            let width = 1 + u32::from_le_bytes([data[6], data[7], data[8], 0]);
+            let height = 1 + u32::from_le_bytes([data[9], data[10], data[11], 0]);
+            if x.checked_add(width).is_none_or(|end| end > canvas_width)
+                || y.checked_add(height).is_none_or(|end| end > canvas_height)
+            {
+                return Err(ImageError::ResourceLimit);
+            }
+            count = count.checked_add(1).ok_or(ImageError::ResourceLimit)?
+        }
+        p = chunk_end;
+    }
+    if count == 0 {
+        Err(ImageError::Malformed)
+    } else {
+        Ok(count)
+    }
+}
+
+/// Produces an in-memory PNG for encrypted publication as a derived object.
+pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError> {
+    let info = probe(bytes)?;
+    if edge == 0 || edge > 4096 {
+        return Err(ImageError::ResourceLimit);
+    }
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ImageError::Decode)?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DIMENSION);
+    limits.max_image_height = Some(MAX_DIMENSION);
+    limits.max_alloc = Some(400 * 1024 * 1024);
+    reader.limits(limits);
+    let mut decoded = reader.decode().map_err(|_| ImageError::Decode)?;
+    decoded = match info.orientation {
+        Orientation::Normal => decoded,
+        Orientation::MirrorHorizontal => decoded.fliph(),
+        Orientation::Rotate180 => decoded.rotate180(),
+        Orientation::MirrorVertical => decoded.flipv(),
+        Orientation::MirrorHorizontalRotate270 => decoded.fliph().rotate270(),
+        Orientation::Rotate90 => decoded.rotate90(),
+        Orientation::MirrorHorizontalRotate90 => decoded.fliph().rotate90(),
+        Orientation::Rotate270 => decoded.rotate270(),
+    };
+    let scaled = if decoded.width() > edge || decoded.height() > edge {
+        decoded.thumbnail(edge, edge).to_rgba8()
+    } else {
+        decoded.to_rgba8()
+    };
+    let mut encoded = Vec::new();
+    PngEncoder::new(&mut encoded)
+        .write_image(
+            scaled.as_raw(),
+            scaled.width(),
+            scaled.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|_| ImageError::Decode)?;
+    let protected = SecretBytes::new(&encoded).map_err(|_| ImageError::Decode);
+    encoded.zeroize();
+    protected
+}
+
+fn thumbnail_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
+    let thumbnail = probe(bytes)?;
+    if thumbnail.format != ImageFormat::Png
+        || thumbnail.frames != 1
+        || thumbnail.orientation != Orientation::Normal
+    {
+        return Err(ImageError::Malformed);
+    }
+    Ok((thumbnail.width, thumbnail.height))
+}
+
+/// Fully decodes the input and packages allowlisted facts with a derived PNG.
+pub fn image_worker_result(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError> {
+    let info = probe(bytes)?;
+    let thumbnail = thumbnail_png(bytes, edge)?;
+    let (thumbnail_width, thumbnail_height) = thumbnail_dimensions(thumbnail.expose())?;
+    let rgba = ImageReader::new(std::io::Cursor::new(thumbnail.expose()))
+        .with_guessed_format()
+        .map_err(|_| ImageError::Decode)?
+        .decode()
+        .map_err(|_| ImageError::Decode)?
+        .to_rgba8();
+    let expected_rgba_len = usize::try_from(
+        u64::from(thumbnail_width)
+            .checked_mul(u64::from(thumbnail_height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(ImageError::ResourceLimit)?,
+    )
+    .map_err(|_| ImageError::ResourceLimit)?;
+    if rgba.len() != expected_rgba_len {
+        return Err(ImageError::Decode);
+    }
+    let total = WORKER_RESULT_HEADER_LEN
+        .checked_add(thumbnail.len())
+        .and_then(|size| size.checked_add(rgba.len()))
+        .filter(|size| *size <= MAX_THUMBNAIL_RESULT_BYTES)
+        .ok_or(ImageError::ResourceLimit)?;
+    let mut result = SecretBytes::zeroed(total).map_err(|_| ImageError::Decode)?;
+    let header = &mut result.expose_mut()[..WORKER_RESULT_HEADER_LEN];
+    header[..8].copy_from_slice(b"OSVIMG2\0");
+    header[8..12].copy_from_slice(&info.width.to_le_bytes());
+    header[12..16].copy_from_slice(&info.height.to_le_bytes());
+    header[16..20].copy_from_slice(&info.frames.to_le_bytes());
+    header[20] = info.format as u8;
+    header[21] = info.orientation as u8;
+    header[22] = u8::from(info.has_color_profile);
+    header[24..28].copy_from_slice(&THUMBNAIL_RECIPE_VERSION.to_le_bytes());
+    header[28..32].copy_from_slice(&thumbnail_width.to_le_bytes());
+    header[32..36].copy_from_slice(&thumbnail_height.to_le_bytes());
+    let thumbnail_png_len =
+        u32::try_from(thumbnail.len()).map_err(|_| ImageError::ResourceLimit)?;
+    let rgba_len = u32::try_from(rgba.len()).map_err(|_| ImageError::ResourceLimit)?;
+    header[36..40].copy_from_slice(&thumbnail_png_len.to_le_bytes());
+    header[40..44].copy_from_slice(&rgba_len.to_le_bytes());
+    let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
+    result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
+    result.expose_mut()[png_end..].copy_from_slice(rgba.as_raw());
+    Ok(result)
+}
+
+pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, ImageError> {
+    if bytes.len() < WORKER_RESULT_HEADER_LEN
+        || &bytes[..8] != b"OSVIMG2\0"
+        || bytes[23] != 0
+        || bytes[44..48] != [0; 4]
+    {
+        return Err(ImageError::Malformed);
+    }
+    let format = match bytes[20] {
+        0 => ImageFormat::Png,
+        1 => ImageFormat::Jpeg,
+        2 => ImageFormat::Gif,
+        3 => ImageFormat::Webp,
+        _ => return Err(ImageError::Malformed),
+    };
+    let orientation = match bytes[21] {
+        0 => Orientation::Normal,
+        1 => Orientation::MirrorHorizontal,
+        2 => Orientation::Rotate180,
+        3 => Orientation::MirrorVertical,
+        4 => Orientation::MirrorHorizontalRotate270,
+        5 => Orientation::Rotate90,
+        6 => Orientation::MirrorHorizontalRotate90,
+        7 => Orientation::Rotate270,
+        _ => return Err(ImageError::Malformed),
+    };
+    if bytes[22] > 1
+        || u32::from_le_bytes(
+            bytes[24..28]
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        ) != THUMBNAIL_RECIPE_VERSION
+    {
+        return Err(ImageError::Malformed);
+    }
+    let info = ImageProbe {
+        format,
+        width: u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| ImageError::Malformed)?),
+        height: u32::from_le_bytes(
+            bytes[12..16]
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        ),
+        frames: u32::from_le_bytes(
+            bytes[16..20]
+                .try_into()
+                .map_err(|_| ImageError::Malformed)?,
+        ),
+        orientation,
+        has_color_profile: bytes[22] == 1,
+    };
+    let pixels = u64::from(info.width)
+        .checked_mul(u64::from(info.height))
+        .ok_or(ImageError::ResourceLimit)?;
+    let thumbnail_width = u32::from_le_bytes(
+        bytes[28..32]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let thumbnail_height = u32::from_le_bytes(
+        bytes[32..36]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let thumbnail_png_len = u32::from_le_bytes(
+        bytes[36..40]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let rgba_len = u32::from_le_bytes(
+        bytes[40..44]
+            .try_into()
+            .map_err(|_| ImageError::Malformed)?,
+    );
+    let expected_rgba_len = thumbnail_width
+        .checked_mul(thumbnail_height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(ImageError::ResourceLimit)?;
+    if info.width == 0
+        || info.height == 0
+        || info.frames == 0
+        || pixels > MAX_PIXELS
+        || thumbnail_width == 0
+        || thumbnail_height == 0
+        || thumbnail_width > 4096
+        || thumbnail_height > 4096
+        || thumbnail_png_len == 0
+        || rgba_len != expected_rgba_len
+    {
+        Err(ImageError::ResourceLimit)
+    } else {
+        Ok(WorkerImageResult {
+            source: info,
+            thumbnail_width,
+            thumbnail_height,
+            thumbnail_png_len,
+            rgba_len,
+        })
+    }
+}
+
+pub struct BoundedCache<K> {
+    entries: VecDeque<(K, SecretBytes, usize)>,
+    bytes: usize,
+    limit: usize,
+}
+impl<K: Eq> BoundedCache<K> {
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+    pub fn insert(&mut self, key: K, value: SecretBytes) {
+        // SecretBytes owns at least one mmap page. Charge the largest Linux
+        // base-page size so tiny/empty values cannot amplify locked memory.
+        const CONSERVATIVE_PAGE_BYTES: usize = 64 * 1024;
+        let charge = value.len().max(CONSERVATIVE_PAGE_BYTES);
+        if value.is_empty() || charge > self.limit {
+            return;
+        }
+        if let Some(i) = self.entries.iter().position(|(k, _, _)| k == &key)
+            && let Some((_, _, old_charge)) = self.entries.remove(i)
+        {
+            self.bytes -= old_charge;
+        }
+        while self.bytes + charge > self.limit {
+            if let Some((_, _, old_charge)) = self.entries.pop_front() {
+                self.bytes -= old_charge;
+            } else {
+                break;
+            }
+        }
+        self.bytes += charge;
+        self.entries.push_back((key, value, charge))
+    }
+    pub fn get(&mut self, key: &K) -> Option<&[u8]> {
+        let i = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let value = self.entries.remove(i)?;
+        self.entries.push_back(value);
+        self.entries.back().map(|(_, v, _)| v.expose())
+    }
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0
+    }
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewerState {
+    zoom: f64,
+    pan_x: f64,
+    pan_y: f64,
+    rotation: u16,
+    playing: bool,
+    frame: u32,
+    frames: u32,
+}
+impl ViewerState {
+    #[must_use]
+    pub fn new(frames: u32) -> Self {
+        Self {
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            rotation: 0,
+            playing: frames > 1,
+            frame: 0,
+            frames: frames.max(1),
+        }
+    }
+    pub fn zoom_by(&mut self, factor: f64) {
+        if factor.is_finite() && factor > 0.0 {
+            self.zoom = (self.zoom * factor).clamp(0.05, 64.0)
+        }
+    }
+    pub fn pan_by(&mut self, x: f64, y: f64) {
+        if x.is_finite() && y.is_finite() {
+            self.pan_x = (self.pan_x + x).clamp(-1e6, 1e6);
+            self.pan_y = (self.pan_y + y).clamp(-1e6, 1e6)
+        }
+    }
+    pub fn rotate_clockwise(&mut self) {
+        self.rotation = (self.rotation + 90) % 360
+    }
+    pub fn toggle_animation(&mut self) {
+        if self.frames > 1 {
+            self.playing = !self.playing
+        }
+    }
+    pub fn advance(&mut self) {
+        if self.playing {
+            self.frame = (self.frame + 1) % self.frames
+        }
+    }
+    #[must_use]
+    pub const fn zoom(&self) -> f64 {
+        self.zoom
+    }
+    #[must_use]
+    pub const fn rotation(&self) -> u16 {
+        self.rotation
+    }
+    #[must_use]
+    pub const fn frame(&self) -> u32 {
+        self.frame
+    }
+    #[must_use]
+    pub const fn playing(&self) -> bool {
+        self.playing
+    }
+}
+
 pub fn spawn_worker(
     executable: &Path,
     request_id: u64,
@@ -14,4 +777,164 @@ pub fn spawn_worker(
         request_id,
         limits,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::ImageEncoder;
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        fn chunk(target: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+            target.extend(u32::try_from(data.len()).unwrap().to_be_bytes());
+            target.extend(kind);
+            target.extend(data);
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(kind);
+            crc.update(data);
+            target.extend(crc.finalize().to_be_bytes());
+        }
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::from(w.to_be_bytes());
+        ihdr.extend(h.to_be_bytes());
+        ihdr.extend([8, 6, 0, 0, 0]);
+        chunk(&mut b, b"IHDR", &ihdr);
+        chunk(&mut b, b"IDAT", &[]);
+        chunk(&mut b, b"IEND", &[]);
+        b
+    }
+
+    fn rgba_fixture() -> image::RgbaImage {
+        image::RgbaImage::from_fn(2, 3, |x, y| {
+            image::Rgba([
+                u8::try_from(x * 80).unwrap(),
+                u8::try_from(y * 60).unwrap(),
+                90,
+                255,
+            ])
+        })
+    }
+
+    fn jpeg_with_orientation(orientation: u16) -> Vec<u8> {
+        let image = rgba_fixture();
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode_image(&image)
+            .unwrap();
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend(orientation.to_le_bytes());
+        exif.extend([0, 0, 0, 0, 0, 0]);
+        let mut segment = vec![0xff, 0xe1];
+        segment.extend(u16::try_from(exif.len() + 2).unwrap().to_be_bytes());
+        segment.extend(exif);
+        jpeg.splice(2..2, segment);
+        jpeg
+    }
+
+    fn encoded_formats() -> Vec<(ImageFormat, Vec<u8>)> {
+        let image = rgba_fixture();
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(image.as_raw(), 2, 3, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let jpeg = jpeg_with_orientation(1);
+        let mut gif = Vec::new();
+        image::codecs::gif::GifEncoder::new(&mut gif)
+            .encode(image.as_raw(), 2, 3, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let mut simple_webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut simple_webp)
+            .write_image(image.as_raw(), 2, 3, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0\x01\0\0\x02\0\0".to_vec();
+        webp.extend_from_slice(&simple_webp[12..]);
+        let riff_len = u32::try_from(webp.len() - 8).unwrap();
+        webp[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        vec![
+            (ImageFormat::Png, png),
+            (ImageFormat::Jpeg, jpeg),
+            (ImageFormat::Gif, gif),
+            (ImageFormat::Webp, webp),
+        ]
+    }
+    #[test]
+    fn rejects_bomb_before_decode() {
+        assert_eq!(probe(&png(65_535, 65_535)), Err(ImageError::ResourceLimit))
+    }
+    #[test]
+    fn probes_png() {
+        let p = probe(&png(10, 20)).unwrap();
+        assert_eq!(
+            (p.format, p.width, p.height, p.frames),
+            (ImageFormat::Png, 10, 20, 1)
+        )
+    }
+    #[test]
+    fn genuine_allowlisted_formats_decode_under_limits() {
+        for (format, bytes) in encoded_formats() {
+            assert_eq!(probe(&bytes).unwrap().format, format);
+            let result = image_worker_result(&bytes, 512).unwrap();
+            let decoded = decode_worker_result_header(result.expose()).unwrap();
+            assert_eq!(decoded.source.format, format);
+            assert_eq!((decoded.thumbnail_width, decoded.thumbnail_height), (2, 3));
+        }
+    }
+    #[test]
+    fn all_exif_orientations_are_applied_before_thumbnail_geometry() {
+        for orientation in 1..=8 {
+            let bytes = jpeg_with_orientation(orientation);
+            let result = image_worker_result(&bytes, 512).unwrap();
+            let decoded = decode_worker_result_header(result.expose()).unwrap();
+            let expected = if orientation >= 5 { (3, 2) } else { (2, 3) };
+            assert_eq!(
+                (decoded.thumbnail_width, decoded.thumbnail_height),
+                expected,
+                "orientation {orientation}"
+            );
+        }
+    }
+    #[test]
+    fn corrupt_png_crc_and_truncation_are_rejected() {
+        let mut corrupt = png(10, 20);
+        corrupt[29] ^= 1;
+        assert_eq!(probe(&corrupt), Err(ImageError::Malformed));
+        let truncated = &png(10, 20)[..40];
+        assert_eq!(probe(truncated), Err(ImageError::Malformed));
+    }
+    #[test]
+    fn cache_evicts_and_clears() {
+        let mut c = BoundedCache::new(65_536);
+        c.insert(1, SecretBytes::new(b"123").unwrap());
+        c.insert(2, SecretBytes::new(b"456").unwrap());
+        assert!(c.get(&1).is_none());
+        assert_eq!(c.bytes(), 65_536);
+        c.clear();
+        assert_eq!(c.bytes(), 0)
+    }
+    #[test]
+    fn viewer_bounds_animation() {
+        let mut v = ViewerState::new(2);
+        v.zoom_by(1e9);
+        v.rotate_clockwise();
+        v.advance();
+        assert_eq!((v.zoom(), v.rotation(), v.frame()), (64.0, 90, 1));
+        v.toggle_animation();
+        assert!(!v.playing())
+    }
+
+    #[test]
+    fn real_png_decodes_to_worker_result() {
+        let image = image::RgbaImage::from_pixel(2, 3, image::Rgba([0x33, 0x66, 0x99, 0xff]));
+        let mut encoded = Vec::new();
+        PngEncoder::new(&mut encoded)
+            .write_image(image.as_raw(), 2, 3, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let result = image_worker_result(&encoded, 512).unwrap();
+        assert_eq!(
+            decode_worker_result_header(result.expose())
+                .unwrap()
+                .source
+                .width,
+            2
+        );
+    }
 }

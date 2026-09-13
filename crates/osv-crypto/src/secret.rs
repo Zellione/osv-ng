@@ -251,6 +251,11 @@ mod platform {
         lock_status: LockStatus,
     }
 
+    // SAFETY: Allocation uniquely owns an anonymous mmap. Its pointer is never
+    // shared, has no thread affinity, and Drop wipes/unlocks/unmaps it on the
+    // thread that receives ownership.
+    unsafe impl Send for Allocation {}
+
     impl Allocation {
         pub(super) fn new(requested_len: usize) -> io::Result<Self> {
             let page_size_raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };

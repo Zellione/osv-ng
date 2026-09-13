@@ -4,10 +4,13 @@ use osv_crypto::SecretBytes;
 use std::{error::Error, fmt};
 
 pub const MAGIC: [u8; 8] = *b"OSVWIPC\0";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 pub const HEADER_LEN: usize = 24;
 pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const MAX_DATA_LEN: usize = MAX_PAYLOAD_LEN - 9;
+/// Independent cap on result framing, even when a caller permits a large byte
+/// result. This bounds per-chunk allocation/accounting under a hostile worker.
+pub const MAX_RESULT_CHUNKS: u64 = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -20,6 +23,8 @@ pub enum Kind {
     Cancel = 6,
     Complete = 7,
     Failed = 8,
+    ResultData = 9,
+    ResultEnd = 10,
 }
 
 impl TryFrom<u8> for Kind {
@@ -35,6 +40,8 @@ impl TryFrom<u8> for Kind {
             6 => Ok(Self::Cancel),
             7 => Ok(Self::Complete),
             8 => Ok(Self::Failed),
+            9 => Ok(Self::ResultData),
+            10 => Ok(Self::ResultEnd),
             _ => Err(ProtocolError::UnknownKind),
         }
     }
@@ -63,6 +70,13 @@ pub enum Message {
     Data {
         sequence: u64,
         bytes: SecretBytes,
+    },
+    ResultData {
+        sequence: u64,
+        bytes: SecretBytes,
+    },
+    ResultEnd {
+        chunks: u64,
     },
     End {
         chunks: u64,
@@ -96,13 +110,20 @@ impl fmt::Debug for Message {
                 .field("page_locks", page_locks)
                 .finish(),
             Self::Start { role } => formatter.debug_struct("Start").field("role", role).finish(),
-            Self::Data { sequence, bytes } => formatter
-                .debug_struct("Data")
+            Self::Data { sequence, bytes } | Self::ResultData { sequence, bytes } => formatter
+                .debug_struct(match self {
+                    Self::Data { .. } => "Data",
+                    _ => "ResultData",
+                })
                 .field("sequence", sequence)
                 .field("bytes", &format_args!("[REDACTED; {}]", bytes.len()))
                 .finish(),
             Self::End { chunks } => formatter
                 .debug_struct("End")
+                .field("chunks", chunks)
+                .finish(),
+            Self::ResultEnd { chunks } => formatter
+                .debug_struct("ResultEnd")
                 .field("chunks", chunks)
                 .finish(),
             Self::Cancel => formatter.write_str("Cancel"),
@@ -171,7 +192,7 @@ impl Frame {
     #[must_use]
     pub fn lock_status(&self) -> osv_crypto::LockStatus {
         match &self.message {
-            Message::Data { bytes, .. } => bytes.lock_status(),
+            Message::Data { bytes, .. } | Message::ResultData { bytes, .. } => bytes.lock_status(),
             _ => osv_crypto::LockStatus::Locked,
         }
     }
@@ -236,9 +257,13 @@ fn payload_len(message: &Message) -> Result<usize, ProtocolError> {
         Message::Ready { .. } => Ok(7),
         Message::Start { .. } => Ok(1),
         Message::Failed { .. } => Ok(2),
-        Message::Data { bytes, .. } if bytes.len() <= MAX_DATA_LEN => Ok(8 + bytes.len()),
-        Message::Data { .. } => Err(ProtocolError::Oversized),
-        Message::End { .. } => Ok(8),
+        Message::Data { bytes, .. } | Message::ResultData { bytes, .. }
+            if bytes.len() <= MAX_DATA_LEN =>
+        {
+            Ok(8 + bytes.len())
+        }
+        Message::Data { .. } | Message::ResultData { .. } => Err(ProtocolError::Oversized),
+        Message::End { .. } | Message::ResultEnd { .. } => Ok(8),
         Message::Cancel => Ok(0),
         Message::Complete { .. } => Ok(1),
     }
@@ -254,6 +279,8 @@ fn message_kind(message: &Message) -> Kind {
         Message::Cancel => Kind::Cancel,
         Message::Complete { .. } => Kind::Complete,
         Message::Failed { .. } => Kind::Failed,
+        Message::ResultData { .. } => Kind::ResultData,
+        Message::ResultEnd { .. } => Kind::ResultEnd,
     }
 }
 
@@ -273,11 +300,13 @@ fn encode_payload(message: &Message, payload: &mut [u8]) {
             payload[6] = encode_lock_status(*page_locks);
         }
         Message::Start { role } => payload[0] = *role as u8,
-        Message::Data { sequence, bytes } => {
+        Message::Data { sequence, bytes } | Message::ResultData { sequence, bytes } => {
             payload[..8].copy_from_slice(&sequence.to_le_bytes());
             payload[8..].copy_from_slice(bytes.expose());
         }
-        Message::End { chunks } => payload.copy_from_slice(&chunks.to_le_bytes()),
+        Message::End { chunks } | Message::ResultEnd { chunks } => {
+            payload.copy_from_slice(&chunks.to_le_bytes())
+        }
         Message::Failed { class, page_locks } => {
             payload[0] = *class as u8;
             payload[1] = encode_lock_status(*page_locks);
@@ -309,7 +338,14 @@ fn decode_message(kind: Kind, bytes: &[u8]) -> Result<Message, ProtocolError> {
             sequence: u64::from_le_bytes(bytes[..8].try_into().expect("fixed slice")),
             bytes: SecretBytes::new(&bytes[8..]).map_err(|_| ProtocolError::Memory)?,
         },
+        Kind::ResultData if bytes.len() >= 8 => Message::ResultData {
+            sequence: u64::from_le_bytes(bytes[..8].try_into().expect("fixed slice")),
+            bytes: SecretBytes::new(&bytes[8..]).map_err(|_| ProtocolError::Memory)?,
+        },
         Kind::End if bytes.len() == 8 => Message::End {
+            chunks: u64::from_le_bytes(bytes.try_into().expect("fixed slice")),
+        },
+        Kind::ResultEnd if bytes.len() == 8 => Message::ResultEnd {
             chunks: u64::from_le_bytes(bytes.try_into().expect("fixed slice")),
         },
         Kind::Cancel if bytes.is_empty() => Message::Cancel,
@@ -350,6 +386,8 @@ pub enum BrokerState {
     Ready,
     Streaming { next_sequence: u64 },
     AwaitingResult,
+    ReceivingResult { next_sequence: u64 },
+    AwaitingComplete,
     Finished,
 }
 
@@ -411,9 +449,27 @@ impl BrokerMachine {
                     version: VERSION, ..
                 },
             ) => BrokerState::Ready,
-            (BrokerState::AwaitingResult, Message::Complete { .. } | Message::Failed { .. }) => {
-                BrokerState::Finished
+            (BrokerState::AwaitingResult, Message::ResultData { sequence: 0, .. }) => {
+                BrokerState::ReceivingResult { next_sequence: 1 }
             }
+            (
+                BrokerState::ReceivingResult { next_sequence },
+                Message::ResultData { sequence, .. },
+            ) if *sequence == next_sequence => BrokerState::ReceivingResult {
+                next_sequence: next_sequence + 1,
+            },
+            (BrokerState::AwaitingResult, Message::ResultEnd { chunks: 0 }) => {
+                BrokerState::AwaitingComplete
+            }
+            (BrokerState::ReceivingResult { next_sequence }, Message::ResultEnd { chunks })
+                if *chunks == next_sequence =>
+            {
+                BrokerState::AwaitingComplete
+            }
+            (
+                BrokerState::AwaitingResult | BrokerState::AwaitingComplete,
+                Message::Complete { .. } | Message::Failed { .. },
+            ) => BrokerState::Finished,
             _ => return Err(ProtocolError::InvalidTransition),
         };
         Ok(())
@@ -480,7 +536,12 @@ mod tests {
                 sequence: 3,
                 bytes: SecretBytes::new(&[1, 2, 3]).unwrap(),
             },
+            Message::ResultData {
+                sequence: 0,
+                bytes: SecretBytes::new(&[4, 5]).unwrap(),
+            },
             Message::End { chunks: 4 },
+            Message::ResultEnd { chunks: 1 },
             Message::Cancel,
             Message::Complete {
                 page_locks: osv_crypto::LockStatus::Locked,
@@ -581,6 +642,11 @@ mod tests {
         let debug = format!("{message:?}");
         assert!(debug.contains("REDACTED"));
         assert!(!debug.contains("sensitive-pixels"));
+        let result = Message::ResultData {
+            sequence: 0,
+            bytes: SecretBytes::new(b"sensitive-thumbnail").unwrap(),
+        };
+        assert!(!format!("{result:?}").contains("sensitive-thumbnail"));
     }
 
     #[test]

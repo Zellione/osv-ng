@@ -107,7 +107,11 @@ impl FramedChannel {
     }
 
     pub fn send(&mut self, frame: &Frame) -> Result<osv_crypto::LockStatus, TransportError> {
-        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+        if !matches!(
+            frame.message,
+            osv_worker_protocol::Message::Data { .. }
+                | osv_worker_protocol::Message::ResultData { .. }
+        ) {
             let mut encoded = [0_u8; HEADER_LEN + 8];
             let encoded_len = frame.encoded_len()?;
             frame.encode_into(&mut encoded[..encoded_len])?;
@@ -126,7 +130,11 @@ impl FramedChannel {
         &mut self,
         frame: &Frame,
     ) -> Result<osv_crypto::LockStatus, TransportError> {
-        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+        if !matches!(
+            frame.message,
+            osv_worker_protocol::Message::Data { .. }
+                | osv_worker_protocol::Message::ResultData { .. }
+        ) {
             let mut encoded = [0_u8; HEADER_LEN + 8];
             let encoded_len = frame.encoded_len()?;
             frame.encode_into(&mut encoded[..encoded_len])?;

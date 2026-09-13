@@ -17,6 +17,14 @@ pub struct SearchResult {
     pub favorite: bool,
 }
 
+/// Minimum encrypted-catalog authority needed to regenerate a missing or stale
+/// derived object from its authenticated original.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DerivedRegeneration {
+    pub media_id: MediaId,
+    pub original_object_id: ObjectId,
+}
+
 /// Encrypted recovery intent. Payload interpretation belongs to the vault service.
 pub struct JournalEntry {
     pub id: [u8; 16],
@@ -80,6 +88,55 @@ impl<'connection> CatalogReader<'connection> {
 
     pub fn operation_journal(&self) -> Result<Vec<JournalEntry>> {
         read_operation_journal(self.connection)
+    }
+
+    /// Exact fingerprints are queried inside the encrypted catalog and are
+    /// never exposed as deterministic object names or ciphertext.
+    pub fn has_fingerprint(&self, fingerprint: &[u8; 32]) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM media WHERE fingerprint=?1)",
+            [fingerprint.as_slice()],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn derived_needing_recipe(
+        &self,
+        role: ObjectRole,
+        recipe_version: u32,
+        maximum: u32,
+    ) -> Result<Vec<DerivedRegeneration>> {
+        if !matches!(role, ObjectRole::Thumbnail | ObjectRole::Poster)
+            || recipe_version == 0
+            || maximum == 0
+            || maximum > MAX_QUERY_RESULTS
+        {
+            return Err(CatalogError::InvalidInput("derived regeneration query"));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT m.id,m.original_object_id FROM media m WHERE NOT EXISTS(SELECT 1 FROM derived_objects d JOIN objects o ON o.id=d.object_id WHERE d.media_id=m.id AND o.role=?1 AND o.state=?2 AND d.recipe_version=?3) ORDER BY m.imported_at_ms,m.id LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                role as i64,
+                ObjectState::Ready as i64,
+                i64::from(recipe_version),
+                i64::from(maximum)
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )?;
+        rows.map(|row| {
+            let (media_id, original_object_id) = row?;
+            Ok(DerivedRegeneration {
+                media_id: MediaId::parse(media_id)?,
+                original_object_id: ObjectId::from_bytes(
+                    original_object_id
+                        .try_into()
+                        .map_err(|_| CatalogError::IntegrityFailed)?,
+                ),
+            })
+        })
+        .collect()
     }
 }
 

@@ -6,6 +6,7 @@ use std::{fmt, io};
 
 use osv_crypto::{LockStatus, SecretString};
 
+pub mod runtime;
 pub mod ui;
 
 const MIN_SPACING: u8 = 2;

@@ -1,6 +1,418 @@
 //! Import plans, archive boundaries, and duplicate decisions.
 
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::{
+    io::Read,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DuplicateDecision {
+    Skip,
+    ImportAnotherCopy,
+}
+
+/// A pending duplicate never has an implicit default. The UI must record an
+/// explicit decision before an import plan can be committed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DuplicateState {
+    Unique,
+    AwaitingDecision,
+    Decided(DuplicateDecision),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ImportPreview {
+    pub fingerprint: [u8; 32],
+    pub mime: &'static str,
+    pub width: u32,
+    pub height: u32,
+    pub animated: bool,
+    pub duplicate: DuplicateState,
+}
+
+impl std::fmt::Debug for ImportPreview {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImportPreview")
+            .field("metadata", &"[REDACTED]")
+            .field("duplicate", &self.duplicate)
+            .finish()
+    }
+}
+
+impl ImportPreview {
+    #[must_use]
+    pub fn from_probe(bytes: &[u8], probe: osv_media::ImageProbe, duplicate_exists: bool) -> Self {
+        let fingerprint: [u8; 32] = Sha256::digest(bytes).into();
+        Self {
+            fingerprint,
+            mime: probe.format.mime(),
+            width: probe.width,
+            height: probe.height,
+            animated: probe.frames > 1,
+            duplicate: if duplicate_exists {
+                DuplicateState::AwaitingDecision
+            } else {
+                DuplicateState::Unique
+            },
+        }
+    }
+
+    pub fn decide(&mut self, decision: DuplicateDecision) {
+        if self.duplicate == DuplicateState::AwaitingDecision {
+            self.duplicate = DuplicateState::Decided(decision);
+        }
+    }
+
+    #[must_use]
+    pub const fn may_import(&self) -> bool {
+        matches!(
+            self.duplicate,
+            DuplicateState::Unique | DuplicateState::Decided(DuplicateDecision::ImportAnotherCopy)
+        )
+    }
+}
+
+#[derive(Debug)]
+pub enum ImageImportError {
+    Input,
+    Cancelled,
+    Worker(osv_isolation::SupervisorError),
+    Vault(osv_vault::ServiceError),
+    DecisionRequired,
+}
+
+impl std::fmt::Display for ImageImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("image import stopped safely")
+    }
+}
+impl std::error::Error for ImageImportError {}
+
+pub struct PreparedImageImport {
+    source: osv_crypto::SecretBytes,
+    thumbnail: osv_crypto::SecretBytes,
+    pub preview: ImportPreview,
+    probe: osv_media::ImageProbe,
+    thumbnail_width: u32,
+    thumbnail_height: u32,
+    display_pixels: osv_crypto::SecretBytes,
+}
+
+impl std::fmt::Debug for PreparedImageImport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreparedImageImport([REDACTED])")
+    }
+}
+
+pub struct CommittedImage {
+    pub original: osv_storage::ObjectId,
+    pub thumbnail: osv_storage::ObjectId,
+    pub display_pixels: osv_crypto::SecretBytes,
+    pub display_width: u32,
+    pub display_height: u32,
+}
+
+struct PreparedThumbnail {
+    probe: osv_media::ImageProbe,
+    bytes: osv_crypto::SecretBytes,
+    width: u32,
+    height: u32,
+    display_pixels: osv_crypto::SecretBytes,
+}
+
+fn prepare_thumbnail(
+    source: &osv_crypto::SecretBytes,
+    worker_executable: &Path,
+    request_id: u64,
+) -> Result<PreparedThumbnail, ImageImportError> {
+    prepare_thumbnail_cancellable(source, worker_executable, request_id, None)
+}
+
+fn prepare_thumbnail_cancellable(
+    source: &osv_crypto::SecretBytes,
+    worker_executable: &Path,
+    request_id: u64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PreparedThumbnail, ImageImportError> {
+    // This broker-side pass is deliberately allocation-free. It rejects gross
+    // resource abuse before IPC; the confined helper independently performs a
+    // complete decode before any result is accepted.
+    let probe = osv_media::probe(source.expose()).map_err(|_| ImageImportError::Input)?;
+    let mut worker = osv_media::spawn_worker(
+        worker_executable,
+        request_id,
+        osv_isolation::SupervisorLimits::default(),
+    )
+    .map_err(ImageImportError::Worker)?;
+    for (sequence, chunk) in source
+        .expose()
+        .chunks(osv_worker_protocol::MAX_DATA_LEN)
+        .enumerate()
+    {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            worker.cancel();
+            return Err(ImageImportError::Cancelled);
+        }
+        let sequence = u64::try_from(sequence).map_err(|_| ImageImportError::Input)?;
+        let bytes = osv_crypto::SecretBytes::new(chunk).map_err(|_| ImageImportError::Input)?;
+        worker
+            .send_authenticated(
+                sequence,
+                osv_isolation::PlaintextBuffer::from_secret(bytes)
+                    .map_err(|_| ImageImportError::Input)?,
+            )
+            .map_err(ImageImportError::Worker)?;
+    }
+    if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        worker.cancel();
+        return Err(ImageImportError::Cancelled);
+    }
+    let (class, derived) = worker
+        .finish_with_output(osv_media::MAX_THUMBNAIL_RESULT_BYTES)
+        .map_err(ImageImportError::Worker)?;
+    if class != osv_isolation::ExitClass::Success {
+        return Err(ImageImportError::Input);
+    }
+    let header = derived.chunks().next().ok_or(ImageImportError::Input)?;
+    let worker_result =
+        osv_media::decode_worker_result_header(header).map_err(|_| ImageImportError::Input)?;
+    if worker_result.source != probe {
+        return Err(ImageImportError::Input);
+    }
+    let png_len =
+        usize::try_from(worker_result.thumbnail_png_len).map_err(|_| ImageImportError::Input)?;
+    let bytes = derived
+        .copy_span(osv_media::WORKER_RESULT_HEADER_LEN, png_len)
+        .map_err(ImageImportError::Worker)?;
+    let rgba_len = usize::try_from(worker_result.rgba_len).map_err(|_| ImageImportError::Input)?;
+    let display_pixels = derived
+        .copy_span(osv_media::WORKER_RESULT_HEADER_LEN + png_len, rgba_len)
+        .map_err(ImageImportError::Worker)?;
+    if derived.logical_len()
+        != osv_media::WORKER_RESULT_HEADER_LEN
+            .checked_add(png_len)
+            .and_then(|len| len.checked_add(rgba_len))
+            .ok_or(ImageImportError::Input)?
+    {
+        return Err(ImageImportError::Input);
+    }
+    let thumbnail_probe = osv_media::probe(bytes.expose()).map_err(|_| ImageImportError::Input)?;
+    if thumbnail_probe.format != osv_media::ImageFormat::Png
+        || thumbnail_probe.width != worker_result.thumbnail_width
+        || thumbnail_probe.height != worker_result.thumbnail_height
+        || thumbnail_probe.frames != 1
+    {
+        return Err(ImageImportError::Input);
+    }
+    Ok(PreparedThumbnail {
+        probe,
+        bytes,
+        width: worker_result.thumbnail_width,
+        height: worker_result.thumbnail_height,
+        display_pixels,
+    })
+}
+
+/// Reads a stable, already-open source into protected memory, sends it to one
+/// short-lived helper, and checks exact duplicates only in the encrypted catalog.
+pub fn prepare_image_import(
+    source: &mut impl Read,
+    logical_len: u64,
+    worker_executable: &Path,
+    request_id: u64,
+    catalog: &osv_catalog::CatalogReader<'_>,
+) -> Result<PreparedImageImport, ImageImportError> {
+    prepare_image_import_cancellable(
+        source,
+        logical_len,
+        worker_executable,
+        request_id,
+        catalog,
+        &AtomicBool::new(false),
+    )
+}
+
+pub fn prepare_image_import_cancellable(
+    source: &mut impl Read,
+    logical_len: u64,
+    worker_executable: &Path,
+    request_id: u64,
+    catalog: &osv_catalog::CatalogReader<'_>,
+    cancelled: &AtomicBool,
+) -> Result<PreparedImageImport, ImageImportError> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ImageImportError::Cancelled);
+    }
+    let len = usize::try_from(logical_len).map_err(|_| ImageImportError::Input)?;
+    if len == 0 || len > osv_media::MAX_ENCODED_BYTES {
+        return Err(ImageImportError::Input);
+    }
+    let mut protected =
+        osv_crypto::SecretBytes::zeroed(len).map_err(|_| ImageImportError::Input)?;
+    source
+        .read_exact(protected.expose_mut())
+        .map_err(|_| ImageImportError::Input)?;
+    let mut excess = [0u8; 1];
+    if source
+        .read(&mut excess)
+        .map_err(|_| ImageImportError::Input)?
+        != 0
+    {
+        return Err(ImageImportError::Input);
+    }
+    let prepared =
+        prepare_thumbnail_cancellable(&protected, worker_executable, request_id, Some(cancelled))?;
+    let probe = prepared.probe;
+    let fingerprint: [u8; 32] = Sha256::digest(protected.expose()).into();
+    let duplicate = catalog
+        .has_fingerprint(&fingerprint)
+        .map_err(|_| ImageImportError::Input)?;
+    Ok(PreparedImageImport {
+        source: protected,
+        thumbnail: prepared.bytes,
+        preview: ImportPreview::from_probe_with_fingerprint(fingerprint, probe, duplicate),
+        probe,
+        thumbnail_width: prepared.width,
+        thumbnail_height: prepared.height,
+        display_pixels: prepared.display_pixels,
+    })
+}
+
+/// Regenerates one missing/stale thumbnail from the authenticated original.
+/// Worker failure or cancellation occurs before publication and therefore
+/// cannot invalidate the original or the currently referenced derived object.
+pub fn regenerate_image_thumbnail(
+    vault: &mut osv_vault::VaultService,
+    target: osv_catalog::DerivedRegeneration,
+    worker_executable: &Path,
+    request_id: u64,
+    now_ms: i64,
+) -> Result<osv_storage::ObjectId, ImageImportError> {
+    let logical_len = vault
+        .reader()
+        .object(target.original_object_id)
+        .map_err(|_| ImageImportError::Input)?
+        .descriptor
+        .logical_len();
+    let len = usize::try_from(logical_len).map_err(|_| ImageImportError::Input)?;
+    if len == 0 || len > osv_media::MAX_ENCODED_BYTES {
+        return Err(ImageImportError::Input);
+    }
+    let mut source = osv_crypto::SecretBytes::zeroed(len).map_err(|_| ImageImportError::Input)?;
+    {
+        let mut reader = vault
+            .open_object(target.original_object_id)
+            .map_err(ImageImportError::Vault)?;
+        reader
+            .read_exact(source.expose_mut())
+            .map_err(|_| ImageImportError::Input)?;
+        let mut excess = [0u8; 1];
+        if reader
+            .read(&mut excess)
+            .map_err(|_| ImageImportError::Input)?
+            != 0
+        {
+            return Err(ImageImportError::Input);
+        }
+    }
+    let prepared = prepare_thumbnail(&source, worker_executable, request_id)?;
+    let logical_len = u64::try_from(prepared.bytes.len()).map_err(|_| ImageImportError::Input)?;
+    let mut reader = std::io::Cursor::new(prepared.bytes.expose());
+    vault
+        .replace_derived(
+            &mut reader,
+            logical_len,
+            target.media_id,
+            osv_storage::ObjectRole::Thumbnail,
+            osv_media::THUMBNAIL_RECIPE_VERSION,
+            prepared.width,
+            prepared.height,
+            now_ms,
+        )
+        .map_err(ImageImportError::Vault)
+}
+
+impl ImportPreview {
+    fn from_probe_with_fingerprint(
+        fingerprint: [u8; 32],
+        probe: osv_media::ImageProbe,
+        duplicate_exists: bool,
+    ) -> Self {
+        Self {
+            fingerprint,
+            mime: probe.format.mime(),
+            width: probe.width,
+            height: probe.height,
+            animated: probe.frames > 1,
+            duplicate: if duplicate_exists {
+                DuplicateState::AwaitingDecision
+            } else {
+                DuplicateState::Unique
+            },
+        }
+    }
+}
+
+impl PreparedImageImport {
+    pub fn commit(
+        self,
+        vault: &mut osv_vault::VaultService,
+        id: osv_catalog::MediaId,
+        original_name: &str,
+        imported_at_ms: i64,
+    ) -> Result<CommittedImage, ImageImportError> {
+        if !self.preview.may_import() {
+            return Err(ImageImportError::DecisionRequired);
+        }
+        let metadata = osv_vault::ImportMetadata {
+            id,
+            original_name,
+            class: osv_catalog::MediaClass::Image,
+            mime: self.preview.mime,
+            width: Some(self.probe.width),
+            height: Some(self.probe.height),
+            duration_ms: None,
+            codecs: match self.probe.format {
+                osv_media::ImageFormat::Png => "png",
+                osv_media::ImageFormat::Jpeg => "jpeg",
+                osv_media::ImageFormat::Gif => "gif",
+                osv_media::ImageFormat::Webp => "webp",
+            },
+            imported_at_ms,
+            fingerprint: &self.preview.fingerprint,
+        };
+        let mut original_reader = std::io::Cursor::new(self.source.expose());
+        let original_len = u64::try_from(self.source.len()).map_err(|_| ImageImportError::Input)?;
+        let original = vault
+            .import(&mut original_reader, original_len, metadata)
+            .map_err(ImageImportError::Vault)?;
+        let mut thumbnail_reader = std::io::Cursor::new(self.thumbnail.expose());
+        let thumbnail_len = self.thumbnail.len();
+        let thumbnail_len = u64::try_from(thumbnail_len).map_err(|_| ImageImportError::Input)?;
+        let thumbnail = vault
+            .replace_derived(
+                &mut thumbnail_reader,
+                thumbnail_len,
+                id,
+                osv_storage::ObjectRole::Thumbnail,
+                osv_media::THUMBNAIL_RECIPE_VERSION,
+                self.thumbnail_width,
+                self.thumbnail_height,
+                imported_at_ms,
+            )
+            .map_err(ImageImportError::Vault)?;
+        Ok(CommittedImage {
+            original,
+            thumbnail,
+            display_pixels: self.display_pixels,
+            display_width: self.thumbnail_width,
+            display_height: self.thumbnail_height,
+        })
+    }
+}
 
 /// Starts one short-lived, object-scoped archive parser.
 pub fn spawn_archive_worker(
@@ -14,4 +426,56 @@ pub fn spawn_archive_worker(
         request_id,
         limits,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_requires_explicit_choice() {
+        let probe = osv_media::ImageProbe {
+            format: osv_media::ImageFormat::Png,
+            width: 1,
+            height: 1,
+            frames: 1,
+            orientation: osv_media::Orientation::Normal,
+            has_color_profile: true,
+        };
+        let mut preview = ImportPreview::from_probe(b"same bytes", probe, true);
+        assert!(!preview.may_import());
+        preview.decide(DuplicateDecision::ImportAnotherCopy);
+        assert!(preview.may_import());
+        let expected: [u8; 32] = Sha256::digest(b"same bytes").into();
+        assert_eq!(preview.fingerprint, expected);
+        assert!(!format!("{preview:?}").contains("same bytes"));
+        assert!(!format!("{preview:?}").contains("image/png"));
+    }
+
+    #[test]
+    fn pre_cancelled_import_never_starts_a_worker() {
+        let cancelled = AtomicBool::new(true);
+        let mut source = std::io::Cursor::new(b"not opened".as_slice());
+        let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+        let password = osv_crypto::Password::new(b"cancel test password").unwrap();
+        let vault = osv_vault::VaultService::create(
+            &parent.path().join("cancel-vault"),
+            &password,
+            None,
+            osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_image_import_cancellable(
+                &mut source,
+                10,
+                Path::new("/missing-worker"),
+                1,
+                &vault.reader(),
+                &cancelled,
+            ),
+            Err(ImageImportError::Cancelled)
+        ));
+    }
 }

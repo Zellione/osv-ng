@@ -233,6 +233,18 @@ fn supervisor_errors_preserve_observed_lock_degradation() {
 }
 
 #[test]
+fn hostile_result_sequence_and_chunk_flood_fail_closed() {
+    let _guard = TEST_PROCESSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for request_id in [9, 10] {
+        let mut worker = Supervisor::spawn(fixture(), Role::Media, request_id, limits()).unwrap();
+        let error = worker.finish_with_output(1024).err().unwrap();
+        assert_eq!(error.class, ExitClass::Protocol, "{error:?}");
+    }
+}
+
+#[test]
 fn sandbox_denies_path_mutation_with_and_without_landlock() {
     if address_sanitizer_active() {
         return;

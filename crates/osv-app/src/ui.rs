@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
 
+use crate::runtime::{ImportRequest, OpenKind, VaultSession};
 use crate::{
     Appearance, Command, CssOutcome, Density, PanelPlacement, Revocable, Route, ShellState, Theme,
     accept_user_css, gallery_labels,
@@ -24,6 +25,14 @@ const BASE_CSS: &str = r#"
 struct CssSlots {
     appearance: gtk::CssProvider,
     user: gtk::CssProvider,
+}
+
+struct TexturePixels(osv_crypto::SecretBytes);
+
+impl AsRef<[u8]> for TexturePixels {
+    fn as_ref(&self) -> &[u8] {
+        self.0.expose()
+    }
 }
 
 impl CssSlots {
@@ -73,6 +82,9 @@ pub fn run() -> glib::ExitCode {
 fn build_window(app: &gtk::Application) {
     let css = CssSlots::install();
     let state = Rc::new(RefCell::new(ShellState::default()));
+    let vault_authority = Rc::new(RefCell::new(None::<gio::File>));
+    let session = Rc::new(RefCell::new(None::<VaultSession>));
+    let sensitive_pictures = Rc::new(RefCell::new(Vec::<gtk::Picture>::new()));
     css.set_appearance(&state.borrow().appearance);
     let password = gtk::PasswordEntry::builder()
         .placeholder_text("Password")
@@ -80,10 +92,29 @@ fn build_window(app: &gtk::Application) {
         .build();
     password.update_property(&[gtk::accessible::Property::Label("Vault password")]);
     let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-    stack.add_named(&welcome_page(&state, &stack), Some("choose"));
-    stack.add_named(&unlock_page(&state, &stack, &password), Some("unlock"));
-    stack.add_named(&create_page(&state, &stack), Some("create"));
-    stack.add_named(&vault_page(&state, &stack, &password, &css), Some("vault"));
+    stack.add_named(
+        &welcome_page(&state, &stack, &vault_authority),
+        Some("choose"),
+    );
+    stack.add_named(
+        &unlock_page(&state, &stack, &password, &vault_authority, &session),
+        Some("unlock"),
+    );
+    stack.add_named(
+        &create_page(&state, &stack, &vault_authority, &session),
+        Some("create"),
+    );
+    stack.add_named(
+        &vault_page(
+            &state,
+            &stack,
+            &password,
+            &css,
+            &session,
+            &sensitive_pictures,
+        ),
+        Some("vault"),
+    );
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Obscura Safe Vault")
@@ -92,7 +123,14 @@ fn build_window(app: &gtk::Application) {
         .child(&stack)
         .build();
     window.add_css_class("osv-shell");
-    install_keyboard(&window, &state, &stack, &password);
+    install_keyboard(
+        &window,
+        &state,
+        &stack,
+        &password,
+        &sensitive_pictures,
+        &session,
+    );
     window.present();
 }
 
@@ -101,11 +139,15 @@ fn install_keyboard(
     state: &Rc<RefCell<ShellState>>,
     outer: &gtk::Stack,
     password: &gtk::PasswordEntry,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
 ) {
     let keys = gtk::EventControllerKey::new();
     let state = Rc::clone(state);
     let outer = outer.clone();
     let password = password.clone();
+    let sensitive_pictures = Rc::clone(sensitive_pictures);
+    let session = Rc::clone(session);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let command = [
             Command::Lock,
@@ -131,6 +173,12 @@ fn install_keyboard(
             return glib::Propagation::Proceed;
         };
         if state.borrow_mut().activate(command) {
+            if command == Command::Lock {
+                if let Some(session) = session.borrow_mut().take() {
+                    session.revoke();
+                }
+                clear_sensitive_pictures(&sensitive_pictures);
+            }
             sync_route(&outer, state.borrow().route(), &password);
             glib::Propagation::Stop
         } else {
@@ -194,7 +242,11 @@ fn page(title: &str) -> gtk::Box {
     page
 }
 
-fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Widget {
+fn welcome_page(
+    state: &Rc<RefCell<ShellState>>,
+    stack: &gtk::Stack,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+) -> gtk::Widget {
     let page = page("Obscura Safe Vault");
     let choose = gtk::Button::with_mnemonic("_Choose vault folder");
     let create = gtk::Button::with_mnemonic("_Create a vault");
@@ -202,12 +254,15 @@ fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Wid
     page.append(&create);
     let state_for_choose = Rc::clone(state);
     let stack_for_choose = stack.clone();
+    let authority_for_choose = Rc::clone(authority);
     choose.connect_clicked(move |button| {
+        let authority = Rc::clone(&authority_for_choose);
         select_folder(button, "Choose a vault folder", {
             let state = Rc::clone(&state_for_choose);
             let stack = stack_for_choose.clone();
             move |outcome| match outcome {
-                PortalSelection::Selected => {
+                PortalSelection::Selected(file) => {
+                    *authority.borrow_mut() = Some(file);
                     state.borrow_mut().navigate(Route::Unlock);
                     stack.set_visible_child_name("unlock");
                 }
@@ -229,7 +284,7 @@ fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Wid
 }
 
 enum PortalSelection {
-    Selected,
+    Selected(gio::File),
     Cancelled,
     Failed,
 }
@@ -243,7 +298,7 @@ fn select_folder(
     let parent = button.root().and_downcast::<gtk::Window>();
     dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
         complete(match result {
-            Ok(_) => PortalSelection::Selected,
+            Ok(file) => PortalSelection::Selected(file),
             Err(error) if portal_error_is_cancelled(&error) => PortalSelection::Cancelled,
             Err(_) => PortalSelection::Failed,
         });
@@ -260,6 +315,8 @@ fn unlock_page(
     state: &Rc<RefCell<ShellState>>,
     stack: &gtk::Stack,
     password: &gtk::PasswordEntry,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
 ) -> gtk::Widget {
     let page = page("Unlock vault");
     let unlock = gtk::Button::with_mnemonic("_Unlock");
@@ -268,33 +325,108 @@ fn unlock_page(
     let state = Rc::clone(state);
     let stack = stack.clone();
     let password = password.clone();
+    let authority = Rc::clone(authority);
+    let session = Rc::clone(session);
     unlock.connect_clicked(move |_| {
-        state.borrow_mut().unlock();
+        let Some(file) = authority.borrow().clone() else {
+            show_error(&stack, "Choose a vault folder before unlocking.");
+            return;
+        };
+        let Some(path) = file.path() else {
+            show_error(
+                &stack,
+                "The selected portal folder is not locally accessible.",
+            );
+            return;
+        };
+        let password_bytes = password.text().as_bytes().to_vec();
         password.set_text("");
-        sync_route(&stack, Route::Gallery, &password);
+        begin_vault_session(
+            path,
+            password_bytes,
+            OpenKind::Unlock,
+            &state,
+            &session,
+            &stack,
+            &password,
+        );
     });
     page.upcast()
 }
 
-fn create_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Widget {
+fn create_page(
+    state: &Rc<RefCell<ShellState>>,
+    stack: &gtk::Stack,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+) -> gtk::Widget {
     let page = page("Create vault");
     let location = gtk::Button::with_mnemonic("Choose _location…");
     let back = gtk::Button::with_mnemonic("_Back");
+    let name = gtk::Entry::builder().text("Obscura Vault").build();
+    let password = gtk::PasswordEntry::builder()
+        .placeholder_text("New vault password")
+        .show_peek_icon(true)
+        .build();
+    let create = gtk::Button::with_mnemonic("_Create vault");
     let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
     page.append(&location);
+    page.append(&name);
+    page.append(&password);
+    page.append(&create);
     page.append(&back);
     page.append(&status);
+    let authority_for_location = Rc::clone(authority);
+    let status_for_location = status.clone();
     location.connect_clicked(move |button| {
-        let status = status.clone();
+        let status = status_for_location.clone();
+        let authority = Rc::clone(&authority_for_location);
         select_folder(button, "Choose where to create the vault", move |outcome| {
             status.set_label(match outcome {
-                PortalSelection::Selected => {
-                    "Location selected. Creation is ready for the vault service."
+                PortalSelection::Selected(file) => {
+                    *authority.borrow_mut() = Some(file);
+                    "Parent folder selected. Enter a name and password."
                 }
                 PortalSelection::Cancelled => "Selection cancelled.",
                 PortalSelection::Failed => "The folder chooser failed. Try again.",
             });
         });
+    });
+    let state_for_create = Rc::clone(state);
+    let stack_for_create = stack.clone();
+    let authority_for_create = Rc::clone(authority);
+    let session_for_create = Rc::clone(session);
+    let password_for_create = password.clone();
+    create.connect_clicked(move |_| {
+        let folder_name = name.text();
+        if folder_name.is_empty()
+            || folder_name.contains('/')
+            || matches!(folder_name.as_str(), "." | "..")
+        {
+            status.set_label("Choose a simple vault folder name.");
+            return;
+        }
+        let Some(parent) = authority_for_create.borrow().clone() else {
+            status.set_label("Choose a parent folder first.");
+            return;
+        };
+        let target = parent.child(folder_name.as_str());
+        let Some(path) = target.path() else {
+            status.set_label("The selected portal folder is not locally accessible.");
+            return;
+        };
+        *authority_for_create.borrow_mut() = Some(target);
+        let password_bytes = password_for_create.text().as_bytes().to_vec();
+        password_for_create.set_text("");
+        begin_vault_session(
+            path,
+            password_bytes,
+            OpenKind::Create,
+            &state_for_create,
+            &session_for_create,
+            &stack_for_create,
+            &password_for_create,
+        );
     });
     let state = Rc::clone(state);
     let stack = stack.clone();
@@ -310,13 +442,15 @@ fn vault_page(
     outer: &gtk::Stack,
     password: &gtk::PasswordEntry,
     css: &Rc<CssSlots>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sidebar.add_css_class("osv-sidebar");
     let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     content.set_widget_name("osv-vault-content");
-    content.add_named(&gallery_view(100_000), Some("gallery"));
+    content.add_named(&gallery_view(session, sensitive_pictures), Some("gallery"));
     content.add_named(
         &simple_page("Search", "Search is ready for catalog integration."),
         Some("search"),
@@ -370,7 +504,13 @@ fn vault_page(
     let state_for_lock = Rc::clone(state);
     let outer_for_lock = outer.clone();
     let password_for_lock = password.clone();
+    let session_for_lock = Rc::clone(session);
+    let sensitive_pictures_for_lock = Rc::clone(sensitive_pictures);
     lock.connect_clicked(move |_| {
+        if let Some(session) = session_for_lock.borrow_mut().take() {
+            session.revoke();
+        }
+        clear_sensitive_pictures(&sensitive_pictures_for_lock);
         state_for_lock.borrow_mut().lock();
         sync_route(&outer_for_lock, Route::Choose, &password_for_lock);
     });
@@ -379,7 +519,258 @@ fn vault_page(
     root.upcast()
 }
 
-fn gallery_view(items: u32) -> gtk::Widget {
+fn begin_vault_session(
+    path: std::path::PathBuf,
+    password_bytes: Vec<u8>,
+    kind: OpenKind,
+    state: &Rc<RefCell<ShellState>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    stack: &gtk::Stack,
+    password: &gtk::PasswordEntry,
+) {
+    if let Some(previous) = session.borrow_mut().take() {
+        previous.revoke();
+    }
+    *session.borrow_mut() = Some(VaultSession::begin(path, password_bytes, kind));
+    let state = Rc::clone(state);
+    let session = Rc::clone(session);
+    let stack = stack.clone();
+    let password = password.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        let ready = session.borrow().as_ref().and_then(VaultSession::try_ready);
+        match ready {
+            None => glib::ControlFlow::Continue,
+            Some(Ok(())) => {
+                state.borrow_mut().unlock();
+                sync_route(&stack, Route::Gallery, &password);
+                glib::ControlFlow::Break
+            }
+            Some(Err(_)) => {
+                if let Some(failed) = session.borrow_mut().take() {
+                    failed.revoke();
+                }
+                show_error(
+                    &stack,
+                    "The vault could not be opened. Check the folder and credentials.",
+                );
+                glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn gallery_view(
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let import = gtk::Button::with_mnemonic("_Import image…");
+    let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    status.update_property(&[gtk::accessible::Property::Label("Image import status")]);
+    let confirm = gtk::Button::with_mnemonic("_Import");
+    let skip = gtk::Button::with_mnemonic("_Skip duplicate");
+    let another = gtk::Button::with_mnemonic("Import _another copy");
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Contain)
+        .can_shrink(true)
+        .height_request(360)
+        .build();
+    picture.update_property(&[gtk::accessible::Property::Label("Imported image preview")]);
+    sensitive_pictures.borrow_mut().push(picture.clone());
+    for button in [&confirm, &skip, &another] {
+        button.set_visible(false);
+    }
+    let decisions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    decisions.append(&confirm);
+    decisions.append(&skip);
+    decisions.append(&another);
+    root.append(&import);
+    root.append(&status);
+    root.append(&decisions);
+    root.append(&picture);
+
+    let selected_authority = Rc::new(RefCell::new(None::<gio::File>));
+    let commit: Rc<dyn Fn(Option<osv_import::DuplicateDecision>)> = {
+        let session = Rc::clone(session);
+        let status = status.clone();
+        let selected_authority = Rc::clone(&selected_authority);
+        let confirm = confirm.clone();
+        let skip = skip.clone();
+        let another = another.clone();
+        let picture = picture.clone();
+        Rc::new(move |decision| {
+            let receiver = session
+                .borrow()
+                .as_ref()
+                .ok_or(crate::runtime::RuntimeError::Closed)
+                .and_then(|session| session.commit_import(decision));
+            let Ok(receiver) = receiver else {
+                status.set_label("The unlocked session is no longer available.");
+                return;
+            };
+            status.set_label("Encrypting and publishing image…");
+            confirm.set_sensitive(false);
+            skip.set_sensitive(false);
+            another.set_sensitive(false);
+            let status = status.clone();
+            let selected_authority = Rc::clone(&selected_authority);
+            let confirm = confirm.clone();
+            let skip = skip.clone();
+            let another = another.clone();
+            let picture = picture.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(Some(imported))) => {
+                        let Ok(width) = i32::try_from(imported.width) else {
+                            status.set_label("The decoded image dimensions were rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let Ok(height) = i32::try_from(imported.height) else {
+                            status.set_label("The decoded image dimensions were rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let Ok(stride) = usize::try_from(imported.width)
+                            .ok()
+                            .and_then(|width| width.checked_mul(4))
+                            .ok_or(())
+                        else {
+                            status.set_label("The decoded image stride was rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let bytes = glib::Bytes::from_owned(TexturePixels(imported.pixels));
+                        let texture = gdk::MemoryTexture::new(
+                            width,
+                            height,
+                            gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            stride,
+                        );
+                        picture.set_paintable(Some(&texture));
+                        status.set_label("Image imported securely.");
+                    }
+                    Ok(Ok(None)) => status.set_label("Duplicate skipped."),
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("Image import stopped safely. Review the file and retry.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                *selected_authority.borrow_mut() = None;
+                for button in [&confirm, &skip, &another] {
+                    button.set_visible(false);
+                    button.set_sensitive(true);
+                }
+                glib::ControlFlow::Break
+            });
+        })
+    };
+    {
+        let commit = Rc::clone(&commit);
+        confirm.connect_clicked(move |_| commit(None));
+    }
+    {
+        let commit = Rc::clone(&commit);
+        skip.connect_clicked(move |_| commit(Some(osv_import::DuplicateDecision::Skip)));
+    }
+    another.connect_clicked(move |_| {
+        commit(Some(osv_import::DuplicateDecision::ImportAnotherCopy));
+    });
+
+    let session_for_import = Rc::clone(session);
+    import.connect_clicked(move |button| {
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose an image to import")
+            .modal(true)
+            .build();
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("Supported images"));
+        for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            filter.add_mime_type(mime);
+        }
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        dialog.set_filters(Some(&filters));
+        let parent = button.root().and_downcast::<gtk::Window>();
+        let session = Rc::clone(&session_for_import);
+        let status = status.clone();
+        let selected_authority = Rc::clone(&selected_authority);
+        let confirm = confirm.clone();
+        let skip = skip.clone();
+        let another = another.clone();
+        dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+            let file = match result {
+                Ok(file) => file,
+                Err(error) if portal_error_is_cancelled(&error) => return,
+                Err(_) => {
+                    status.set_label("The image chooser failed. Try again.");
+                    return;
+                }
+            };
+            let Some(path) = file.path() else {
+                status.set_label("The selected portal file is not locally accessible.");
+                return;
+            };
+            let original_name = file
+                .basename()
+                .and_then(|name| name.into_string().ok())
+                .unwrap_or_else(|| "imported-image".to_owned());
+            *selected_authority.borrow_mut() = Some(file);
+            let receiver = session
+                .borrow()
+                .as_ref()
+                .ok_or(crate::runtime::RuntimeError::Closed)
+                .and_then(|session| {
+                    session.prepare_import(ImportRequest {
+                        source_path: path,
+                        original_name,
+                    })
+                });
+            let Ok(receiver) = receiver else {
+                status.set_label("Unlock a vault before importing.");
+                return;
+            };
+            status.set_label("Inspecting image in the isolated worker…");
+            let status = status.clone();
+            let confirm = confirm.clone();
+            let skip = skip.clone();
+            let another = another.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(preview)) => {
+                        status.set_label(&format!(
+                            "{} — {} × {}{}{}",
+                            preview.mime,
+                            preview.width,
+                            preview.height,
+                            if preview.animated {
+                                " — animated"
+                            } else {
+                                ""
+                            },
+                            if preview.duplicate {
+                                " — exact duplicate"
+                            } else {
+                                ""
+                            }
+                        ));
+                        confirm.set_visible(!preview.duplicate);
+                        skip.set_visible(preview.duplicate);
+                        another.set_visible(preview.duplicate);
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("The image was rejected safely.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        });
+    });
+
+    let items = 100_000;
     let labels = gallery_labels(items).expect("bounded gallery size");
     let references: Vec<&str> = labels.iter().map(String::as_str).collect();
     let model = gtk::StringList::new(&references);
@@ -406,11 +797,19 @@ fn gallery_view(items: u32) -> gtk::Widget {
     grid.set_min_columns(2);
     grid.set_max_columns(12);
     grid.add_css_class("osv-gallery");
-    gtk::ScrolledWindow::builder()
+    let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&grid)
-        .build()
-        .upcast()
+        .vexpand(true)
+        .build();
+    root.append(&scroller);
+    root.upcast()
+}
+
+fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {
+    for picture in pictures.borrow().iter() {
+        picture.set_paintable(gtk::gdk::Paintable::NONE);
+    }
 }
 
 fn simple_page(title: &str, detail: &str) -> gtk::Widget {

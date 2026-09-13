@@ -213,6 +213,26 @@ fn run_hostile_worker() {
                 })
                 .unwrap();
         }
+        9 | 10 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            handshake(&mut channel, &hello);
+            let _ = channel.receive().unwrap();
+            let count = if hello.request_id == 9 {
+                1
+            } else {
+                osv_worker_protocol::MAX_RESULT_CHUNKS + 1
+            };
+            for sequence in 0..count {
+                let sequence = if hello.request_id == 9 { 1 } else { sequence };
+                let _ = channel.send(&Frame {
+                    request_id: hello.request_id,
+                    message: Message::ResultData {
+                        sequence,
+                        bytes: osv_crypto::SecretBytes::new(b"x").unwrap(),
+                    },
+                });
+            }
+        }
         _ => std::process::exit(64),
     }
 }
