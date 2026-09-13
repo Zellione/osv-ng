@@ -22,6 +22,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+      - name: Install GTK development dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-4-dev
       - name: Build pinned SQLCipher
         working-directory: ${{ runner.temp }}
         run: |
@@ -133,6 +137,6 @@ jobs:
         run: flatpak-builder --force-clean --disable-rofiles-fuse .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml
       - name: Run the installed bootstrap binaries
         run: |
-          flatpak-builder --run .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml osv-app
+          flatpak-builder --run .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml osv-app --self-check
           flatpak-builder --run .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml /app/libexec/osv-media-worker
           flatpak-builder --run .flatpak-phase2 build-aux/flatpak/io.github.osv_ng.Phase2.yml /app/libexec/osv-archive-worker

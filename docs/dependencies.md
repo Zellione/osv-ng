@@ -3,6 +3,17 @@
 Direct dependencies in the production workspace are recorded here alongside the
 review checklist. Transitive versions remain pinned by the root `Cargo.lock`.
 
+## Phase 8 GTK shell
+
+- `gtk4` 0.11.4 is the accepted gtk-rs binding from ADR 0007. Its sys crates
+  temporarily retain `system-deps` 7 while shared GLib-stack sys crates use
+  version 9, and `gtk4-macros` retains `syn` 2 while GLib macros use version 3.
+  Both duplicate leaves are narrowly allowed in `deny.toml`; remove the
+  exceptions when gtk-rs converges them.
+- The GTK transitive graph adds the OSI-approved Apache-2.0,
+  Apache-2.0-with-LLVM-exception, and Unicode-3.0 license expressions to the
+  existing MIT/BSD policy.
+
 ## Phase 3 cryptographic and Linux dependencies
 
 - `argon2` 0.5.3 provides the RustCrypto Argon2id implementation. Default

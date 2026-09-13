@@ -1335,6 +1335,77 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Establish the redesigned UI without coupling it to storage details.
 
+**Implementation complete 2026-09-12; manual acceptance pending**
+
+**Progress**
+
+- Promoted GTK4 0.11.4 into the production workspace and replaced the headless
+  application stub with a storage-independent shell. The shell provides
+  portal-backed choose/create entry points, an unlock form, explicit public
+  routes, virtualized grid navigation, task and search surfaces, preferences,
+  and an immediate lock transition.
+- Added a headless session/action model with generation-bound background jobs,
+  cancellation, redacted public worker failures, and a synchronous lock
+  boundary. Lock revokes tracked worker authority, drops and wipes
+  application-owned decrypted labels, clears jobs, invalidates late callbacks,
+  and returns to the non-sensitive chooser.
+- Added bounded appearance and shortcut models covering system/light/dark/high
+  contrast themes, accent color, compact/comfortable/spacious density, spacing,
+  font family and size, four panel placements, accelerator conflicts, and
+  desktop-reserved shortcuts. Invalid settings normalize to safe defaults.
+- User CSS is capped at 256 KiB, rejects imports, is parsed into a temporary GTK
+  provider, and is installed only when parsing reports no errors; otherwise the
+  active built-in theme remains installed. GTK `GridView`/`ListItemFactory`
+  supplies virtualized, labelled gallery children for a synthetic 100k model.
+- Remediated the post-commit GPT-6 review: the central route synchronizer wipes
+  the password widget on every lock; decrypted labels now use redacted,
+  best-effort locked `SecretString` owners; job and worker registrations own
+  synchronous revocation capabilities; and cancellation, failure, completion,
+  and lock observably revoke them. CSS policy rejects all at-rules, escapes, and
+  URL tokens and reloads two stable providers instead of accumulating them.
+- GTK dismissal and cancellation domains are handled separately from chooser
+  failure. Accelerator parsing normalizes modifier aliases and rejects malformed,
+  conflicting, and reserved bindings. Panel placement now reparents or hides the
+  live sidebar, accent styling is visible on selection, and the task surface
+  drives progress, cancellation, and redacted failure states from a synthetic
+  asynchronous job. Preference controls have explicit accessible labels and a
+  scrollable constrained-window layout.
+
+**Verification**
+
+- Headless regressions cover locked and unlocked keyboard actions, invalid CSS,
+  theme input normalization, scale factors 1 through 4, lock during a job,
+  stale callbacks after relock, redacted worker failure, portal cancellation,
+  shortcut conflicts, and bounded 100k-entry index setup.
+- Workspace formatting, warnings-as-errors Clippy, all-target/all-feature tests,
+  the secret-canary regression, `cargo audit`, and dependency-policy gates pass.
+  The Flatpak dependency source lock was regenerated after adding GTK; the
+  clean offline release build/test gate and all three installed self-checks
+  pass. A native Wayland smoke launch reached the event loop and remained
+  responsive until its intentional timeout.
+
+**Deviations and follow-up**
+
+- Vault creation and authentication buttons terminate at explicit service
+  seams: Phase 8 owns interaction state, not storage orchestration. Phase 9
+  will connect those seams while delivering the first end-to-end media path.
+- Automated tests exercise GTK-independent policy so they run without a display.
+  Native Wayland accessibility inspection, mixed-output scale movement, and
+  portal interaction remain manual release gates; the Phase 1 measurements
+  supporting GTK selection remain recorded in ADR 0007.
+- The 100k test now constructs the same bounded label vector consumed by the GTK
+  model rather than timing three sample labels. Automated frame-time, assistive
+  technology, and real mixed-output measurements remain manual release gates as
+  stated above rather than being inferred from the headless arithmetic tests.
+- The final GPT-6 re-review tightened authority ownership so rejection, session
+  replacement, shell drop, completion, failure, cancellation, and lock all
+  revoke through an RAII owner. It also made job terminal states monotonic,
+  prevents overlapping demo tasks from sharing presentation state, validates
+  user accelerators with GTK before assignment, normalizes dispatch modifiers,
+  and reuses the active window so global CSS providers remain single-instance.
+  Phase 9 is not open until the remaining native Wayland interaction,
+  accessibility, mixed-scale, and production-view performance gates are run.
+
 **Deliverables**
 
 - Unlock/create/choose flow, lock boundary, navigation/action model, background
