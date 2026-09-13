@@ -1486,6 +1486,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   results echo both fields and are rejected on mismatch. Catalog tile selection
   now authenticates the encrypted original and requests a separately capped
   4096-edge viewer rendition instead of enlarging the stored 512-edge thumbnail.
+- Wired visible viewer controls for bounded zoom, directional pan, clockwise
+  rotation, and previous/next catalog navigation. GTK applies zoom/pan/rotation
+  as a native GSK child transform over the protected texture owner, avoiding a
+  second application pixel buffer. Page, arrow, plus/minus, and rotation keys
+  invoke the same controls, with Ctrl/Alt combinations left to global shortcuts.
 
 **Verification**
 
@@ -1508,8 +1513,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Visible zoom/pan/rotation/media navigation, decoded animation-frame
-  representation and controls, deeper
+- Decoded animation-frame representation and controls, deeper
   color-profile fixtures, and Flatpak interactive display checks remain required
   before Phase 9 can be marked complete. Third-party decoder working
   allocations remain subject to the documented opaque-library limitation and

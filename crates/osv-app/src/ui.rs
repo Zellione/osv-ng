@@ -587,7 +587,71 @@ fn gallery_view(
     root.append(&import);
     root.append(&status);
     root.append(&decisions);
-    root.append(&picture);
+    let viewer = gtk::Fixed::new();
+    viewer.set_size_request(640, 380);
+    viewer.put(&picture, 0.0, 0.0);
+    let viewer_state = Rc::new(RefCell::new(osv_media::ViewerState::new(1)));
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let previous = gtk::Button::with_mnemonic("_Previous");
+    let next = gtk::Button::with_mnemonic("_Next");
+    let zoom_out = gtk::Button::with_label("Zoom out");
+    let zoom_in = gtk::Button::with_label("Zoom in");
+    let rotate = gtk::Button::with_label("Rotate clockwise");
+    let pan_left = gtk::Button::with_label("Pan left");
+    let pan_right = gtk::Button::with_label("Pan right");
+    let pan_up = gtk::Button::with_label("Pan up");
+    let pan_down = gtk::Button::with_label("Pan down");
+    for button in [
+        &previous, &next, &zoom_out, &zoom_in, &rotate, &pan_left, &pan_right, &pan_up, &pan_down,
+    ] {
+        controls.append(button);
+    }
+    root.append(&controls);
+    root.append(&viewer);
+
+    let apply_transform: Rc<dyn Fn()> = {
+        let viewer = viewer.clone();
+        let picture = picture.clone();
+        let viewer_state = Rc::clone(&viewer_state);
+        Rc::new(move || {
+            let state = *viewer_state.borrow();
+            let (pan_x, pan_y) = state.pan();
+            let transform = gtk::gsk::Transform::new()
+                .translate(&gtk::graphene::Point::new(pan_x as f32, pan_y as f32))
+                .rotate(state.rotation() as f32)
+                .scale(state.zoom() as f32, state.zoom() as f32);
+            viewer.set_child_transform(&picture, Some(&transform));
+        })
+    };
+    for (button, zoom) in [(&zoom_out, 0.8), (&zoom_in, 1.25)] {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        button.connect_clicked(move |_| {
+            state.borrow_mut().zoom_by(zoom);
+            apply();
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        rotate.connect_clicked(move |_| {
+            state.borrow_mut().rotate_clockwise();
+            apply();
+        });
+    }
+    for (button, x, y) in [
+        (&pan_left, -32.0, 0.0),
+        (&pan_right, 32.0, 0.0),
+        (&pan_up, 0.0, -32.0),
+        (&pan_down, 0.0, 32.0),
+    ] {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        button.connect_clicked(move |_| {
+            state.borrow_mut().pan_by(x, y);
+            apply();
+        });
+    }
 
     let selected_authority = Rc::new(RefCell::new(None::<gio::File>));
     let commit: Rc<dyn Fn(Option<osv_import::DuplicateDecision>)> = {
@@ -774,6 +838,24 @@ fn gallery_view(
     let model = gtk::StringList::new(&[]);
     let selection = gtk::SingleSelection::new(Some(model.clone()));
     let records = Rc::new(RefCell::new(Vec::<GalleryImage>::new()));
+    {
+        let selection = selection.clone();
+        previous.connect_clicked(move |_| {
+            let selected = selection.selected();
+            if selected != gtk::INVALID_LIST_POSITION && selected > 0 {
+                selection.set_selected(selected - 1);
+            }
+        });
+    }
+    {
+        let selection = selection.clone();
+        next.connect_clicked(move |_| {
+            let selected = selection.selected();
+            if selected != gtk::INVALID_LIST_POSITION && selected + 1 < selection.n_items() {
+                selection.set_selected(selected + 1);
+            }
+        });
+    }
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
@@ -797,6 +879,8 @@ fn gallery_view(
         let records = Rc::clone(&records);
         let picture = picture.clone();
         let status = status.clone();
+        let viewer_state = Rc::clone(&viewer_state);
+        let apply_transform = Rc::clone(&apply_transform);
         selection.connect_selected_notify(move |selection| {
             let index = selection.selected();
             let Some(record) = records.borrow().get(index as usize).copied() else {
@@ -820,6 +904,8 @@ fn gallery_view(
             let session = Rc::clone(&session);
             let picture = picture.clone();
             let status = status.clone();
+            let viewer_state = Rc::clone(&viewer_state);
+            let apply_transform = Rc::clone(&apply_transform);
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 match receiver.try_recv() {
                     Ok(Ok(opened)) => {
@@ -833,7 +919,9 @@ fn gallery_view(
                         if let Some(texture) =
                             memory_texture(opened.pixels, opened.width, opened.height)
                         {
+                            *viewer_state.borrow_mut() = osv_media::ViewerState::new(opened.frames);
                             picture.set_paintable(Some(&texture));
+                            apply_transform();
                             status.set_label("Original opened through the isolated viewer path.");
                         } else {
                             status.set_label("The decoded viewer dimensions were rejected.");
@@ -854,6 +942,42 @@ fn gallery_view(
     grid.set_min_columns(2);
     grid.set_max_columns(12);
     grid.add_css_class("osv-gallery");
+    let keys = gtk::EventControllerKey::new();
+    {
+        let previous = previous.clone();
+        let next = next.clone();
+        let zoom_out = zoom_out.clone();
+        let zoom_in = zoom_in.clone();
+        let rotate = rotate.clone();
+        let pan_left = pan_left.clone();
+        let pan_right = pan_right.clone();
+        let pan_up = pan_up.clone();
+        let pan_down = pan_down.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let button = match key {
+                gdk::Key::Page_Up => Some(&previous),
+                gdk::Key::Page_Down => Some(&next),
+                gdk::Key::plus | gdk::Key::KP_Add => Some(&zoom_in),
+                gdk::Key::minus | gdk::Key::KP_Subtract => Some(&zoom_out),
+                gdk::Key::r | gdk::Key::R => Some(&rotate),
+                gdk::Key::Left => Some(&pan_left),
+                gdk::Key::Right => Some(&pan_right),
+                gdk::Key::Up => Some(&pan_up),
+                gdk::Key::Down => Some(&pan_down),
+                _ => None,
+            };
+            if let Some(button) = button {
+                button.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
+    root.add_controller(keys);
     let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&grid)
