@@ -28,7 +28,33 @@ struct CssSlots {
 }
 
 struct TexturePixels(osv_crypto::SecretBytes);
-type SensitiveAnimations = Rc<RefCell<Vec<Rc<RefCell<Vec<gdk::MemoryTexture>>>>>>;
+
+struct AnimationPlayback {
+    frames: RefCell<Vec<gdk::MemoryTexture>>,
+    delays: RefCell<Vec<u32>>,
+    viewer: RefCell<osv_media::ViewerState>,
+    next_frame_at: Cell<std::time::Instant>,
+}
+
+impl AnimationPlayback {
+    fn new() -> Self {
+        Self {
+            frames: RefCell::new(Vec::new()),
+            delays: RefCell::new(Vec::new()),
+            viewer: RefCell::new(osv_media::ViewerState::new(1)),
+            next_frame_at: Cell::new(std::time::Instant::now()),
+        }
+    }
+
+    fn revoke(&self) {
+        self.frames.borrow_mut().clear();
+        self.delays.borrow_mut().clear();
+        *self.viewer.borrow_mut() = osv_media::ViewerState::new(1);
+        self.next_frame_at.set(std::time::Instant::now());
+    }
+}
+
+type SensitiveAnimations = Rc<RefCell<Vec<Rc<AnimationPlayback>>>>;
 
 impl AsRef<[u8]> for TexturePixels {
     fn as_ref(&self) -> &[u8] {
@@ -604,13 +630,14 @@ fn gallery_view(
     let viewer = gtk::Fixed::new();
     viewer.set_size_request(640, 380);
     viewer.put(&picture, 0.0, 0.0);
-    let viewer_state = Rc::new(RefCell::new(osv_media::ViewerState::new(1)));
-    let animation_frames = Rc::new(RefCell::new(Vec::<gdk::MemoryTexture>::new()));
+    let animation = Rc::new(AnimationPlayback::new());
     sensitive_animations
         .borrow_mut()
-        .push(Rc::clone(&animation_frames));
-    let frame_delays = Rc::new(RefCell::new(Vec::<u32>::new()));
-    let next_frame_at = Rc::new(Cell::new(std::time::Instant::now()));
+        .push(Rc::clone(&animation));
+    let viewer_state = Rc::clone(&animation);
+    let animation_frames = Rc::clone(&animation);
+    let frame_delays = Rc::clone(&animation);
+    let next_frame_at = Rc::clone(&animation);
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let previous = gtk::Button::with_mnemonic("_Previous");
     let next = gtk::Button::with_mnemonic("_Next");
@@ -646,7 +673,7 @@ fn gallery_view(
         let picture = picture.clone();
         let viewer_state = Rc::clone(&viewer_state);
         Rc::new(move || {
-            let state = *viewer_state.borrow();
+            let state = *viewer_state.viewer.borrow();
             let (pan_x, pan_y) = state.pan();
             let transform = gtk::gsk::Transform::new()
                 .translate(&gtk::graphene::Point::new(pan_x as f32, pan_y as f32))
@@ -659,7 +686,7 @@ fn gallery_view(
         let state = Rc::clone(&viewer_state);
         let apply = Rc::clone(&apply_transform);
         button.connect_clicked(move |_| {
-            state.borrow_mut().zoom_by(zoom);
+            state.viewer.borrow_mut().zoom_by(zoom);
             apply();
         });
     }
@@ -667,7 +694,7 @@ fn gallery_view(
         let state = Rc::clone(&viewer_state);
         let apply = Rc::clone(&apply_transform);
         rotate.connect_clicked(move |_| {
-            state.borrow_mut().rotate_clockwise();
+            state.viewer.borrow_mut().rotate_clockwise();
             apply();
         });
     }
@@ -680,7 +707,7 @@ fn gallery_view(
         let state = Rc::clone(&viewer_state);
         let apply = Rc::clone(&apply_transform);
         button.connect_clicked(move |_| {
-            state.borrow_mut().pan_by(x, y);
+            state.viewer.borrow_mut().pan_by(x, y);
             apply();
         });
     }
@@ -689,17 +716,22 @@ fn gallery_view(
         let next_frame_at = Rc::clone(&next_frame_at);
         let frame_delays = Rc::clone(&frame_delays);
         play_pause.connect_clicked(move |button| {
-            state.borrow_mut().toggle_animation();
-            let playing = state.borrow().playing();
+            state.viewer.borrow_mut().toggle_animation();
+            let playing = state.viewer.borrow().playing();
             button.set_label(if playing {
                 "Pause animation"
             } else {
                 "Play animation"
             });
             if playing {
-                let frame = state.borrow().frame() as usize;
-                let delay = frame_delays.borrow().get(frame).copied().unwrap_or(10);
-                next_frame_at.set(
+                let frame = state.viewer.borrow().frame() as usize;
+                let delay = frame_delays
+                    .delays
+                    .borrow()
+                    .get(frame)
+                    .copied()
+                    .unwrap_or(10);
+                next_frame_at.next_frame_at.set(
                     std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
                 );
             }
@@ -710,9 +742,9 @@ fn gallery_view(
         let frames = Rc::clone(&animation_frames);
         let picture = picture.clone();
         step_frame.connect_clicked(move |_| {
-            state.borrow_mut().step_forward();
-            let frame = state.borrow().frame() as usize;
-            if let Some(texture) = frames.borrow().get(frame) {
+            state.viewer.borrow_mut().step_forward();
+            let frame = state.viewer.borrow().frame() as usize;
+            if let Some(texture) = frames.frames.borrow().get(frame) {
                 picture.set_paintable(Some(texture));
             }
         });
@@ -724,17 +756,17 @@ fn gallery_view(
         let next_frame_at = Rc::clone(&next_frame_at);
         let picture = picture.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
-            if frames.borrow().len() > 1
-                && state.borrow().playing()
-                && std::time::Instant::now() >= next_frame_at.get()
+            if frames.frames.borrow().len() > 1
+                && state.viewer.borrow().playing()
+                && std::time::Instant::now() >= next_frame_at.next_frame_at.get()
             {
-                state.borrow_mut().advance();
-                let frame = state.borrow().frame() as usize;
-                if let Some(texture) = frames.borrow().get(frame) {
+                state.viewer.borrow_mut().advance();
+                let frame = state.viewer.borrow().frame() as usize;
+                if let Some(texture) = frames.frames.borrow().get(frame) {
                     picture.set_paintable(Some(texture));
                 }
-                let delay = delays.borrow().get(frame).copied().unwrap_or(10);
-                next_frame_at.set(
+                let delay = delays.delays.borrow().get(frame).copied().unwrap_or(10);
+                next_frame_at.next_frame_at.set(
                     std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
                 );
             }
@@ -1037,15 +1069,16 @@ fn gallery_view(
                                 status.set_label("The animation frame count was rejected safely.");
                                 return glib::ControlFlow::Break;
                             }
-                            *viewer_state.borrow_mut() = osv_media::ViewerState::new(opened.frames);
+                            *viewer_state.viewer.borrow_mut() =
+                                osv_media::ViewerState::new(opened.frames);
                             picture.set_paintable(Some(&texture));
-                            *animation_frames.borrow_mut() = textures;
-                            *frame_delays.borrow_mut() = delays;
+                            *animation_frames.frames.borrow_mut() = textures;
+                            *frame_delays.delays.borrow_mut() = delays;
                             let animated = opened.frames > 1;
                             play_pause.set_sensitive(animated);
                             step_frame.set_sensitive(animated);
                             play_pause.set_label("Pause animation");
-                            next_frame_at.set(
+                            next_frame_at.next_frame_at.set(
                                 std::time::Instant::now()
                                     + std::time::Duration::from_millis(u64::from(
                                         first_delay.max(10),
@@ -1225,8 +1258,8 @@ fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {
 }
 
 fn clear_sensitive_animations(animations: &SensitiveAnimations) {
-    for frames in animations.borrow().iter() {
-        frames.borrow_mut().clear();
+    for animation in animations.borrow().iter() {
+        animation.revoke();
     }
 }
 
@@ -1555,6 +1588,20 @@ impl fmt::Debug for CssSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_revocation_clears_media_derived_playback_state() {
+        let playback = AnimationPlayback::new();
+        *playback.delays.borrow_mut() = vec![20, 40];
+        *playback.viewer.borrow_mut() = osv_media::ViewerState::new(2);
+        playback.viewer.borrow_mut().advance();
+        playback.revoke();
+
+        assert!(playback.frames.borrow().is_empty());
+        assert!(playback.delays.borrow().is_empty());
+        assert_eq!(playback.viewer.borrow().frame(), 0);
+        assert!(!playback.viewer.borrow().playing());
+    }
 
     #[test]
     fn gtk_dialog_dismissal_is_portal_cancellation() {

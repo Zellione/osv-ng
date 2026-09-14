@@ -246,6 +246,7 @@ fn prepare_rendition_cancellable(
     if worker_result.purpose != purpose || worker_result.requested_edge != edge {
         return Err(ImageImportError::Input);
     }
+    validate_worker_frame_cardinality(&worker_result, purpose)?;
     let png_len =
         usize::try_from(worker_result.thumbnail_png_len).map_err(|_| ImageImportError::Input)?;
     let bytes = derived
@@ -306,6 +307,23 @@ fn prepare_rendition_cancellable(
         first_delay_ms: worker_result.first_delay_ms,
         additional_frames,
     })
+}
+
+fn validate_worker_frame_cardinality(
+    result: &osv_media::WorkerImageResult,
+    purpose: osv_media::ImagePurpose,
+) -> Result<(), ImageImportError> {
+    let expected = match purpose {
+        osv_media::ImagePurpose::Thumbnail => 1,
+        osv_media::ImagePurpose::Viewer => result.source.frames,
+    };
+    if result.output_frames != expected
+        || (purpose == osv_media::ImagePurpose::Thumbnail
+            && (result.first_delay_ms != 0 || result.additional_frames_len != 0))
+    {
+        return Err(ImageImportError::Input);
+    }
+    Ok(())
 }
 
 /// Reads a stable, already-open source into protected memory, sends it to one
@@ -664,6 +682,49 @@ pub fn spawn_archive_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_result(
+        purpose: osv_media::ImagePurpose,
+        source_frames: u32,
+    ) -> osv_media::WorkerImageResult {
+        osv_media::WorkerImageResult {
+            source: osv_media::ImageProbe {
+                format: osv_media::ImageFormat::Gif,
+                width: 2,
+                height: 2,
+                frames: source_frames,
+                orientation: osv_media::Orientation::Normal,
+                has_color_profile: false,
+            },
+            thumbnail_width: 2,
+            thumbnail_height: 2,
+            thumbnail_png_len: 1,
+            rgba_len: 16,
+            purpose,
+            requested_edge: osv_media::THUMBNAIL_EDGE,
+            output_frames: source_frames,
+            first_delay_ms: if source_frames > 1 { 20 } else { 0 },
+            additional_frames_len: source_frames.saturating_sub(1) * 20,
+        }
+    }
+
+    #[test]
+    fn broker_requires_exact_frame_cardinality_by_purpose() {
+        let mut viewer = worker_result(osv_media::ImagePurpose::Viewer, 2);
+        assert!(validate_worker_frame_cardinality(&viewer, viewer.purpose).is_ok());
+        viewer.output_frames = 1;
+        viewer.first_delay_ms = 0;
+        viewer.additional_frames_len = 0;
+        assert!(validate_worker_frame_cardinality(&viewer, viewer.purpose).is_err());
+
+        let mut thumbnail = worker_result(osv_media::ImagePurpose::Thumbnail, 2);
+        thumbnail.output_frames = 1;
+        thumbnail.first_delay_ms = 0;
+        thumbnail.additional_frames_len = 0;
+        assert!(validate_worker_frame_cardinality(&thumbnail, thumbnail.purpose).is_ok());
+        thumbnail.first_delay_ms = 20;
+        assert!(validate_worker_frame_cardinality(&thumbnail, thumbnail.purpose).is_err());
+    }
 
     #[test]
     fn duplicate_requires_explicit_choice() {

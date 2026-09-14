@@ -1533,6 +1533,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Probe count, full-canvas pixels, 100/50 ms timing, protected frame decode, and
   the complete version-4 viewer result all pass. APNG is therefore explicitly
   supported rather than inferred only from an `acTL` marker.
+- Tightened the broker contract so thumbnails must contain exactly one untimed
+  frame and viewer results must contain every frame declared by the
+  independently probed source; self-consistent truncated animations now fail
+  closed. Lock now revokes the complete playback object, including protected
+  texture owners, frame delays, frame index/count, play state, and scheduling
+  deadline retained by timer closures.
 
 **Verification**
 
