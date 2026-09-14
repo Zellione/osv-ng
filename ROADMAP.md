@@ -1598,6 +1598,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   exact secret-canary redaction gate, `cargo audit`, and dependency policy.
   The combined run reproduced only the known `InvalidDescriptor` and
   `PermissionDenied` isolation failures; both tests pass independently.
+- The separate fuzz workspace format, audit, and deny gates pass. The pinned
+  nightly ASan secret-canary smoke completed 11,269,460 executions in 21
+  seconds without a finding. A fresh Phase 2 Flatpak release rebuild passed its
+  complete offline workspace suite (including the new runtime close and
+  animation/gallery lifetime regressions), and the installed app self-check and
+  both installed helper hardening checks pass.
 
 **Deviations and follow-up**
 
@@ -1608,9 +1614,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement
   durability boundaries.
-- Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
-  accessibility interaction evidence, and a fresh GPT-6 adversarial review are
-  still required. Third-party decoder working allocations remain subject to the
+- Native Wayland portal/accessibility interaction evidence and a fresh GPT-6
+  adversarial review are still required. Third-party decoder working
+  allocations remain subject to the
   documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.
