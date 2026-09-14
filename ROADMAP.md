@@ -1581,6 +1581,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Background real-vault create/clean-close and pre-cancelled import paths have
   dedicated regressions. Catalog-backed composition bounds and authenticated
   encrypted-thumbnail reopen have dedicated regressions.
+- The 2026-09-14 post-gallery/regeneration checkpoint passes workspace format,
+  warnings-as-errors Clippy, all tests through the documented combined-process
+  isolation interference, the independent serial `osv-isolation` gate, the
+  exact secret-canary redaction gate, `cargo audit`, and dependency policy.
+  The combined run reproduced only the known `InvalidDescriptor` and
+  `PermissionDenied` isolation failures; both tests pass independently.
 
 **Deviations and follow-up**
 
