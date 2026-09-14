@@ -1486,4 +1486,39 @@ mod tests {
             (25, 20)
         );
     }
+
+    #[test]
+    fn animated_webp_structure_and_cumulative_pressure_fail_before_decode() {
+        let valid = animated_webp();
+        let second = valid
+            .windows(4)
+            .enumerate()
+            .filter(|(_, bytes)| *bytes == b"ANMF")
+            .nth(1)
+            .unwrap()
+            .0;
+        let mut outside_canvas = valid.clone();
+        outside_canvas[second + 8 + 6..second + 8 + 9].copy_from_slice(&[2, 0, 0]);
+        assert_eq!(probe(&outside_canvas), Err(ImageError::ResourceLimit));
+
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert_eq!(probe(&truncated), Err(ImageError::Malformed));
+
+        let first = valid.windows(4).position(|bytes| bytes == b"ANMF").unwrap();
+        let frame_len = 8 + usize::try_from(u32::from_le_bytes(
+            valid[first + 4..first + 8].try_into().unwrap(),
+        ))
+        .unwrap();
+        let frame = valid[first..first + frame_len].to_vec();
+        let mut pressure = valid[..first].to_vec();
+        pressure[24..27].copy_from_slice(&999u32.to_le_bytes()[..3]);
+        pressure[27..30].copy_from_slice(&999u32.to_le_bytes()[..3]);
+        for _ in 0..201 {
+            pressure.extend_from_slice(&frame);
+        }
+        let riff_len = u32::try_from(pressure.len() - 8).unwrap();
+        pressure[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert_eq!(probe(&pressure), Err(ImageError::ResourceLimit));
+    }
 }

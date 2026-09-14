@@ -1559,6 +1559,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   monotonic, but once the serial owner enters the allowed atomic replacement
   region it completes the new-object/catalog transition and leaves the newly
   referenced object authenticated and readable before servicing queued close.
+- Expanded animated-WebP hostile corpus coverage for frames outside the canvas,
+  truncated frame records, and a 201-frame 1000×1000 cumulative pixel-frame
+  pressure case rejected by the allocation-free probe before decoder entry.
 
 **Verification**
 
