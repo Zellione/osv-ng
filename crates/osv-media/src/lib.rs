@@ -307,6 +307,9 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
     let mut saw_idat = false;
     let mut saw_iend = false;
     let mut saw_animation_control = false;
+    let mut animation_frame_controls = 0u32;
+    let mut expected_animation_sequence = 0u32;
+    let mut saw_frame_control = false;
     while p.checked_add(12).is_some_and(|x| x <= b.len()) {
         let n =
             u32::from_be_bytes(b[p..p + 4].try_into().map_err(|_| ImageError::Malformed)?) as usize;
@@ -338,6 +341,53 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
                     .map_err(|_| ImageError::Malformed)?,
             )
         }
+        if kind == b"fcTL" {
+            if !saw_animation_control || n != 26 {
+                return Err(ImageError::Malformed);
+            }
+            let data = &b[p + 8..end - 4];
+            let sequence =
+                u32::from_be_bytes(data[0..4].try_into().map_err(|_| ImageError::Malformed)?);
+            let frame_width =
+                u32::from_be_bytes(data[4..8].try_into().map_err(|_| ImageError::Malformed)?);
+            let frame_height =
+                u32::from_be_bytes(data[8..12].try_into().map_err(|_| ImageError::Malformed)?);
+            let x = u32::from_be_bytes(data[12..16].try_into().map_err(|_| ImageError::Malformed)?);
+            let y = u32::from_be_bytes(data[16..20].try_into().map_err(|_| ImageError::Malformed)?);
+            if sequence != expected_animation_sequence
+                || frame_width == 0
+                || frame_height == 0
+                || x.checked_add(frame_width).is_none_or(|end| end > width)
+                || y.checked_add(frame_height).is_none_or(|end| end > height)
+                || data[24] > 2
+                || data[25] > 1
+            {
+                return Err(ImageError::Malformed);
+            }
+            expected_animation_sequence = expected_animation_sequence
+                .checked_add(1)
+                .ok_or(ImageError::ResourceLimit)?;
+            animation_frame_controls = animation_frame_controls
+                .checked_add(1)
+                .ok_or(ImageError::ResourceLimit)?;
+            saw_frame_control = true;
+        }
+        if kind == b"fdAT" {
+            if !saw_animation_control || !saw_frame_control || n < 4 {
+                return Err(ImageError::Malformed);
+            }
+            let sequence = u32::from_be_bytes(
+                b[p + 8..p + 12]
+                    .try_into()
+                    .map_err(|_| ImageError::Malformed)?,
+            );
+            if sequence != expected_animation_sequence {
+                return Err(ImageError::Malformed);
+            }
+            expected_animation_sequence = expected_animation_sequence
+                .checked_add(1)
+                .ok_or(ImageError::ResourceLimit)?;
+        }
         if kind == b"IHDR" && p != 8 {
             return Err(ImageError::Malformed);
         }
@@ -352,7 +402,11 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
             break;
         }
     }
-    if !saw_idat || !saw_iend {
+    if !saw_idat
+        || !saw_iend
+        || (saw_animation_control && animation_frame_controls != frames)
+        || (!saw_animation_control && animation_frame_controls != 0)
+    {
         return Err(ImageError::Malformed);
     }
     Ok(ImageProbe {
@@ -1587,6 +1641,65 @@ mod tests {
         let result = image_worker_result_from_request(&request).unwrap();
         let header = decode_worker_result_header(result.expose()).unwrap();
         assert_eq!((header.source.frames, header.output_frames), (2, 2));
+    }
+
+    #[test]
+    fn apng_sequence_geometry_and_frame_count_fail_before_decode() {
+        fn encoded_apng() -> Vec<u8> {
+            let mut encoded = Vec::new();
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(2, 0).unwrap();
+            encoder.validate_sequence(true);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[1, 2, 3, 255].repeat(4)).unwrap();
+            writer.write_image_data(&[4, 5, 6, 255].repeat(4)).unwrap();
+            writer.finish().unwrap();
+            encoded
+        }
+
+        fn mutate_chunk(bytes: &mut [u8], kind: &[u8; 4], data_offset: usize, value: u8) {
+            let mut p = 8usize;
+            loop {
+                let len = usize::try_from(u32::from_be_bytes(bytes[p..p + 4].try_into().unwrap()))
+                    .unwrap();
+                let end = p + 12 + len;
+                if &bytes[p + 4..p + 8] == kind {
+                    bytes[p + 8 + data_offset] = value;
+                    let mut crc = crc32fast::Hasher::new();
+                    crc.update(kind);
+                    crc.update(&bytes[p + 8..end - 4]);
+                    bytes[end - 4..end].copy_from_slice(&crc.finalize().to_be_bytes());
+                    return;
+                }
+                p = end;
+            }
+        }
+
+        let mut wrong_count = encoded_apng();
+        mutate_chunk(&mut wrong_count, b"acTL", 3, 3);
+        assert_eq!(probe(&wrong_count), Err(ImageError::Malformed));
+
+        let mut wrong_sequence = encoded_apng();
+        mutate_chunk(&mut wrong_sequence, b"fcTL", 3, 1);
+        assert_eq!(probe(&wrong_sequence), Err(ImageError::Malformed));
+
+        let mut outside_canvas = encoded_apng();
+        mutate_chunk(&mut outside_canvas, b"fcTL", 7, 3);
+        assert_eq!(probe(&outside_canvas), Err(ImageError::Malformed));
+
+        let mut invalid_disposal = encoded_apng();
+        mutate_chunk(&mut invalid_disposal, b"fcTL", 24, 3);
+        assert_eq!(probe(&invalid_disposal), Err(ImageError::Malformed));
+
+        let mut invalid_blend = encoded_apng();
+        mutate_chunk(&mut invalid_blend, b"fcTL", 25, 2);
+        assert_eq!(probe(&invalid_blend), Err(ImageError::Malformed));
+
+        let mut wrong_data_sequence = encoded_apng();
+        mutate_chunk(&mut wrong_data_sequence, b"fdAT", 3, 9);
+        assert_eq!(probe(&wrong_data_sequence), Err(ImageError::Malformed));
     }
 
     #[test]

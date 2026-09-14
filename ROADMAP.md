@@ -1431,8 +1431,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   identification, dimensions, animation frame counts, JPEG EXIF orientation,
   and an allowlist-only color-profile presence flag. Encoded size, dimensions,
   canvas pixels, cumulative canvas pixel-frames, animation frames, and worker
-  chunk counts are rejected before decoder allocation. Per-frame geometry and
-  full structural validation remain follow-up work below.
+  chunk counts are rejected before decoder allocation. Format-specific
+  structural validation and hostile corpus expansion continue below.
 - The media helper now retains authenticated IPC chunks only in protected,
   wipe-on-drop storage, validates the reconstructed object under the existing
   seccomp/resource/descriptor sandbox, and reports malformed and resource-limit
@@ -1588,6 +1588,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   requires its canonical first `IHDR`, rejects repeated headers, and accepts at
   most one pre-image animation-control chunk; WebP rejects reserved feature and
   extended-header bits before decoder entry.
+- Allocation-free APNG probing now validates every frame-control size, sequence,
+  canvas extent, disposal/blend operation, data-chunk sequence, and declared
+  frame count before decoder entry. Genuine-APNG mutations cover each boundary.
 - Decoder-produced RGBA buffers owned by the helper application are now wrapped
   in wipe-on-drop owners during thumbnail scaling and result assembly, including
   early-return paths. This does not change the documented limitation for opaque
@@ -1646,8 +1649,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 **Deviations and follow-up**
 
 - Deeper malformed/bomb corpus cases remain required before Phase 9 can be
-  marked complete. Animation replacement eviction and lock-time revocation have
-  dedicated owner/state lifetime regressions.
+  marked complete, specifically JPEG multi-scan/entropy-marker corruption, GIF
+  extension/sub-block edge cases, and near-limit helper memory pressure.
+  Animation replacement eviction and lock-time revocation have dedicated
+  owner/state lifetime regressions.
 - Regeneration now has full runtime close-during-worker integration,
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement
