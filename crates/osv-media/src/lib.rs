@@ -282,7 +282,7 @@ pub fn probe(bytes: &[u8]) -> Result<ImageProbe, ImageError> {
     }
 }
 fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
-    if b.len() < 33 || &b[12..16] != b"IHDR" {
+    if b.len() < 33 || &b[8..12] != 13u32.to_be_bytes().as_slice() || &b[12..16] != b"IHDR" {
         return Err(ImageError::Malformed);
     }
     let width = u32::from_be_bytes(b[16..20].try_into().map_err(|_| ImageError::Malformed)?);
@@ -292,6 +292,7 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
     let mut profile = false;
     let mut saw_idat = false;
     let mut saw_iend = false;
+    let mut saw_animation_control = false;
     while p.checked_add(12).is_some_and(|x| x <= b.len()) {
         let n =
             u32::from_be_bytes(b[p..p + 4].try_into().map_err(|_| ImageError::Malformed)?) as usize;
@@ -313,14 +314,18 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
             return Err(ImageError::Malformed);
         }
         if kind == b"acTL" {
-            if n != 8 {
+            if n != 8 || saw_animation_control || saw_idat {
                 return Err(ImageError::Malformed);
             }
+            saw_animation_control = true;
             frames = u32::from_be_bytes(
                 b[p + 8..p + 12]
                     .try_into()
                     .map_err(|_| ImageError::Malformed)?,
             )
+        }
+        if kind == b"IHDR" && p != 8 {
+            return Err(ImageError::Malformed);
         }
         profile |= matches!(kind, b"iCCP" | b"sRGB" | b"cHRM" | b"gAMA");
         saw_idat |= kind == b"IDAT";
@@ -565,6 +570,9 @@ fn probe_webp(b: &[u8]) -> Result<ImageProbe, ImageError> {
         return Err(ImageError::Malformed);
     }
     let flags = b[20];
+    if flags & 0xc1 != 0 || b[21..24] != [0; 3] {
+        return Err(ImageError::Malformed);
+    }
     let width = 1 + u32::from_le_bytes([b[24], b[25], b[26], 0]);
     let height = 1 + u32::from_le_bytes([b[27], b[28], b[29], 0]);
     let frame_count = validate_webp_chunks(b, width, height)?;
@@ -1306,6 +1314,50 @@ mod tests {
         assert_eq!(probe(&corrupt), Err(ImageError::Malformed));
         let truncated = &png(10, 20)[..40];
         assert_eq!(probe(truncated), Err(ImageError::Malformed));
+    }
+
+    #[test]
+    fn png_chunk_order_and_webp_reserved_fields_are_rejected_by_probe() {
+        fn insert_png_chunk(png: &mut Vec<u8>, offset: usize, kind: &[u8; 4], data: &[u8]) {
+            let mut chunk = Vec::new();
+            chunk.extend(u32::try_from(data.len()).unwrap().to_be_bytes());
+            chunk.extend(kind);
+            chunk.extend(data);
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(kind);
+            crc.update(data);
+            chunk.extend(crc.finalize().to_be_bytes());
+            png.splice(offset..offset, chunk);
+        }
+
+        let valid_png = encoded_formats().remove(0).1;
+        let mut duplicate_header = valid_png.clone();
+        let ihdr = valid_png[16..29].to_vec();
+        insert_png_chunk(&mut duplicate_header, 33, b"IHDR", &ihdr);
+        assert_eq!(probe(&duplicate_header), Err(ImageError::Malformed));
+
+        let mut late_animation_control = valid_png;
+        let idat_end = 33
+            + 12
+            + usize::try_from(u32::from_be_bytes(
+                late_animation_control[33..37].try_into().unwrap(),
+            ))
+            .unwrap();
+        insert_png_chunk(
+            &mut late_animation_control,
+            idat_end,
+            b"acTL",
+            &[0, 0, 0, 1, 0, 0, 0, 0],
+        );
+        assert_eq!(probe(&late_animation_control), Err(ImageError::Malformed));
+
+        let mut reserved_webp_flag = encoded_formats().remove(3).1;
+        reserved_webp_flag[20] |= 0x80;
+        assert_eq!(probe(&reserved_webp_flag), Err(ImageError::Malformed));
+
+        let mut reserved_webp_header = encoded_formats().remove(3).1;
+        reserved_webp_header[21] = 1;
+        assert_eq!(probe(&reserved_webp_header), Err(ImageError::Malformed));
     }
     #[test]
     fn truncated_jpeg_gif_and_webp_fail_complete_decode() {

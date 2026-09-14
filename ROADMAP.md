@@ -1580,6 +1580,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Tightened allocation-free container validation so GIF requires a final trailer
   with no trailing bytes, while still and animated WebP require an exact RIFF
   extent, canonical extended header length, and completely framed chunks.
+- Added hostile PNG chunk-order and extended-WebP reserved-field cases. PNG now
+  requires its canonical first `IHDR`, rejects repeated headers, and accepts at
+  most one pre-image animation-control chunk; WebP rejects reserved feature and
+  extended-header bits before decoder entry.
 - Added a real-runtime close-during-regeneration integration using the installed
   media-helper protocol and a 4096×4096 authenticated PNG. The test waits until
   serial maintenance is actively decoding, revokes and closes the session under
@@ -1644,8 +1648,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   gallery/import/viewer routes still require an interactive native-Wayland
   check; this agent run verified accessible activation through portal request
   initiation but could not select or dismiss the compositor-owned dialog.
-  Mixed-output scaling and a fresh GPT-6 adversarial review are also still
-  required. Third-party decoder working allocations remain subject to the
+  Mixed-output scaling could not be exercised because the session exposed only
+  one active `eDP-1` output at scale 1. A fresh GPT-6 adversarial review is also
+  still required. Third-party decoder working allocations remain subject to the
   documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.
