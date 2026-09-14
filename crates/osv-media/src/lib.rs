@@ -544,19 +544,29 @@ fn probe_jpeg(b: &[u8]) -> Result<ImageProbe, ImageError> {
     let mut geometry = None;
     let mut orientation = Orientation::Normal;
     let mut profile = false;
-    while p + 4 <= b.len() {
+    let mut saw_scan = false;
+    let mut saw_end = false;
+    while p < b.len() {
         if b[p] != 0xff {
             return Err(ImageError::Malformed);
         }
+        let marker_start = p;
         while p < b.len() && b[p] == 0xff {
             p += 1
         }
         let marker = *b.get(p).ok_or(ImageError::Malformed)?;
         p += 1;
-        if marker == 0xd9 || marker == 0xda {
+        if marker == 0xd9 {
+            saw_end = true;
+            if p != b.len() {
+                return Err(ImageError::Malformed);
+            }
             break;
         }
-        if matches!(marker, 0x01 | 0xd0..=0xd7) {
+        if marker == 0xd8 || marker == 0x00 || matches!(marker, 0xd0..=0xd7) {
+            return Err(ImageError::Malformed);
+        }
+        if marker == 0x01 {
             continue;
         }
         let n = u16::from_be_bytes(
@@ -596,9 +606,22 @@ fn probe_jpeg(b: &[u8]) -> Result<ImageProbe, ImageError> {
             orientation = parse_exif_orientation(&data[6..]).unwrap_or(Orientation::Normal)
         }
         profile |= marker == 0xe2 && data.starts_with(b"ICC_PROFILE\0");
-        p += n
+        p += n;
+        if marker == 0xda {
+            if geometry.is_none() {
+                return Err(ImageError::Malformed);
+            }
+            saw_scan = true;
+            p = next_jpeg_marker(b, p)?;
+            if p <= marker_start {
+                return Err(ImageError::Malformed);
+            }
+        }
     }
     let (width, height) = geometry.ok_or(ImageError::Malformed)?;
+    if !saw_scan || !saw_end {
+        return Err(ImageError::Malformed);
+    }
     Ok(ImageProbe {
         format: ImageFormat::Jpeg,
         width,
@@ -607,6 +630,25 @@ fn probe_jpeg(b: &[u8]) -> Result<ImageProbe, ImageError> {
         orientation,
         has_color_profile: profile,
     })
+}
+
+fn next_jpeg_marker(b: &[u8], mut p: usize) -> Result<usize, ImageError> {
+    while p < b.len() {
+        if b[p] != 0xff {
+            p += 1;
+            continue;
+        }
+        let marker_start = p;
+        while p < b.len() && b[p] == 0xff {
+            p += 1;
+        }
+        match *b.get(p).ok_or(ImageError::Malformed)? {
+            0x00 => p += 1,
+            0xd0..=0xd7 => p += 1,
+            _ => return Ok(marker_start),
+        }
+    }
+    Err(ImageError::Malformed)
 }
 fn parse_exif_orientation(t: &[u8]) -> Option<Orientation> {
     if t.len() < 8 {
@@ -1466,6 +1508,40 @@ mod tests {
                 "{format:?} truncation decoded"
             );
         }
+    }
+
+    #[test]
+    fn jpeg_scan_framing_is_validated_before_decode() {
+        fn segment(jpeg: &mut Vec<u8>, marker: u8, data: &[u8]) {
+            jpeg.extend([0xff, marker]);
+            jpeg.extend(u16::try_from(data.len() + 2).unwrap().to_be_bytes());
+            jpeg.extend(data);
+        }
+
+        let mut multiscan = vec![0xff, 0xd8];
+        segment(&mut multiscan, 0xc0, &[8, 0, 1, 0, 1, 1, 1, 0x11, 0]);
+        segment(&mut multiscan, 0xda, &[1, 1, 0, 0, 63, 0]);
+        multiscan.extend([1, 0xff, 0x00, 2, 0xff, 0xd0]);
+        segment(&mut multiscan, 0xda, &[1, 1, 0, 0, 63, 0]);
+        multiscan.extend([3, 0xff, 0xd9]);
+        let parsed = probe(&multiscan).unwrap();
+        assert_eq!((parsed.width, parsed.height), (1, 1));
+
+        let mut missing_end = multiscan.clone();
+        missing_end.truncate(missing_end.len() - 2);
+        assert_eq!(probe(&missing_end), Err(ImageError::Malformed));
+
+        let mut trailing = multiscan.clone();
+        trailing.push(0);
+        assert_eq!(probe(&trailing), Err(ImageError::Malformed));
+
+        let mut illegal_marker = multiscan;
+        let entropy = illegal_marker
+            .windows(6)
+            .position(|window| window == [1, 0xff, 0x00, 2, 0xff, 0xd0])
+            .unwrap();
+        illegal_marker[entropy + 5] = 0xd8;
+        assert_eq!(probe(&illegal_marker), Err(ImageError::Malformed));
     }
 
     #[test]
