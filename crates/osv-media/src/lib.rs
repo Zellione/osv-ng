@@ -445,7 +445,7 @@ fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
                 if p + 2 > b.len() {
                     return Err(ImageError::Malformed);
                 }
-                p = skip_sub_blocks(b, p + 2)?
+                p = skip_gif_extension(b, p)?
             }
             0x3b => {
                 p += 1;
@@ -466,6 +466,33 @@ fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
         orientation: Orientation::Normal,
         has_color_profile: false,
     })
+}
+fn skip_gif_extension(b: &[u8], p: usize) -> Result<usize, ImageError> {
+    match *b.get(p + 1).ok_or(ImageError::Malformed)? {
+        0xf9 => {
+            let extension = b.get(p..p + 8).ok_or(ImageError::Malformed)?;
+            let packed = extension[3];
+            if extension[2] != 4 || extension[7] != 0 || packed & 0xe0 != 0 || (packed >> 2) & 7 > 3
+            {
+                return Err(ImageError::Malformed);
+            }
+            Ok(p + 8)
+        }
+        0xfe => skip_sub_blocks(b, p + 2),
+        0xff => {
+            if *b.get(p + 2).ok_or(ImageError::Malformed)? != 11 {
+                return Err(ImageError::Malformed);
+            }
+            skip_sub_blocks(b, p.checked_add(14).ok_or(ImageError::Malformed)?)
+        }
+        0x01 => {
+            if *b.get(p + 2).ok_or(ImageError::Malformed)? != 12 {
+                return Err(ImageError::Malformed);
+            }
+            skip_sub_blocks(b, p.checked_add(15).ok_or(ImageError::Malformed)?)
+        }
+        _ => Err(ImageError::Malformed),
+    }
 }
 fn skip_gif_image(
     b: &[u8],
@@ -1461,6 +1488,36 @@ mod tests {
         let declared = u32::try_from(truncated_chunk.len() - 8).unwrap();
         truncated_chunk[4..8].copy_from_slice(&declared.to_le_bytes());
         assert_eq!(probe(&truncated_chunk), Err(ImageError::Malformed));
+    }
+
+    #[test]
+    fn malformed_gif_extensions_fail_before_decode() {
+        fn insert_extension(extension: &[u8]) -> Vec<u8> {
+            let mut gif = encoded_formats().remove(2).1;
+            let color_table_len = if gif[10] & 0x80 == 0 {
+                0
+            } else {
+                3 * (1usize << (usize::from(gif[10] & 7) + 1))
+            };
+            gif.splice(
+                13 + color_table_len..13 + color_table_len,
+                extension.iter().copied(),
+            );
+            gif
+        }
+
+        for extension in [
+            vec![0x21, 0x02, 0],
+            vec![0x21, 0xf9, 3, 0, 0, 0, 0, 0],
+            vec![0x21, 0xf9, 4, 0xe0, 0, 0, 0, 0],
+            [vec![0x21, 0xff, 10], vec![0; 10], vec![0]].concat(),
+            vec![0x21, 0xfe, 2, 1],
+        ] {
+            assert_eq!(
+                probe(&insert_extension(&extension)),
+                Err(ImageError::Malformed)
+            );
+        }
     }
     #[test]
     fn cache_evicts_and_clears() {

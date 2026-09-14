@@ -1591,6 +1591,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Allocation-free APNG probing now validates every frame-control size, sequence,
   canvas extent, disposal/blend operation, data-chunk sequence, and declared
   frame count before decoder entry. Genuine-APNG mutations cover each boundary.
+- Allocation-free GIF probing now allowlists extension labels and validates
+  fixed graphic-control, application, and plain-text header sizes, reserved
+  graphic-control bits, disposal values, terminators, and sub-block bounds.
 - Decoder-produced RGBA buffers owned by the helper application are now wrapped
   in wipe-on-drop owners during thumbnail scaling and result assembly, including
   early-return paths. This does not change the documented limitation for opaque
@@ -1649,10 +1652,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 **Deviations and follow-up**
 
 - Deeper malformed/bomb corpus cases remain required before Phase 9 can be
-  marked complete, specifically JPEG multi-scan/entropy-marker corruption, GIF
-  extension/sub-block edge cases, and near-limit helper memory pressure.
-  Animation replacement eviction and lock-time revocation have dedicated
-  owner/state lifetime regressions.
+  marked complete, specifically JPEG multi-scan/entropy-marker corruption and
+  near-limit helper memory pressure. GIF extension/sub-block bounds now have
+  dedicated allocation-free regressions. Animation replacement eviction and
+  lock-time revocation have dedicated owner/state lifetime regressions.
 - Regeneration now has full runtime close-during-worker integration,
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement
