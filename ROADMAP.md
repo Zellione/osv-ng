@@ -1621,6 +1621,14 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   complete offline workspace suite (including the new runtime close and
   animation/gallery lifetime regressions), and the installed app self-check and
   both installed helper hardening checks pass.
+- A 2026-09-14 native-Wayland production-shell run reached and remained in the
+  GTK event loop. Direct AT-SPI inspection identified GTK 4.22.5, the named
+  `Obscura Safe Vault` application window, and the visible chooser buttons with
+  button roles and `Choose vault folder`/`Create a vault` names. Invoking the
+  chooser through `org.a11y.atspi.Action.DoAction` succeeded and initiated the
+  portal path. After the latest import/framing changes, a fresh no-FUSE Phase 2
+  Flatpak release rebuild passed the complete offline suite; the installed app
+  and both installed helper self-checks also pass.
 
 **Deviations and follow-up**
 
@@ -1631,9 +1639,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement
   durability boundaries.
-- Native Wayland portal/accessibility interaction evidence and a fresh GPT-6
-  adversarial review are still required. Third-party decoder working
-  allocations remain subject to the
+- Visual portal selection/cancellation and AT-SPI inspection of the unlocked
+  gallery/import/viewer routes still require an interactive native-Wayland
+  check; this agent run verified accessible activation through portal request
+  initiation but could not select or dismiss the compositor-owned dialog.
+  Mixed-output scaling and a fresh GPT-6 adversarial review are also still
+  required. Third-party decoder working allocations remain subject to the
   documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.
