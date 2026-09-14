@@ -708,6 +708,36 @@ mod tests {
         }
     }
 
+    struct RevokeAtDurable<'flag>(&'flag AtomicBool);
+
+    impl osv_vault::ServiceFaultInjector for RevokeAtDurable<'_> {
+        fn should_fail(&mut self, point: osv_vault::ServicePoint) -> bool {
+            if point == osv_vault::ServicePoint::ObjectDurable {
+                self.0.store(true, Ordering::Release);
+            }
+            false
+        }
+    }
+
+    fn prepared_replacement(bytes: &[u8]) -> PreparedThumbnail {
+        PreparedThumbnail {
+            probe: osv_media::ImageProbe {
+                format: osv_media::ImageFormat::Png,
+                width: 2,
+                height: 2,
+                frames: 1,
+                orientation: osv_media::Orientation::Normal,
+                has_color_profile: false,
+            },
+            bytes: osv_crypto::SecretBytes::new(bytes).unwrap(),
+            width: 2,
+            height: 2,
+            display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
+            first_delay_ms: 0,
+            additional_frames: Vec::new(),
+        }
+    }
+
     fn worker_result(
         purpose: osv_media::ImagePurpose,
         source_frames: u32,
@@ -849,22 +879,7 @@ mod tests {
                     2,
                 )
                 .unwrap();
-            let prepared = PreparedThumbnail {
-                probe: osv_media::ImageProbe {
-                    format: osv_media::ImageFormat::Png,
-                    width: 2,
-                    height: 2,
-                    frames: 1,
-                    orientation: osv_media::Orientation::Normal,
-                    has_color_profile: false,
-                },
-                bytes: osv_crypto::SecretBytes::new(b"new encrypted thumbnail").unwrap(),
-                width: 2,
-                height: 2,
-                display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
-                first_delay_ms: 0,
-                additional_frames: Vec::new(),
-            };
+            let prepared = prepared_replacement(b"new encrypted thumbnail");
             let result = publish_regenerated_thumbnail(
                 &mut vault,
                 osv_catalog::DerivedRegeneration {
@@ -916,6 +931,35 @@ mod tests {
                     .count(),
                 1
             );
+            if point == osv_vault::ServicePoint::CatalogCommitted {
+                let revoked = AtomicBool::new(false);
+                let newest = publish_regenerated_thumbnail(
+                    &mut vault,
+                    osv_catalog::DerivedRegeneration {
+                        media_id,
+                        original_object_id: original_id,
+                    },
+                    prepared_replacement(b"replacement completed during revoke"),
+                    4,
+                    &mut RevokeAtDurable(&revoked),
+                )
+                .unwrap();
+                assert!(revoked.load(Ordering::Acquire));
+                let referenced = vault
+                    .reader()
+                    .image_records(osv_media::THUMBNAIL_RECIPE_VERSION, 10)
+                    .unwrap()[0]
+                    .thumbnail_object_id
+                    .unwrap();
+                assert_eq!(referenced, newest);
+                let mut plaintext = Vec::new();
+                vault
+                    .open_object(newest)
+                    .unwrap()
+                    .read_to_end(&mut plaintext)
+                    .unwrap();
+                assert_eq!(plaintext, b"replacement completed during revoke");
+            }
             vault.close().unwrap();
         }
     }

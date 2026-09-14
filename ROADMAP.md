@@ -1555,6 +1555,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   derived object remains referenced and readable until commit, the new durable
   object is readable after commit, and maintenance removes orphan/journal state
   without ever leaving a catalog reference to missing ciphertext.
+- Added revocation-at-object-durable evidence for regeneration: cancellation is
+  monotonic, but once the serial owner enters the allowed atomic replacement
+  region it completes the new-object/catalog transition and leaves the newly
+  referenced object authenticated and readable before servicing queued close.
 
 **Verification**
 
@@ -1580,9 +1584,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Deeper malformed/bomb corpus cases and explicit animation cache-eviction
   evidence remain required before Phase 9 can be marked complete. Lock-time
   animation revocation now has a dedicated state-lifetime regression.
-- Session close-during-transition lifecycle evidence remains. Regeneration now
-  has orchestration-level injected-fault coverage; existing vault crash-process
-  coverage exercises the same replacement durability boundaries.
+- A full runtime close-during-worker integration regression remains.
+  Regeneration has orchestration-level injected-fault and atomic-region
+  revocation coverage; existing vault crash-process coverage exercises the same
+  replacement durability boundaries.
 - Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
   accessibility interaction evidence, and a fresh GPT-6 adversarial review are
   still required. Third-party decoder working allocations remain subject to the
