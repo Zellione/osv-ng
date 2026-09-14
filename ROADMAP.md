@@ -1562,6 +1562,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Expanded animated-WebP hostile corpus coverage for frames outside the canvas,
   truncated frame records, and a 201-frame 1000×1000 cumulative pixel-frame
   pressure case rejected by the allocation-free probe before decoder entry.
+- Added a real-runtime close-during-regeneration integration using the installed
+  media-helper protocol and a 4096×4096 authenticated PNG. The test waits until
+  serial maintenance is actively decoding, revokes and closes the session under
+  two seconds, then reopens the vault as writer and verifies an empty operation
+  journal plus a usable catalog image record. Development helper discovery now
+  handles Cargo integration-test executables under `target/*/deps` without a
+  production environment override.
 
 **Verification**
 
@@ -1593,10 +1600,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Deeper malformed/bomb corpus cases and explicit animation cache-eviction
   evidence remain required before Phase 9 can be marked complete. Lock-time
   animation revocation now has a dedicated state-lifetime regression.
-- A full runtime close-during-worker integration regression remains.
-  Regeneration has orchestration-level injected-fault and atomic-region
-  revocation coverage; existing vault crash-process coverage exercises the same
-  replacement durability boundaries.
+- Regeneration now has full runtime close-during-worker integration,
+  orchestration-level injected-fault, and atomic-region revocation coverage;
+  existing vault crash-process coverage exercises the same replacement
+  durability boundaries.
 - Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
   accessibility interaction evidence, and a fresh GPT-6 adversarial review are
   still required. Third-party decoder working allocations remain subject to the

@@ -838,6 +838,7 @@ name = "osv-media-worker"
 version = "0.1.0"
 dependencies = [
  "image",
+ "osv-app",
  "osv-catalog",
  "osv-crypto",
  "osv-import",

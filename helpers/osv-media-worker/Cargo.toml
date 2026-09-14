@@ -17,6 +17,7 @@ osv-worker-protocol.workspace = true
 image.workspace = true
 osv-catalog.workspace = true
 osv-import.workspace = true
+osv-app = { path = "../../crates/osv-app", version = "=0.1.0" }
 osv-storage.workspace = true
 osv-test-support = { path = "../../crates/osv-test-support", version = "=0.1.0" }
 osv-vault.workspace = true

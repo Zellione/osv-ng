@@ -258,6 +258,97 @@ fn cancelled_regeneration_preserves_original_and_prior_thumbnail() {
 }
 
 #[test]
+fn runtime_close_during_active_regeneration_revokes_and_reopens_cleanly() {
+    use image::ImageEncoder;
+
+    let parent = osv_test_support::TempVault::create_in(std::path::Path::new("/tmp")).unwrap();
+    let path = parent.path().join("runtime-close-regeneration");
+    let password_bytes = b"runtime close regeneration password";
+    let password = osv_crypto::Password::new(password_bytes).unwrap();
+    let mut vault = osv_vault::VaultService::create(
+        &path,
+        &password,
+        None,
+        osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+        1,
+    )
+    .unwrap();
+    let dimensions = 4096u32;
+    let pixels = vec![0x5a; dimensions as usize * dimensions as usize * 4];
+    let mut encoded = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut encoded)
+        .write_image(
+            &pixels,
+            dimensions,
+            dimensions,
+            image::ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    let media_id = osv_catalog::MediaId::from_bytes([0x75; 16]);
+    vault
+        .import(
+            &mut std::io::Cursor::new(&encoded),
+            encoded.len() as u64,
+            osv_vault::ImportMetadata {
+                id: media_id,
+                original_name: "runtime-close.png",
+                class: osv_catalog::MediaClass::Image,
+                mime: "image/png",
+                width: Some(dimensions),
+                height: Some(dimensions),
+                duration_ms: None,
+                codecs: "png",
+                imported_at_ms: 1,
+                fingerprint: &[0x93; 32],
+            },
+        )
+        .unwrap();
+    vault.close().unwrap();
+
+    let session = osv_app::runtime::VaultSession::begin(
+        path.clone(),
+        password_bytes.to_vec(),
+        osv_app::runtime::OpenKind::Unlock,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(ready) = session.try_ready() {
+            ready.unwrap();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session did not unlock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    loop {
+        if session.maintenance_status().running {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "regeneration did not become active"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let close_started = std::time::Instant::now();
+    session.close();
+    assert!(close_started.elapsed() < std::time::Duration::from_secs(2));
+
+    let reopened = osv_vault::VaultService::open(
+        &path,
+        &osv_crypto::Password::new(password_bytes).unwrap(),
+        None,
+        osv_vault::OpenMode::Writer,
+    )
+    .unwrap();
+    assert!(reopened.reader().operation_journal().unwrap().is_empty());
+    assert_eq!(reopened.reader().image_records(1, 10).unwrap().len(), 1);
+    reopened.close().unwrap();
+}
+
+#[test]
 fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts() {
     let parent = osv_test_support::TempVault::create_in(std::path::Path::new("/tmp")).unwrap();
     let path = parent.path().join("image-import");

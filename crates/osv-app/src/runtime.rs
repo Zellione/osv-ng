@@ -679,7 +679,17 @@ fn media_worker_path() -> PathBuf {
     } else {
         std::env::current_exe()
             .ok()
-            .and_then(|path| path.parent().map(|parent| parent.join("osv-media-worker")))
+            .and_then(|path| {
+                let parent = path.parent()?;
+                let adjacent = parent.join("osv-media-worker");
+                if adjacent.exists() {
+                    Some(adjacent)
+                } else {
+                    parent
+                        .parent()
+                        .map(|target| target.join("osv-media-worker"))
+                }
+            })
             .unwrap_or_else(|| PathBuf::from("osv-media-worker"))
     }
 }
