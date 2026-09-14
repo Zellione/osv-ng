@@ -29,8 +29,28 @@ struct CssSlots {
 
 struct TexturePixels(osv_crypto::SecretBytes);
 
+struct FrameRegistry<T> {
+    values: RefCell<Vec<T>>,
+}
+
+impl<T> FrameRegistry<T> {
+    fn new() -> Self {
+        Self {
+            values: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn replace(&self, values: Vec<T>) {
+        *self.values.borrow_mut() = values;
+    }
+
+    fn clear(&self) {
+        self.values.borrow_mut().clear();
+    }
+}
+
 struct AnimationPlayback {
-    frames: RefCell<Vec<gdk::MemoryTexture>>,
+    frames: FrameRegistry<gdk::MemoryTexture>,
     delays: RefCell<Vec<u32>>,
     viewer: RefCell<osv_media::ViewerState>,
     next_frame_at: Cell<std::time::Instant>,
@@ -39,7 +59,7 @@ struct AnimationPlayback {
 impl AnimationPlayback {
     fn new() -> Self {
         Self {
-            frames: RefCell::new(Vec::new()),
+            frames: FrameRegistry::new(),
             delays: RefCell::new(Vec::new()),
             viewer: RefCell::new(osv_media::ViewerState::new(1)),
             next_frame_at: Cell::new(std::time::Instant::now()),
@@ -47,7 +67,7 @@ impl AnimationPlayback {
     }
 
     fn revoke(&self) {
-        self.frames.borrow_mut().clear();
+        self.frames.clear();
         self.delays.borrow_mut().clear();
         *self.viewer.borrow_mut() = osv_media::ViewerState::new(1);
         self.next_frame_at.set(std::time::Instant::now());
@@ -826,7 +846,7 @@ fn gallery_view(
         step_frame.connect_clicked(move |_| {
             state.viewer.borrow_mut().step_forward();
             let frame = state.viewer.borrow().frame() as usize;
-            if let Some(texture) = frames.frames.borrow().get(frame) {
+            if let Some(texture) = frames.frames.values.borrow().get(frame) {
                 picture.set_paintable(Some(texture));
             }
         });
@@ -838,13 +858,13 @@ fn gallery_view(
         let next_frame_at = Rc::clone(&next_frame_at);
         let picture = picture.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
-            if frames.frames.borrow().len() > 1
+            if frames.frames.values.borrow().len() > 1
                 && state.viewer.borrow().playing()
                 && std::time::Instant::now() >= next_frame_at.next_frame_at.get()
             {
                 state.viewer.borrow_mut().advance();
                 let frame = state.viewer.borrow().frame() as usize;
-                if let Some(texture) = frames.frames.borrow().get(frame) {
+                if let Some(texture) = frames.frames.values.borrow().get(frame) {
                     picture.set_paintable(Some(texture));
                 }
                 let delay = delays.delays.borrow().get(frame).copied().unwrap_or(10);
@@ -1197,7 +1217,7 @@ fn gallery_view(
                             *viewer_state.viewer.borrow_mut() =
                                 osv_media::ViewerState::new(opened.frames);
                             picture.set_paintable(Some(&texture));
-                            *animation_frames.frames.borrow_mut() = textures;
+                            animation_frames.frames.replace(textures);
                             *frame_delays.delays.borrow_mut() = delays;
                             let animated = opened.frames > 1;
                             play_pause.set_sensitive(animated);
@@ -1717,6 +1737,29 @@ impl fmt::Debug for CssSlots {
 mod tests {
     use super::*;
 
+    struct DropProbe(Rc<Cell<u32>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn animation_registry_evicts_and_lock_clear_drops_all_frame_owners() {
+        let drops = Rc::new(Cell::new(0));
+        let registry = FrameRegistry::new();
+        registry.replace(vec![
+            DropProbe(Rc::clone(&drops)),
+            DropProbe(Rc::clone(&drops)),
+        ]);
+        registry.replace(vec![DropProbe(Rc::clone(&drops))]);
+        assert_eq!(drops.get(), 2);
+        registry.clear();
+        assert_eq!(drops.get(), 3);
+        assert!(registry.values.borrow().is_empty());
+    }
+
     #[test]
     fn gallery_revocation_drops_names_navigation_and_entries() {
         let id = osv_catalog::GalleryId::from_bytes([7; 16]);
@@ -1749,7 +1792,7 @@ mod tests {
         playback.viewer.borrow_mut().advance();
         playback.revoke();
 
-        assert!(playback.frames.borrow().is_empty());
+        assert!(playback.frames.values.borrow().is_empty());
         assert!(playback.delays.borrow().is_empty());
         assert_eq!(playback.viewer.borrow().frame(), 0);
         assert!(!playback.viewer.borrow().playing());

@@ -1569,6 +1569,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   journal plus a usable catalog image record. Development helper discovery now
   handles Cargo integration-test executables under `target/*/deps` without a
   production environment override.
+- Made animation frame replacement an explicit owner registry operation.
+  Regression coverage proves that loading a new animation immediately drops
+  every prior frame owner and that lock clearing drops every replacement owner,
+  in addition to clearing delays and playback state.
 
 **Verification**
 
@@ -1597,9 +1601,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases and explicit animation cache-eviction
-  evidence remain required before Phase 9 can be marked complete. Lock-time
-  animation revocation now has a dedicated state-lifetime regression.
+- Deeper malformed/bomb corpus cases remain required before Phase 9 can be
+  marked complete. Animation replacement eviction and lock-time revocation have
+  dedicated owner/state lifetime regressions.
 - Regeneration now has full runtime close-during-worker integration,
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement
