@@ -1539,6 +1539,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   closed. Lock now revokes the complete playback object, including protected
   texture owners, frame delays, frame index/count, play state, and scheduling
   deadline retained by timer closures.
+- Added a genuine two-frame animated WebP assembled from lossless WebP frame
+  bitstreams. The corpus proves exact full-canvas pixels, 25/50 ms timing,
+  protected decode, and the complete version-4 viewer result.
 
 **Verification**
 
@@ -1561,9 +1564,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases, animated WebP corpus evidence, and animation
-  cache/lock wipe tests
-  remain required before Phase 9 can be marked complete.
+- Deeper malformed/bomb corpus cases and explicit animation cache-eviction
+  evidence remain required before Phase 9 can be marked complete. Lock-time
+  animation revocation now has a dedicated state-lifetime regression.
 - Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
   at the orchestration layer and session close-during-transition lifecycle
   evidence also remain.

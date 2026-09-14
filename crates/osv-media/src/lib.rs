@@ -1159,6 +1159,41 @@ mod tests {
             (ImageFormat::Webp, webp),
         ]
     }
+
+    fn animated_webp() -> Vec<u8> {
+        fn chunk(output: &mut Vec<u8>, kind: &[u8; 4], payload: &[u8]) {
+            output.extend_from_slice(kind);
+            output.extend(u32::try_from(payload.len()).unwrap().to_le_bytes());
+            output.extend_from_slice(payload);
+            if !payload.len().is_multiple_of(2) {
+                output.push(0);
+            }
+        }
+
+        fn lossless_frame(color: [u8; 4], delay_ms: u32) -> Vec<u8> {
+            let pixels = color.repeat(4);
+            let mut still = Vec::new();
+            image::codecs::webp::WebPEncoder::new_lossless(&mut still)
+                .write_image(&pixels, 2, 2, image::ExtendedColorType::Rgba8)
+                .unwrap();
+            let mut payload = vec![0; 16];
+            payload[6] = 1;
+            payload[9] = 1;
+            payload[12..15].copy_from_slice(&delay_ms.to_le_bytes()[..3]);
+            payload[15] = 2;
+            payload.extend_from_slice(&still[12..]);
+            payload
+        }
+
+        let mut webp = b"RIFF\0\0\0\0WEBP".to_vec();
+        chunk(&mut webp, b"VP8X", &[0x12, 0, 0, 0, 1, 0, 0, 1, 0, 0]);
+        chunk(&mut webp, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+        chunk(&mut webp, b"ANMF", &lossless_frame([1, 2, 3, 255], 25));
+        chunk(&mut webp, b"ANMF", &lossless_frame([4, 5, 6, 255], 50));
+        let riff_len = u32::try_from(webp.len() - 8).unwrap();
+        webp[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        webp
+    }
     #[test]
     fn rejects_bomb_before_decode() {
         assert_eq!(probe(&png(65_535, 65_535)), Err(ImageError::ResourceLimit))
@@ -1425,5 +1460,30 @@ mod tests {
         let result = image_worker_result_from_request(&request).unwrap();
         let header = decode_worker_result_header(result.expose()).unwrap();
         assert_eq!((header.source.frames, header.output_frames), (2, 2));
+    }
+
+    #[test]
+    fn genuine_animated_webp_decodes_full_canvas_frames_and_timing() {
+        let encoded = animated_webp();
+        let probe = probe(&encoded).unwrap();
+        assert_eq!((probe.format, probe.frames), (ImageFormat::Webp, 2));
+        let frames = animation_frames(&encoded, 512).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].width, frames[0].height), (2, 2));
+        assert_eq!((frames[0].delay_ms, frames[1].delay_ms), (25, 50));
+        assert_eq!(frames[0].pixels.expose()[..4], [1, 2, 3, 255]);
+        assert_eq!(frames[1].pixels.expose()[..4], [4, 5, 6, 255]);
+
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert_eq!((header.source.frames, header.output_frames), (2, 2));
+        assert_eq!(
+            (header.first_delay_ms, header.additional_frames_len),
+            (25, 20)
+        );
     }
 }
