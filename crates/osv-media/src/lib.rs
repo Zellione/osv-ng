@@ -140,6 +140,20 @@ pub struct DecodedAnimationFrame {
     pub delay_ms: u32,
 }
 
+struct WipeRgba(image::RgbaImage);
+
+impl WipeRgba {
+    fn wipe(&mut self) {
+        self.0.as_mut().zeroize();
+    }
+}
+
+impl Drop for WipeRgba {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
 impl fmt::Debug for DecodedAnimationFrame {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("DecodedAnimationFrame([REDACTED])")
@@ -651,12 +665,12 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
         reader.decode().map_err(|_| ImageError::Decode)?,
         info.orientation,
     );
-    let scaled = if decoded.width() > edge || decoded.height() > edge {
+    let scaled = WipeRgba(if decoded.width() > edge || decoded.height() > edge {
         decoded.thumbnail(edge, edge).to_rgba8()
     } else {
         decoded.to_rgba8()
-    };
-    encode_png_rgba(&scaled)
+    });
+    encode_png_rgba(&scaled.0)
 }
 
 fn apply_orientation(
@@ -714,12 +728,14 @@ fn image_worker_result_for(
     let info = probe(bytes)?;
     let thumbnail = thumbnail_png(bytes, edge)?;
     let (thumbnail_width, thumbnail_height) = thumbnail_dimensions(thumbnail.expose())?;
-    let rgba = ImageReader::new(std::io::Cursor::new(thumbnail.expose()))
-        .with_guessed_format()
-        .map_err(|_| ImageError::Decode)?
-        .decode()
-        .map_err(|_| ImageError::Decode)?
-        .to_rgba8();
+    let rgba = WipeRgba(
+        ImageReader::new(std::io::Cursor::new(thumbnail.expose()))
+            .with_guessed_format()
+            .map_err(|_| ImageError::Decode)?
+            .decode()
+            .map_err(|_| ImageError::Decode)?
+            .to_rgba8(),
+    );
     let expected_rgba_len = usize::try_from(
         u64::from(thumbnail_width)
             .checked_mul(u64::from(thumbnail_height))
@@ -727,7 +743,7 @@ fn image_worker_result_for(
             .ok_or(ImageError::ResourceLimit)?,
     )
     .map_err(|_| ImageError::ResourceLimit)?;
-    if rgba.len() != expected_rgba_len {
+    if rgba.0.len() != expected_rgba_len {
         return Err(ImageError::Decode);
     }
     let animation = if purpose == ImagePurpose::Viewer && info.frames > 1 {
@@ -743,7 +759,7 @@ fn image_worker_result_for(
     let first_delay_ms = animation.first().map_or(0, |frame| frame.delay_ms);
     let display_rgba = animation
         .first()
-        .map_or(rgba.as_raw().as_slice(), |frame| frame.pixels.expose());
+        .map_or(rgba.0.as_raw().as_slice(), |frame| frame.pixels.expose());
     if display_rgba.len() != expected_rgba_len {
         return Err(ImageError::Malformed);
     }
@@ -762,7 +778,7 @@ fn image_worker_result_for(
     }
     let total = WORKER_RESULT_HEADER_LEN
         .checked_add(thumbnail.len())
-        .and_then(|size| size.checked_add(rgba.len()))
+        .and_then(|size| size.checked_add(rgba.0.len()))
         .and_then(|size| size.checked_add(additional_frames_len))
         .filter(|size| {
             *size
@@ -787,7 +803,7 @@ fn image_worker_result_for(
     header[32..36].copy_from_slice(&thumbnail_height.to_le_bytes());
     let thumbnail_png_len =
         u32::try_from(thumbnail.len()).map_err(|_| ImageError::ResourceLimit)?;
-    let rgba_len = u32::try_from(rgba.len()).map_err(|_| ImageError::ResourceLimit)?;
+    let rgba_len = u32::try_from(rgba.0.len()).map_err(|_| ImageError::ResourceLimit)?;
     header[36..40].copy_from_slice(&thumbnail_png_len.to_le_bytes());
     header[40..44].copy_from_slice(&rgba_len.to_le_bytes());
     header[44..48].copy_from_slice(&edge.to_le_bytes());
@@ -804,8 +820,8 @@ fn image_worker_result_for(
     );
     let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
     result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
-    result.expose_mut()[png_end..png_end + rgba.len()].copy_from_slice(display_rgba);
-    let mut offset = png_end + rgba.len();
+    result.expose_mut()[png_end..png_end + rgba.0.len()].copy_from_slice(display_rgba);
+    let mut offset = png_end + rgba.0.len();
     for frame in animation.iter().skip(1) {
         result.expose_mut()[offset..offset + 4].copy_from_slice(&frame.delay_ms.to_le_bytes());
         offset += 4;
@@ -1401,6 +1417,17 @@ mod tests {
         assert_eq!(c.bytes(), 65_536);
         c.clear();
         assert_eq!(c.bytes(), 0)
+    }
+
+    #[test]
+    fn application_owned_rgba_is_wiped_before_release() {
+        let mut rgba = WipeRgba(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([1, 2, 3, 4]),
+        ));
+        rgba.wipe();
+        assert!(rgba.0.as_raw().iter().all(|byte| *byte == 0));
     }
     #[test]
     fn viewer_bounds_animation() {
