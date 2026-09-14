@@ -1423,7 +1423,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
-**Status (2026-09-13): In progress**
+**Status (2026-09-14): In progress**
 
 **Delivered scope**
 
@@ -1478,6 +1478,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   are discarded, so an old callback cannot enqueue work into a newly unlocked
   vault or restore decrypted preview pixels after lock. Failure to enqueue a
   selected file now also releases the retained portal authority immediately.
+- Reading a stable portal-selected descriptor into protected memory is now
+  split into protocol-sized chunks with revocation checks between reads. Lock
+  no longer waits for the complete bounded source read before cancellation can
+  stop initial import preparation.
 - Added bounded encrypted-catalog image and gallery summaries that omit original
   filenames from tile composition. The production gallery now replaces its
   synthetic model with catalog-backed image records; the 100k synthetic model

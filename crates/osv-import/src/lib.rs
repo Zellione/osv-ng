@@ -362,9 +362,22 @@ pub fn prepare_image_import_cancellable(
     }
     let mut protected =
         osv_crypto::SecretBytes::zeroed(len).map_err(|_| ImageImportError::Input)?;
-    source
-        .read_exact(protected.expose_mut())
-        .map_err(|_| ImageImportError::Input)?;
+    let mut offset = 0usize;
+    while offset < len {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ImageImportError::Cancelled);
+        }
+        let end = offset
+            .checked_add(osv_worker_protocol::MAX_DATA_LEN)
+            .map_or(len, |end| end.min(len));
+        source
+            .read_exact(&mut protected.expose_mut()[offset..end])
+            .map_err(|_| ImageImportError::Input)?;
+        offset = end;
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(ImageImportError::Cancelled);
+    }
     let mut excess = [0u8; 1];
     if source
         .read(&mut excess)
@@ -699,6 +712,7 @@ pub fn spawn_archive_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     struct FailAt(osv_vault::ServicePoint);
 
@@ -826,6 +840,53 @@ mod tests {
             ),
             Err(ImageImportError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn cancellation_interrupts_selected_file_read_between_bounded_chunks() {
+        struct RevokeAfterFirstRead<'a> {
+            cancelled: &'a AtomicBool,
+            reads: &'a Cell<u32>,
+        }
+
+        impl Read for RevokeAfterFirstRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                assert_eq!(self.reads.get(), 0, "read continued after revocation");
+                self.reads.set(1);
+                buffer.fill(0);
+                self.cancelled.store(true, Ordering::Release);
+                Ok(buffer.len())
+            }
+        }
+
+        let cancelled = AtomicBool::new(false);
+        let reads = Cell::new(0);
+        let mut source = RevokeAfterFirstRead {
+            cancelled: &cancelled,
+            reads: &reads,
+        };
+        let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+        let password = osv_crypto::Password::new(b"mid-read cancellation password").unwrap();
+        let vault = osv_vault::VaultService::create(
+            &parent.path().join("mid-read-cancel-vault"),
+            &password,
+            None,
+            osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            prepare_image_import_cancellable(
+                &mut source,
+                u64::try_from(osv_worker_protocol::MAX_DATA_LEN + 1).unwrap(),
+                Path::new("/missing-worker"),
+                1,
+                &vault.reader(),
+                &cancelled,
+            ),
+            Err(ImageImportError::Cancelled)
+        ));
+        assert_eq!(reads.get(), 1);
     }
 
     #[test]
