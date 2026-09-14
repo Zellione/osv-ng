@@ -1661,6 +1661,51 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   protocol ceilings. The test is ignored in routine runs because of its memory
   cost and remains directly runnable as a release/resource gate.
 
+**GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
+
+- **P1 — Import confirmation is not bound to one preparation.** Preparing B
+  while A's decision controls remain active can replace the serial owner's
+  unversioned pending value, after which A's visible confirmation commits B.
+  Add a per-prepare identity to preview and commit, reject stale identities
+  without consuming the current pending import, clear decisions when a new
+  prepare starts, and regress the A-preview/B-prepare/A-confirm ordering.
+- **P1 — Revocation cannot interrupt silent or partial helper transport.** The
+  supervisor checks cancellation before a receive, but header/body polling,
+  backpressured sends, and exit waiting can retain the serial vault owner and
+  keys until the 30-second operation deadline. Make transport and exit polling
+  cancellation-aware while retaining partial-frame state; cover silence,
+  partial headers/bodies, blocked input, and Complete-without-exit workers.
+- **P2 — Some application-owned decoded pixels are not wiped.** Collected
+  animation frames, full-resolution scaling inputs, still-image decode and
+  orientation intermediates, and the PNG encoder's error path can drop ordinary
+  pixel vectors. Guard every decoder-returned image immediately, process frames
+  with wiping ownership, and exercise early-return paths.
+- **P2 — Decrypted names use non-wiping and potentially revealing owners.**
+  Gallery and import names are retained and formatted as ordinary `String`s;
+  `GalleryRecord` also derives unredacted `Debug`. Use protected/redacted owners
+  for controllable Rust allocations, wipe transfer/formatting buffers, redact
+  debug output, and separately document unavoidable GTK text copies.
+- **P2 — Image orchestration discards memory-lock degradation.** The supervisor
+  combines worker/IPC lock status, but rendition preparation does not propagate
+  it through the session security state. Aggregate and surface transient and
+  retained image-operation degradation, with a memlock exhaustion regression.
+- **P2 — A hostile helper can exceed the requested rendition edge.** Broker
+  validation permits dimensions up to the global 4096 limit even for a 512-edge
+  thumbnail. Bind actual dimensions to the requested edge and independently
+  oriented source geometry; regress a self-consistent oversized thumbnail.
+- **P2 — Thumbnail failure can hide an already committed original.** Original
+  publication precedes thumbnail publication, but a derived failure reports the
+  whole import as failed without refreshing the gallery or scheduling the now-
+  missing thumbnail. Represent partial success and enqueue regeneration, or use
+  a reviewed combined transition; add fault injection at this boundary.
+- **P2 — A one-frame APNG with a separate poster displays the poster.** Animation
+  dispatch currently depends on frame count being greater than one rather than
+  animation-container presence. Track APNG animation presence independently and
+  regress a one-frame animation whose poster has visibly different pixels.
+- The review found no additional stable-descriptor authority escape, helper
+  descriptor-confinement failure, revoked-session successful-result leak, or
+  missing-ciphertext catalog reference in the durable publication transitions.
+
 **Deviations and follow-up**
 
 - The named malformed/bomb corpus gaps are covered: APNG/WebP frame geometry
@@ -1677,9 +1722,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   check; this agent run verified accessible activation through portal request
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
-  session exposed only one active `eDP-1` output at scale 1. A fresh GPT-6
-  adversarial review is still required. Third-party decoder working allocations remain subject to the
-  documented opaque-library limitation and the helper's process resource
+  session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
+  adversarial review is complete; its two P1 and six P2 findings above remain
+  Phase 9 blockers. Third-party decoder working allocations remain subject to
+  the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.
 
