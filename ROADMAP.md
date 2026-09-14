@@ -1597,6 +1597,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - JPEG probing now walks every entropy-coded scan, handles byte stuffing and
   restart markers, supports repeated scans, rejects illegal marker transitions,
   and requires an exact end-of-image marker before decoder allocation.
+- Added an explicit near-limit helper integration using a 3500×3500 two-frame
+  APNG. It exercises the real process ceiling, protected animation planes, and
+  authenticated multi-chunk streaming above 90 MiB while remaining under the
+  96 MiB viewer-result contract.
 - Decoder-produced RGBA buffers owned by the helper application are now wrapped
   in wipe-on-drop owners during thumbnail scaling and result assembly, including
   early-return paths. This does not change the documented limitation for opaque
@@ -1651,14 +1655,19 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   portal path. After the latest import/framing changes, a fresh no-FUSE Phase 2
   Flatpak release rebuild passed the complete offline suite; the installed app
   and both installed helper self-checks also pass.
+- The explicit near-limit media-helper gate passed in 10.16 seconds with a
+  sandboxed 3500×3500 two-frame APNG, producing more than 90 MiB through the
+  authenticated result stream without exceeding the 96 MiB result or 97-chunk
+  protocol ceilings. The test is ignored in routine runs because of its memory
+  cost and remains directly runnable as a release/resource gate.
 
 **Deviations and follow-up**
 
-- Deeper malformed/bomb corpus cases remain required before Phase 9 can be
-  marked complete, specifically near-limit helper memory pressure. JPEG
-  multi-scan/entropy-marker corruption and GIF extension/sub-block bounds now
-  have dedicated allocation-free regressions. Animation replacement eviction
-  and lock-time revocation have dedicated owner/state lifetime regressions.
+- The named malformed/bomb corpus gaps are covered: APNG/WebP frame geometry
+  and sequence pressure, JPEG multi-scan/entropy markers, GIF extension and
+  sub-block bounds, and near-limit helper output all have dedicated regressions.
+  Animation replacement eviction and lock-time revocation likewise have
+  dedicated owner/state lifetime regressions.
 - Regeneration now has full runtime close-during-worker integration,
   orchestration-level injected-fault, and atomic-region revocation coverage;
   existing vault crash-process coverage exercises the same replacement

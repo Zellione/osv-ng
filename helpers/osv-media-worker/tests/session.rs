@@ -33,6 +33,24 @@ fn animated_gif() -> Vec<u8> {
     encoded
 }
 
+fn near_limit_apng(edge: u32) -> Vec<u8> {
+    let pixel_count = usize::try_from(u64::from(edge) * u64::from(edge)).unwrap();
+    let pixels = [0x21, 0x43, 0x65, 0xff].repeat(pixel_count);
+    let mut encoded = Vec::new();
+    let mut encoder = png::Encoder::new(&mut encoded, edge, edge);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_animated(2, 0).unwrap();
+    encoder.validate_sequence(true);
+    let mut writer = encoder.write_header().unwrap();
+    writer.set_frame_delay(1, 50).unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.set_frame_delay(1, 25).unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    encoded
+}
+
 #[test]
 fn media_worker_completes_a_bounded_stream_under_sandbox() {
     let executable = std::path::Path::new(env!("CARGO_BIN_EXE_osv-media-worker"));
@@ -88,6 +106,44 @@ fn media_worker_streams_bounded_animation_frames() {
             + header.rgba_len as usize
             + header.additional_frames_len as usize
     );
+}
+
+#[test]
+#[ignore = "explicit near-limit helper memory-pressure gate"]
+fn media_worker_streams_near_maximum_viewer_result_under_process_ceiling() {
+    const EDGE: u32 = 3_500;
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_osv-media-worker"));
+    let mut worker = osv_media::spawn_worker(executable, 45, SupervisorLimits::default()).unwrap();
+    let request = osv_media::encode_worker_request(osv_media::ImagePurpose::Viewer, EDGE).unwrap();
+    let mut request_buffer = PlaintextBuffer::zeroed(request.len()).unwrap();
+    request_buffer.as_mut_slice().copy_from_slice(&request);
+    worker.send_authenticated(0, request_buffer).unwrap();
+    let animation = near_limit_apng(EDGE);
+    for (index, chunk) in animation
+        .chunks(osv_worker_protocol::MAX_DATA_LEN)
+        .enumerate()
+    {
+        let mut input = PlaintextBuffer::zeroed(chunk.len()).unwrap();
+        input.as_mut_slice().copy_from_slice(chunk);
+        worker
+            .send_authenticated(u64::try_from(index + 1).unwrap(), input)
+            .unwrap();
+    }
+    let (class, output) = worker
+        .finish_with_output(osv_media::MAX_VIEWER_RESULT_BYTES)
+        .unwrap();
+    assert_eq!(class, ExitClass::Success, "{:?}", output.failure_class());
+    assert!(output.logical_len() >= 90 * 1024 * 1024);
+    assert!(output.logical_len() <= osv_media::MAX_VIEWER_RESULT_BYTES);
+    assert!(
+        output.chunks().count() <= usize::try_from(osv_worker_protocol::MAX_RESULT_CHUNKS).unwrap()
+    );
+    let header = osv_media::decode_worker_result_header(output.chunks().next().unwrap()).unwrap();
+    assert_eq!(
+        (header.thumbnail_width, header.thumbnail_height),
+        (EDGE, EDGE)
+    );
+    assert_eq!(header.output_frames, 2);
 }
 
 #[test]

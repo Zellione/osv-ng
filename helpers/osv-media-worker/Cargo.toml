@@ -15,6 +15,7 @@ osv-worker-protocol.workspace = true
 
 [dev-dependencies]
 image.workspace = true
+png.workspace = true
 osv-catalog.workspace = true
 osv-import.workspace = true
 osv-app = { path = "../../crates/osv-app", version = "=0.1.0" }
