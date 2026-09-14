@@ -1,7 +1,7 @@
 //! Serial background ownership for an unlocked production vault session.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -65,6 +65,32 @@ pub struct GalleryImage {
     pub has_thumbnail: bool,
 }
 
+pub struct GalleryFolder {
+    pub id: osv_catalog::GalleryId,
+    pub name: String,
+}
+
+#[derive(Clone, Copy)]
+pub enum GalleryChild {
+    Gallery(osv_catalog::GalleryId),
+    Image(GalleryImage),
+}
+
+pub struct GallerySnapshot {
+    pub roots: Vec<GalleryChild>,
+    pub folders: HashMap<osv_catalog::GalleryId, GalleryFolder>,
+    pub children: HashMap<osv_catalog::GalleryId, Vec<GalleryChild>>,
+}
+
+impl GallerySnapshot {
+    #[must_use]
+    pub fn level(&self, folder: Option<osv_catalog::GalleryId>) -> &[GalleryChild] {
+        folder.map_or(self.roots.as_slice(), |id| {
+            self.children.get(&id).map_or(&[], Vec::as_slice)
+        })
+    }
+}
+
 pub struct OpenedImage {
     pub media_id: osv_catalog::MediaId,
     pub pixels: osv_crypto::SecretBytes,
@@ -112,8 +138,8 @@ impl std::fmt::Debug for ImportedImage {
 }
 
 enum Command {
-    ListImages {
-        response: mpsc::Sender<Result<Vec<GalleryImage>, RuntimeError>>,
+    ListGallery {
+        response: mpsc::Sender<Result<GallerySnapshot, RuntimeError>>,
     },
     OpenThumbnail {
         media_id: osv_catalog::MediaId,
@@ -242,8 +268,8 @@ impl VaultSession {
                     continue;
                 };
                 match command {
-                    Command::ListImages { response } => {
-                        let result = list_images(&vault);
+                    Command::ListGallery { response } => {
+                        let result = list_gallery(&vault);
                         let _ = response.send(result);
                     }
                     Command::OpenThumbnail { media_id, response } => {
@@ -331,12 +357,12 @@ impl VaultSession {
         Ok(receiver)
     }
 
-    pub fn list_images(
+    pub fn list_gallery(
         &self,
-    ) -> Result<mpsc::Receiver<Result<Vec<GalleryImage>, RuntimeError>>, RuntimeError> {
+    ) -> Result<mpsc::Receiver<Result<GallerySnapshot, RuntimeError>>, RuntimeError> {
         let (response, receiver) = mpsc::channel();
         self.commands
-            .send(Command::ListImages { response })
+            .send(Command::ListGallery { response })
             .map_err(|_| RuntimeError::Closed)?;
         Ok(receiver)
     }
@@ -433,8 +459,9 @@ fn prepare_import(
     Ok((prepared, request.original_name, preview))
 }
 
-fn list_images(vault: &VaultService) -> Result<Vec<GalleryImage>, RuntimeError> {
-    vault
+fn list_gallery(vault: &VaultService) -> Result<GallerySnapshot, RuntimeError> {
+    const LIMIT: usize = 10_000;
+    let images: Vec<_> = vault
         .reader()
         .image_records(osv_media::THUMBNAIL_RECIPE_VERSION, 10_000)
         .map_err(|_| RuntimeError::Input)
@@ -449,7 +476,84 @@ fn list_images(vault: &VaultService) -> Result<Vec<GalleryImage>, RuntimeError> 
                     has_thumbnail: record.thumbnail_object_id.is_some(),
                 })
                 .collect()
-        })
+        })?;
+    let records = vault
+        .reader()
+        .gallery_records(10_000)
+        .map_err(|_| RuntimeError::Input)?;
+    if images
+        .len()
+        .checked_add(records.len())
+        .is_none_or(|total| total > LIMIT)
+    {
+        return Err(RuntimeError::Input);
+    }
+    let image_by_id: HashMap<_, _> = images
+        .iter()
+        .map(|image| (image.media_id, *image))
+        .collect();
+    let gallery_order: Vec<_> = records.iter().map(|record| record.id).collect();
+    let mut folders = HashMap::with_capacity(records.len());
+    let mut children = HashMap::with_capacity(records.len());
+    let mut nested_galleries = HashSet::new();
+    let mut nested_media = HashSet::new();
+    let mut aggregate = images.len() + records.len();
+    for record in records {
+        let entries = vault
+            .reader()
+            .gallery_children(record.id, 10_000)
+            .map_err(|_| RuntimeError::Input)?;
+        aggregate = aggregate
+            .checked_add(entries.len())
+            .filter(|total| *total <= LIMIT)
+            .ok_or(RuntimeError::Input)?;
+        let mut composed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match entry {
+                osv_catalog::Child::Gallery(id) => {
+                    nested_galleries.insert(id);
+                    composed.push(GalleryChild::Gallery(id));
+                }
+                osv_catalog::Child::Media(id) => {
+                    let image = image_by_id.get(&id).copied().ok_or(RuntimeError::Input)?;
+                    nested_media.insert(id);
+                    composed.push(GalleryChild::Image(image));
+                }
+            }
+        }
+        folders.insert(
+            record.id,
+            GalleryFolder {
+                id: record.id,
+                name: record.name,
+            },
+        );
+        children.insert(record.id, composed);
+    }
+    if children
+        .values()
+        .flatten()
+        .any(|entry| matches!(entry, GalleryChild::Gallery(id) if !folders.contains_key(id)))
+    {
+        return Err(RuntimeError::Input);
+    }
+    let mut roots: Vec<_> = gallery_order
+        .iter()
+        .filter(|id| !nested_galleries.contains(id))
+        .copied()
+        .map(GalleryChild::Gallery)
+        .collect();
+    roots.extend(
+        images
+            .into_iter()
+            .filter(|image| !nested_media.contains(&image.media_id))
+            .map(GalleryChild::Image),
+    );
+    Ok(GallerySnapshot {
+        roots,
+        folders,
+        children,
+    })
 }
 
 fn open_thumbnail(
@@ -585,6 +689,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gallery_snapshot_navigates_empty_deep_and_mixed_levels() {
+        let ids: Vec<_> = (0u8..64)
+            .map(|byte| osv_catalog::GalleryId::from_bytes([byte; 16]))
+            .collect();
+        let image = GalleryImage {
+            media_id: osv_catalog::MediaId::from_bytes([0x80; 16]),
+            width: 8,
+            height: 6,
+            favorite: true,
+            has_thumbnail: true,
+        };
+        let mut folders = HashMap::new();
+        let mut children = HashMap::new();
+        for (depth, id) in ids.iter().copied().enumerate() {
+            folders.insert(
+                id,
+                GalleryFolder {
+                    id,
+                    name: format!("Level {depth}"),
+                },
+            );
+            let level = ids
+                .get(depth + 1)
+                .copied()
+                .map_or_else(Vec::new, |child| vec![GalleryChild::Gallery(child)]);
+            children.insert(id, level);
+        }
+        children
+            .get_mut(ids.last().unwrap())
+            .unwrap()
+            .push(GalleryChild::Image(image));
+        let snapshot = GallerySnapshot {
+            roots: vec![GalleryChild::Gallery(ids[0]), GalleryChild::Image(image)],
+            folders,
+            children,
+        };
+        assert_eq!(snapshot.level(None).len(), 2);
+        for (depth, id) in ids.iter().enumerate().take(ids.len() - 1) {
+            assert!(
+                matches!(snapshot.level(Some(*id)), [GalleryChild::Gallery(next)] if *next == ids[depth + 1])
+            );
+        }
+        assert!(
+            matches!(snapshot.level(ids.last().copied()), [GalleryChild::Image(found)] if found == &image)
+        );
+        assert!(
+            snapshot
+                .level(Some(osv_catalog::GalleryId::from_bytes([0xff; 16])))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn background_session_creates_and_cleanly_closes_real_vault() {
         let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
         let path = parent.path().join("runtime-vault");
@@ -602,13 +759,14 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let images = session.list_images().unwrap().recv().unwrap().unwrap();
-        assert!(images.is_empty());
+        let gallery = session.list_gallery().unwrap().recv().unwrap().unwrap();
+        assert!(gallery.roots.is_empty());
+        assert!(gallery.folders.is_empty());
         assert_ne!(session.generation(), 0);
         assert_eq!(session.catalog_revision(), 0);
         assert_eq!(session.maintenance_status(), MaintenanceStatus::default());
         session.revoke();
-        if let Ok(receiver) = session.list_images() {
+        if let Ok(receiver) = session.list_gallery() {
             assert!(
                 receiver
                     .recv_timeout(std::time::Duration::from_secs(1))

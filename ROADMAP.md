@@ -1542,6 +1542,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Added a genuine two-frame animated WebP assembled from lossless WebP frame
   bitstreams. The corpus proves exact full-canvas pixels, 25/50 ms timing,
   protected decode, and the complete version-4 viewer result.
+- Replaced flat production composition with a bounded catalog-backed gallery
+  snapshot that preserves ordered media/gallery children, presents root and
+  unfiled items, and supports arbitrary acyclic nesting with explicit upward
+  navigation. A single 10,000-entry aggregate budget bounds galleries, images,
+  and relationships rather than multiplying per-gallery limits. Both lock paths
+  synchronously drop decrypted gallery names, navigation state, entries, and
+  GTK string-model contents.
 
 **Verification**
 
@@ -1567,9 +1574,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Deeper malformed/bomb corpus cases and explicit animation cache-eviction
   evidence remain required before Phase 9 can be marked complete. Lock-time
   animation revocation now has a dedicated state-lifetime regression.
-- Production composition still needs nested gallery presentation. Regeneration replacement fault/crash tests
-  at the orchestration layer and session close-during-transition lifecycle
-  evidence also remain.
+- Regeneration replacement fault/crash tests at the orchestration layer and
+  session close-during-transition lifecycle evidence remain.
 - Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
   accessibility interaction evidence, and a fresh GPT-6 adversarial review are
   still required. Third-party decoder working allocations remain subject to the

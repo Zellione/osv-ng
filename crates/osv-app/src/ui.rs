@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
 
-use crate::runtime::{GalleryImage, ImportRequest, OpenKind, VaultSession};
+use crate::runtime::{GalleryChild, GallerySnapshot, ImportRequest, OpenKind, VaultSession};
 use crate::{
     Appearance, Command, CssOutcome, Density, PanelPlacement, Revocable, Route, ShellState, Theme,
     accept_user_css,
@@ -55,6 +55,71 @@ impl AnimationPlayback {
 }
 
 type SensitiveAnimations = Rc<RefCell<Vec<Rc<AnimationPlayback>>>>;
+type SensitiveGalleries = Rc<RefCell<Vec<Rc<GalleryPresentation>>>>;
+
+#[derive(Clone, Copy)]
+enum GalleryUiEntry {
+    Folder(osv_catalog::GalleryId),
+    Image(crate::runtime::GalleryImage),
+}
+
+struct GalleryPresentation {
+    snapshot: Rc<RefCell<Option<GallerySnapshot>>>,
+    entries: Rc<RefCell<Vec<GalleryUiEntry>>>,
+    path: Rc<RefCell<Vec<osv_catalog::GalleryId>>>,
+    model: gtk::StringList,
+}
+
+impl GalleryPresentation {
+    fn revoke(&self) {
+        revoke_gallery_state(&self.snapshot, &self.entries, &self.path);
+        self.model.splice(0, self.model.n_items(), &[]);
+    }
+}
+
+fn revoke_gallery_state(
+    snapshot: &RefCell<Option<GallerySnapshot>>,
+    entries: &RefCell<Vec<GalleryUiEntry>>,
+    path: &RefCell<Vec<osv_catalog::GalleryId>>,
+) {
+    snapshot.borrow_mut().take();
+    entries.borrow_mut().clear();
+    path.borrow_mut().clear();
+}
+
+fn show_gallery_level(
+    snapshot: &GallerySnapshot,
+    folder: Option<osv_catalog::GalleryId>,
+    entries: &RefCell<Vec<GalleryUiEntry>>,
+    model: &gtk::StringList,
+) {
+    let source = snapshot.level(folder);
+    let mut next = Vec::with_capacity(source.len());
+    let mut labels = Vec::with_capacity(source.len());
+    for (index, child) in source.iter().enumerate() {
+        match child {
+            GalleryChild::Gallery(id) => {
+                if let Some(folder) = snapshot.folders.get(id) {
+                    next.push(GalleryUiEntry::Folder(*id));
+                    labels.push(format!("Gallery — {}", folder.name));
+                }
+            }
+            GalleryChild::Image(image) => {
+                next.push(GalleryUiEntry::Image(*image));
+                labels.push(format!(
+                    "Image {} — {} × {}{}",
+                    index + 1,
+                    image.width,
+                    image.height,
+                    if image.favorite { " — favorite" } else { "" }
+                ));
+            }
+        }
+    }
+    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+    model.splice(0, model.n_items(), &labels);
+    *entries.borrow_mut() = next;
+}
 
 impl AsRef<[u8]> for TexturePixels {
     fn as_ref(&self) -> &[u8] {
@@ -113,6 +178,7 @@ fn build_window(app: &gtk::Application) {
     let session = Rc::new(RefCell::new(None::<VaultSession>));
     let sensitive_pictures = Rc::new(RefCell::new(Vec::<gtk::Picture>::new()));
     let sensitive_animations: SensitiveAnimations = Rc::new(RefCell::new(Vec::new()));
+    let sensitive_galleries: SensitiveGalleries = Rc::new(RefCell::new(Vec::new()));
     css.set_appearance(&state.borrow().appearance);
     let password = gtk::PasswordEntry::builder()
         .placeholder_text("Password")
@@ -141,6 +207,7 @@ fn build_window(app: &gtk::Application) {
             &session,
             &sensitive_pictures,
             &sensitive_animations,
+            &sensitive_galleries,
         ),
         Some("vault"),
     );
@@ -159,11 +226,13 @@ fn build_window(app: &gtk::Application) {
         &password,
         &sensitive_pictures,
         &sensitive_animations,
+        &sensitive_galleries,
         &session,
     );
     window.present();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_keyboard(
     window: &gtk::ApplicationWindow,
     state: &Rc<RefCell<ShellState>>,
@@ -171,6 +240,7 @@ fn install_keyboard(
     password: &gtk::PasswordEntry,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
     session: &Rc<RefCell<Option<VaultSession>>>,
 ) {
     let keys = gtk::EventControllerKey::new();
@@ -179,6 +249,7 @@ fn install_keyboard(
     let password = password.clone();
     let sensitive_pictures = Rc::clone(sensitive_pictures);
     let sensitive_animations = Rc::clone(sensitive_animations);
+    let sensitive_galleries = Rc::clone(sensitive_galleries);
     let session = Rc::clone(session);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let command = [
@@ -211,6 +282,7 @@ fn install_keyboard(
                 }
                 clear_sensitive_pictures(&sensitive_pictures);
                 clear_sensitive_animations(&sensitive_animations);
+                clear_sensitive_galleries(&sensitive_galleries);
             }
             sync_route(&outer, state.borrow().route(), &password);
             glib::Propagation::Stop
@@ -470,6 +542,7 @@ fn create_page(
     page.upcast()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vault_page(
     state: &Rc<RefCell<ShellState>>,
     outer: &gtk::Stack,
@@ -478,6 +551,7 @@ fn vault_page(
     session: &Rc<RefCell<Option<VaultSession>>>,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -485,7 +559,12 @@ fn vault_page(
     let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     content.set_widget_name("osv-vault-content");
     content.add_named(
-        &gallery_view(session, sensitive_pictures, sensitive_animations),
+        &gallery_view(
+            session,
+            sensitive_pictures,
+            sensitive_animations,
+            sensitive_galleries,
+        ),
         Some("gallery"),
     );
     content.add_named(
@@ -544,12 +623,14 @@ fn vault_page(
     let session_for_lock = Rc::clone(session);
     let sensitive_pictures_for_lock = Rc::clone(sensitive_pictures);
     let sensitive_animations_for_lock = Rc::clone(sensitive_animations);
+    let sensitive_galleries_for_lock = Rc::clone(sensitive_galleries);
     lock.connect_clicked(move |_| {
         if let Some(session) = session_for_lock.borrow_mut().take() {
             session.revoke();
         }
         clear_sensitive_pictures(&sensitive_pictures_for_lock);
         clear_sensitive_animations(&sensitive_animations_for_lock);
+        clear_sensitive_galleries(&sensitive_galleries_for_lock);
         state_for_lock.borrow_mut().lock();
         sync_route(&outer_for_lock, Route::Choose, &password_for_lock);
     });
@@ -602,6 +683,7 @@ fn gallery_view(
     session: &Rc<RefCell<Option<VaultSession>>>,
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let import = gtk::Button::with_mnemonic("_Import image…");
@@ -958,7 +1040,35 @@ fn gallery_view(
 
     let model = gtk::StringList::new(&[]);
     let selection = gtk::SingleSelection::new(Some(model.clone()));
-    let records = Rc::new(RefCell::new(Vec::<GalleryImage>::new()));
+    let records = Rc::new(RefCell::new(Vec::<GalleryUiEntry>::new()));
+    let snapshot = Rc::new(RefCell::new(None::<GallerySnapshot>));
+    let gallery_path = Rc::new(RefCell::new(Vec::<osv_catalog::GalleryId>::new()));
+    let presentation = Rc::new(GalleryPresentation {
+        snapshot: Rc::clone(&snapshot),
+        entries: Rc::clone(&records),
+        path: Rc::clone(&gallery_path),
+        model: model.clone(),
+    });
+    sensitive_galleries
+        .borrow_mut()
+        .push(Rc::clone(&presentation));
+    let up = gtk::Button::with_mnemonic("_Up one gallery");
+    up.set_sensitive(false);
+    root.append(&up);
+    {
+        let snapshot = Rc::clone(&snapshot);
+        let path = Rc::clone(&gallery_path);
+        let records = Rc::clone(&records);
+        let model = model.clone();
+        up.connect_clicked(move |button| {
+            path.borrow_mut().pop();
+            let folder = path.borrow().last().copied();
+            button.set_sensitive(folder.is_some());
+            if let Some(snapshot) = snapshot.borrow().as_ref() {
+                show_gallery_level(snapshot, folder, &records, &model);
+            }
+        });
+    }
     {
         let selection = selection.clone();
         previous.connect_clicked(move |_| {
@@ -998,6 +1108,10 @@ fn gallery_view(
     {
         let session = Rc::clone(session);
         let records = Rc::clone(&records);
+        let snapshot = Rc::clone(&snapshot);
+        let gallery_path = Rc::clone(&gallery_path);
+        let model = model.clone();
+        let up = up.clone();
         let picture = picture.clone();
         let status = status.clone();
         let viewer_state = Rc::clone(&viewer_state);
@@ -1009,7 +1123,18 @@ fn gallery_view(
         let step_frame = step_frame.clone();
         selection.connect_selected_notify(move |selection| {
             let index = selection.selected();
-            let Some(record) = records.borrow().get(index as usize).copied() else {
+            let Some(entry) = records.borrow().get(index as usize).copied() else {
+                return;
+            };
+            let GalleryUiEntry::Image(record) = entry else {
+                let GalleryUiEntry::Folder(id) = entry else {
+                    unreachable!()
+                };
+                gallery_path.borrow_mut().push(id);
+                up.set_sensitive(true);
+                if let Some(snapshot) = snapshot.borrow().as_ref() {
+                    show_gallery_level(snapshot, Some(id), &records, &model);
+                }
                 return;
             };
             if !record.has_thumbnail {
@@ -1154,6 +1279,9 @@ fn gallery_view(
     {
         let session = Rc::clone(session);
         let records = Rc::clone(&records);
+        let snapshot = Rc::clone(&snapshot);
+        let gallery_path = Rc::clone(&gallery_path);
+        let up = up.clone();
         let model = model.clone();
         let task_status = status.clone();
         let loaded_revision = Rc::new(Cell::new(None::<(u64, u64)>));
@@ -1165,6 +1293,9 @@ fn gallery_view(
             if session_state.is_none() {
                 loaded_revision.set(None);
                 records.borrow_mut().clear();
+                snapshot.borrow_mut().take();
+                gallery_path.borrow_mut().clear();
+                up.set_sensitive(false);
                 model.splice(0, model.n_items(), &[]);
                 return glib::ControlFlow::Continue;
             }
@@ -1183,7 +1314,7 @@ fn gallery_view(
             if loaded_revision.get() == session_state {
                 return glib::ControlFlow::Continue;
             }
-            let receiver = match session.borrow().as_ref().map(VaultSession::list_images) {
+            let receiver = match session.borrow().as_ref().map(VaultSession::list_gallery) {
                 Some(Ok(receiver)) => receiver,
                 _ => return glib::ControlFlow::Continue,
             };
@@ -1191,30 +1322,21 @@ fn gallery_view(
             let generation = session_state.map(|state| state.0);
             let session = Rc::clone(&session);
             let records = Rc::clone(&records);
+            let snapshot = Rc::clone(&snapshot);
+            let gallery_path = Rc::clone(&gallery_path);
+            let up = up.clone();
             let model = model.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 match receiver.try_recv() {
-                    Ok(Ok(images)) => {
+                    Ok(Ok(loaded)) => {
                         let current = session.borrow().as_ref().map(VaultSession::generation);
                         if current != generation {
                             return glib::ControlFlow::Break;
                         }
-                        let labels: Vec<String> = images
-                            .iter()
-                            .enumerate()
-                            .map(|(index, image)| {
-                                format!(
-                                    "Image {} — {} × {}{}",
-                                    index + 1,
-                                    image.width,
-                                    image.height,
-                                    if image.favorite { " — favorite" } else { "" }
-                                )
-                            })
-                            .collect();
-                        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-                        model.splice(0, model.n_items(), &labels);
-                        *records.borrow_mut() = images;
+                        gallery_path.borrow_mut().clear();
+                        up.set_sensitive(false);
+                        show_gallery_level(&loaded, None, &records, &model);
+                        *snapshot.borrow_mut() = Some(loaded);
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -1260,6 +1382,12 @@ fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {
 fn clear_sensitive_animations(animations: &SensitiveAnimations) {
     for animation in animations.borrow().iter() {
         animation.revoke();
+    }
+}
+
+fn clear_sensitive_galleries(galleries: &SensitiveGalleries) {
+    for gallery in galleries.borrow().iter() {
+        gallery.revoke();
     }
 }
 
@@ -1588,6 +1716,30 @@ impl fmt::Debug for CssSlots {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gallery_revocation_drops_names_navigation_and_entries() {
+        let id = osv_catalog::GalleryId::from_bytes([7; 16]);
+        let mut folders = std::collections::HashMap::new();
+        folders.insert(
+            id,
+            crate::runtime::GalleryFolder {
+                id,
+                name: "sensitive name".to_owned(),
+            },
+        );
+        let snapshot = RefCell::new(Some(GallerySnapshot {
+            roots: vec![GalleryChild::Gallery(id)],
+            folders,
+            children: std::collections::HashMap::new(),
+        }));
+        let entries = RefCell::new(vec![GalleryUiEntry::Folder(id)]);
+        let path = RefCell::new(vec![id]);
+        revoke_gallery_state(&snapshot, &entries, &path);
+        assert!(snapshot.borrow().is_none());
+        assert!(entries.borrow().is_empty());
+        assert!(path.borrow().is_empty());
+    }
 
     #[test]
     fn animation_revocation_clears_media_derived_playback_state() {
