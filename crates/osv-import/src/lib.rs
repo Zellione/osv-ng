@@ -459,10 +459,26 @@ pub fn regenerate_image_thumbnail_cancellable(
     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Err(ImageImportError::Cancelled);
     }
+    publish_regenerated_thumbnail(
+        vault,
+        target,
+        prepared,
+        now_ms,
+        &mut osv_vault::NoServiceFaults,
+    )
+}
+
+fn publish_regenerated_thumbnail(
+    vault: &mut osv_vault::VaultService,
+    target: osv_catalog::DerivedRegeneration,
+    prepared: PreparedThumbnail,
+    now_ms: i64,
+    faults: &mut impl osv_vault::ServiceFaultInjector,
+) -> Result<osv_storage::ObjectId, ImageImportError> {
     let logical_len = u64::try_from(prepared.bytes.len()).map_err(|_| ImageImportError::Input)?;
     let mut reader = std::io::Cursor::new(prepared.bytes.expose());
     vault
-        .replace_derived(
+        .replace_derived_with(
             &mut reader,
             logical_len,
             target.media_id,
@@ -471,6 +487,7 @@ pub fn regenerate_image_thumbnail_cancellable(
             prepared.width,
             prepared.height,
             now_ms,
+            faults,
         )
         .map_err(ImageImportError::Vault)
 }
@@ -683,6 +700,14 @@ pub fn spawn_archive_worker(
 mod tests {
     use super::*;
 
+    struct FailAt(osv_vault::ServicePoint);
+
+    impl osv_vault::ServiceFaultInjector for FailAt {
+        fn should_fail(&mut self, point: osv_vault::ServicePoint) -> bool {
+            point == self.0
+        }
+    }
+
     fn worker_result(
         purpose: osv_media::ImagePurpose,
         source_frames: u32,
@@ -771,5 +796,127 @@ mod tests {
             ),
             Err(ImageImportError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn regeneration_publication_faults_preserve_a_durable_catalog_target() {
+        for point in [
+            osv_vault::ServicePoint::ObjectDurable,
+            osv_vault::ServicePoint::BeforeCatalogCommit,
+            osv_vault::ServicePoint::CatalogCommitted,
+        ] {
+            let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+            let password = osv_crypto::Password::new(b"regeneration fault password").unwrap();
+            let path = parent.path().join(point.name());
+            let mut vault = osv_vault::VaultService::create(
+                &path,
+                &password,
+                None,
+                osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+                1,
+            )
+            .unwrap();
+            let media_id = osv_catalog::MediaId::from_bytes([0x31; 16]);
+            let original = b"authenticated original";
+            let original_id = vault
+                .import(
+                    &mut std::io::Cursor::new(original),
+                    original.len() as u64,
+                    osv_vault::ImportMetadata {
+                        id: media_id,
+                        original_name: "private.png",
+                        class: osv_catalog::MediaClass::Image,
+                        mime: "image/png",
+                        width: Some(2),
+                        height: Some(2),
+                        duration_ms: None,
+                        codecs: "",
+                        imported_at_ms: 1,
+                        fingerprint: &[0x42; 32],
+                    },
+                )
+                .unwrap();
+            let old = b"old encrypted thumbnail";
+            let old_id = vault
+                .replace_derived(
+                    &mut std::io::Cursor::new(old),
+                    old.len() as u64,
+                    media_id,
+                    osv_storage::ObjectRole::Thumbnail,
+                    2,
+                    2,
+                    2,
+                    2,
+                )
+                .unwrap();
+            let prepared = PreparedThumbnail {
+                probe: osv_media::ImageProbe {
+                    format: osv_media::ImageFormat::Png,
+                    width: 2,
+                    height: 2,
+                    frames: 1,
+                    orientation: osv_media::Orientation::Normal,
+                    has_color_profile: false,
+                },
+                bytes: osv_crypto::SecretBytes::new(b"new encrypted thumbnail").unwrap(),
+                width: 2,
+                height: 2,
+                display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
+                first_delay_ms: 0,
+                additional_frames: Vec::new(),
+            };
+            let result = publish_regenerated_thumbnail(
+                &mut vault,
+                osv_catalog::DerivedRegeneration {
+                    media_id,
+                    original_object_id: original_id,
+                },
+                prepared,
+                3,
+                &mut FailAt(point),
+            );
+            assert!(
+                matches!(result, Err(ImageImportError::Vault(osv_vault::ServiceError::InjectedFault(actual))) if actual == point)
+            );
+
+            let committed_new = point == osv_vault::ServicePoint::CatalogCommitted;
+            let recipe = if committed_new {
+                osv_media::THUMBNAIL_RECIPE_VERSION
+            } else {
+                2
+            };
+            let record = vault.reader().image_records(recipe, 10).unwrap()[0];
+            let referenced = record.thumbnail_object_id.unwrap();
+            assert_eq!(referenced == old_id, !committed_new);
+            let mut plaintext = Vec::new();
+            vault
+                .open_object(referenced)
+                .unwrap()
+                .read_to_end(&mut plaintext)
+                .unwrap();
+            assert_eq!(
+                plaintext,
+                if committed_new {
+                    b"new encrypted thumbnail".as_slice()
+                } else {
+                    old.as_slice()
+                }
+            );
+            vault.maintenance_scan().unwrap();
+            assert!(vault.reader().operation_journal().unwrap().is_empty());
+            assert_eq!(
+                vault
+                    .reader()
+                    .all_objects()
+                    .unwrap()
+                    .iter()
+                    .filter(|object| {
+                        object.descriptor.role() == osv_storage::ObjectRole::Thumbnail
+                    })
+                    .count(),
+                1
+            );
+            vault.close().unwrap();
+        }
     }
 }

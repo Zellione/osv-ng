@@ -1549,6 +1549,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   and relationships rather than multiplying per-gallery limits. Both lock paths
   synchronously drop decrypted gallery names, navigation state, entries, and
   GTK string-model contents.
+- Routed regeneration publication through a fault-injectable form of the exact
+  production transition. Orchestration regressions at object-durable,
+  before-catalog-commit, and catalog-committed boundaries prove that the old
+  derived object remains referenced and readable until commit, the new durable
+  object is readable after commit, and maintenance removes orphan/journal state
+  without ever leaving a catalog reference to missing ciphertext.
 
 **Verification**
 
@@ -1574,8 +1580,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Deeper malformed/bomb corpus cases and explicit animation cache-eviction
   evidence remain required before Phase 9 can be marked complete. Lock-time
   animation revocation now has a dedicated state-lifetime regression.
-- Regeneration replacement fault/crash tests at the orchestration layer and
-  session close-during-transition lifecycle evidence remain.
+- Session close-during-transition lifecycle evidence remains. Regeneration now
+  has orchestration-level injected-fault coverage; existing vault crash-process
+  coverage exercises the same replacement durability boundaries.
 - Final full host/audit/deny/fuzz-policy/Flatpak gates, native Wayland portal and
   accessibility interaction evidence, and a fresh GPT-6 adversarial review are
   still required. Third-party decoder working allocations remain subject to the
