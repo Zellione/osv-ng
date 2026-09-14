@@ -475,6 +475,16 @@ fn portal_error_is_cancelled(error: &glib::Error) -> bool {
         || error.matches(gio::IOErrorEnum::Cancelled)
 }
 
+fn release_authority_on_error<T, E>(
+    result: Result<T, E>,
+    authority: &RefCell<Option<gio::File>>,
+) -> Result<T, E> {
+    if result.is_err() {
+        authority.borrow_mut().take();
+    }
+    result
+}
+
 fn unlock_page(
     state: &Rc<RefCell<ShellState>>,
     stack: &gtk::Stack,
@@ -1077,16 +1087,19 @@ fn gallery_view(
                 .and_then(|name| name.into_string().ok())
                 .unwrap_or_else(|| "imported-image".to_owned());
             *selected_authority.borrow_mut() = Some(file);
-            let receiver = session
-                .borrow()
-                .as_ref()
-                .ok_or(crate::runtime::RuntimeError::Closed)
-                .and_then(|session| {
-                    session.prepare_import(ImportRequest {
-                        source,
-                        original_name,
-                    })
-                });
+            let receiver = release_authority_on_error(
+                session
+                    .borrow()
+                    .as_ref()
+                    .ok_or(crate::runtime::RuntimeError::Closed)
+                    .and_then(|session| {
+                        session.prepare_import(ImportRequest {
+                            source,
+                            original_name,
+                        })
+                    }),
+                &selected_authority,
+            );
             let Ok(receiver) = receiver else {
                 status.set_label("Unlock a vault before importing.");
                 return;
@@ -1890,5 +1903,18 @@ mod tests {
         assert!(portal_error_is_cancelled(&dismissed));
         let failed = glib::Error::new(gtk::DialogError::Failed, "failed");
         assert!(!portal_error_is_cancelled(&failed));
+    }
+
+    #[test]
+    fn failed_import_enqueue_releases_portal_authority() {
+        let authority = RefCell::new(Some(gio::File::for_path("/public/test-image.png")));
+        let result: Result<(), ()> = release_authority_on_error(Err(()), &authority);
+        assert!(result.is_err());
+        assert!(authority.borrow().is_none());
+
+        let authority = RefCell::new(Some(gio::File::for_path("/public/test-image.png")));
+        let result: Result<(), ()> = release_authority_on_error(Ok(()), &authority);
+        assert!(result.is_ok());
+        assert!(authority.borrow().is_some());
     }
 }

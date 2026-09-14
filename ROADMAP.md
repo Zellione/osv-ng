@@ -1476,7 +1476,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Extended session-generation rejection to the entire import UI lifecycle.
   Portal completions, prepare results, and commit results from a revoked session
   are discarded, so an old callback cannot enqueue work into a newly unlocked
-  vault or restore decrypted preview pixels after lock.
+  vault or restore decrypted preview pixels after lock. Failure to enqueue a
+  selected file now also releases the retained portal authority immediately.
 - Added bounded encrypted-catalog image and gallery summaries that omit original
   filenames from tile composition. The production gallery now replaces its
   synthetic model with catalog-backed image records; the 100k synthetic model
