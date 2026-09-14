@@ -358,6 +358,7 @@ fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
             .checked_add(3 * (1usize << (usize::from(b[10] & 7) + 1)))
             .ok_or(ImageError::Malformed)?
     }
+    let mut saw_trailer = false;
     while p < b.len() {
         match b[p] {
             0x2c => {
@@ -373,11 +374,15 @@ fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
                 }
                 p = skip_sub_blocks(b, p + 2)?
             }
-            0x3b => break,
+            0x3b => {
+                p += 1;
+                saw_trailer = true;
+                break;
+            }
             _ => return Err(ImageError::Malformed),
         }
     }
-    if frames == 0 {
+    if frames == 0 || !saw_trailer || p != b.len() {
         return Err(ImageError::Malformed);
     }
     Ok(ImageProbe {
@@ -554,12 +559,24 @@ fn probe_webp(b: &[u8]) -> Result<ImageProbe, ImageError> {
     if b.len() < 30 || &b[12..16] != b"VP8X" {
         return Err(ImageError::Unsupported);
     }
+    let riff_len =
+        u32::from_le_bytes(b[4..8].try_into().map_err(|_| ImageError::Malformed)?) as usize;
+    if riff_len.checked_add(8) != Some(b.len()) || &b[16..20] != 10u32.to_le_bytes().as_slice() {
+        return Err(ImageError::Malformed);
+    }
     let flags = b[20];
     let width = 1 + u32::from_le_bytes([b[24], b[25], b[26], 0]);
     let height = 1 + u32::from_le_bytes([b[27], b[28], b[29], 0]);
+    let frame_count = validate_webp_chunks(b, width, height)?;
     let frames = if flags & 2 != 0 {
-        count_webp_frames(b, width, height)?
+        if frame_count == 0 {
+            return Err(ImageError::Malformed);
+        }
+        frame_count
     } else {
+        if frame_count != 0 {
+            return Err(ImageError::Malformed);
+        }
         1
     };
     Ok(ImageProbe {
@@ -571,7 +588,11 @@ fn probe_webp(b: &[u8]) -> Result<ImageProbe, ImageError> {
         has_color_profile: flags & 0x20 != 0,
     })
 }
-fn count_webp_frames(b: &[u8], canvas_width: u32, canvas_height: u32) -> Result<u32, ImageError> {
+fn validate_webp_chunks(
+    b: &[u8],
+    canvas_width: u32,
+    canvas_height: u32,
+) -> Result<u32, ImageError> {
     let mut p = 12usize;
     let mut count = 0u32;
     while p + 8 <= b.len() {
@@ -602,11 +623,10 @@ fn count_webp_frames(b: &[u8], canvas_width: u32, canvas_height: u32) -> Result<
         }
         p = chunk_end;
     }
-    if count == 0 {
-        Err(ImageError::Malformed)
-    } else {
-        Ok(count)
+    if p != b.len() {
+        return Err(ImageError::Malformed);
     }
+    Ok(count)
 }
 
 /// Produces an in-memory PNG for encrypted publication as a derived object.
@@ -713,6 +733,12 @@ fn image_worker_result_for(
         animation.len()
     };
     let first_delay_ms = animation.first().map_or(0, |frame| frame.delay_ms);
+    let display_rgba = animation
+        .first()
+        .map_or(rgba.as_raw().as_slice(), |frame| frame.pixels.expose());
+    if display_rgba.len() != expected_rgba_len {
+        return Err(ImageError::Malformed);
+    }
     let mut additional_frames_len = 0usize;
     for frame in animation.iter().skip(1) {
         if frame.width != thumbnail_width
@@ -770,7 +796,7 @@ fn image_worker_result_for(
     );
     let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
     result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
-    result.expose_mut()[png_end..png_end + rgba.len()].copy_from_slice(rgba.as_raw());
+    result.expose_mut()[png_end..png_end + rgba.len()].copy_from_slice(display_rgba);
     let mut offset = png_end + rgba.len();
     for frame in animation.iter().skip(1) {
         result.expose_mut()[offset..offset + 4].copy_from_slice(&frame.delay_ms.to_le_bytes());
@@ -1292,6 +1318,28 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn gif_trailer_and_webp_riff_framing_are_required_by_probe() {
+        let mut gif = encoded_formats().remove(2).1;
+        assert_eq!(gif.pop(), Some(0x3b));
+        assert_eq!(probe(&gif), Err(ImageError::Malformed));
+
+        let mut trailing_webp = encoded_formats().remove(3).1;
+        trailing_webp.push(0);
+        assert_eq!(probe(&trailing_webp), Err(ImageError::Malformed));
+
+        let mut short_riff = encoded_formats().remove(3).1;
+        let declared = u32::try_from(short_riff.len() - 9).unwrap();
+        short_riff[4..8].copy_from_slice(&declared.to_le_bytes());
+        assert_eq!(probe(&short_riff), Err(ImageError::Malformed));
+
+        let mut truncated_chunk = encoded_formats().remove(3).1;
+        truncated_chunk.pop();
+        let declared = u32::try_from(truncated_chunk.len() - 8).unwrap();
+        truncated_chunk[4..8].copy_from_slice(&declared.to_le_bytes());
+        assert_eq!(probe(&truncated_chunk), Err(ImageError::Malformed));
+    }
     #[test]
     fn cache_evicts_and_clears() {
         let mut c = BoundedCache::new(65_536);
@@ -1460,6 +1508,40 @@ mod tests {
         let result = image_worker_result_from_request(&request).unwrap();
         let header = decode_worker_result_header(result.expose()).unwrap();
         assert_eq!((header.source.frames, header.output_frames), (2, 2));
+    }
+
+    #[test]
+    fn apng_separate_default_image_is_not_a_playback_frame() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(2, 0).unwrap();
+            encoder.set_sep_def_img(true).unwrap();
+            encoder.validate_sequence(true);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[9, 9, 9, 255].repeat(4)).unwrap();
+            writer.set_frame_delay(1, 10).unwrap();
+            writer.write_image_data(&[1, 2, 3, 255].repeat(4)).unwrap();
+            writer.set_frame_delay(1, 20).unwrap();
+            writer.write_image_data(&[4, 5, 6, 255].repeat(4)).unwrap();
+            writer.finish().unwrap();
+        }
+        let frames = animation_frames(&encoded, 512).unwrap();
+        assert_eq!(frames[0].pixels.expose()[..4], [1, 2, 3, 255]);
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        let first_pixel =
+            WORKER_RESULT_HEADER_LEN + usize::try_from(header.thumbnail_png_len).unwrap();
+        assert_eq!(
+            result.expose()[first_pixel..first_pixel + 4],
+            [1, 2, 3, 255]
+        );
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub enum RuntimeError {
 }
 
 pub struct ImportRequest {
-    pub source_path: PathBuf,
+    pub source: std::fs::File,
     pub original_name: String,
 }
 
@@ -267,6 +267,25 @@ impl VaultSession {
                     }
                     continue;
                 };
+                if worker_cancelled.load(Ordering::Acquire) {
+                    match command {
+                        Command::ListGallery { response } => {
+                            let _ = response.send(Err(RuntimeError::Cancelled));
+                        }
+                        Command::OpenThumbnail { response, .. }
+                        | Command::OpenViewer { response, .. } => {
+                            let _ = response.send(Err(RuntimeError::Cancelled));
+                        }
+                        Command::PrepareImport { response, .. } => {
+                            let _ = response.send(Err(RuntimeError::Cancelled));
+                        }
+                        Command::CommitImport { response, .. } => {
+                            let _ = response.send(Err(RuntimeError::Cancelled));
+                        }
+                        Command::Close => break,
+                    }
+                    continue;
+                }
                 match command {
                     Command::ListGallery { response } => {
                         let result = list_gallery(&vault);
@@ -438,8 +457,12 @@ fn prepare_import(
 ) -> Result<(osv_import::PreparedImageImport, String, ImportPreview), RuntimeError> {
     let worker = media_worker_path();
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    let mut source = std::fs::File::open(&request.source_path).map_err(|_| RuntimeError::Input)?;
-    let logical_len = source.metadata().map_err(|_| RuntimeError::Input)?.len();
+    let mut source = request.source;
+    let metadata = source.metadata().map_err(|_| RuntimeError::Input)?;
+    if !metadata.is_file() {
+        return Err(RuntimeError::Input);
+    }
+    let logical_len = metadata.len();
     let prepared = osv_import::prepare_image_import_cancellable(
         &mut source,
         logical_len,
@@ -697,6 +720,25 @@ fn media_worker_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_request_keeps_selected_inode_after_path_substitution() {
+        use std::io::Read;
+
+        let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+        let selected = parent.path().join("selected.png");
+        let replacement = parent.path().join("replacement.png");
+        std::fs::write(&selected, b"selected public fixture").unwrap();
+        std::fs::write(&replacement, b"replacement public fixture").unwrap();
+        let mut request = ImportRequest {
+            source: std::fs::File::open(&selected).unwrap(),
+            original_name: "fixture.png".to_owned(),
+        };
+        std::fs::rename(&replacement, &selected).unwrap();
+        let mut bytes = Vec::new();
+        request.source.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"selected public fixture");
+    }
 
     #[test]
     fn gallery_snapshot_navigates_empty_deep_and_mixed_levels() {

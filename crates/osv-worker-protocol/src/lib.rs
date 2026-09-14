@@ -10,7 +10,8 @@ pub const MAX_PAYLOAD_LEN: usize = 1024 * 1024;
 pub const MAX_DATA_LEN: usize = MAX_PAYLOAD_LEN - 9;
 /// Independent cap on result framing, even when a caller permits a large byte
 /// result. This bounds per-chunk allocation/accounting under a hostile worker.
-pub const MAX_RESULT_CHUNKS: u64 = 64;
+/// Covers the 96 MiB viewer cap when each authenticated frame loses header bytes.
+pub const MAX_RESULT_CHUNKS: u64 = 97;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -487,6 +488,13 @@ impl BrokerMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_chunk_ceiling_covers_the_viewer_byte_contract() {
+        let capacity = MAX_RESULT_CHUNKS * u64::try_from(MAX_DATA_LEN).unwrap();
+        assert!(capacity >= 96 * 1024 * 1024);
+        assert!((MAX_RESULT_CHUNKS - 1) * u64::try_from(MAX_DATA_LEN).unwrap() < 96 * 1024 * 1024);
+    }
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 gtk.workspace = true
+libc.workspace = true
 osv-catalog.workspace = true
 osv-crypto.workspace = true
 osv-domain.workspace = true

@@ -742,6 +742,7 @@ name = "osv-app"
 version = "0.1.0"
 dependencies = [
  "gtk4",
+ "libc",
  "osv-catalog",
  "osv-crypto",
  "osv-domain",

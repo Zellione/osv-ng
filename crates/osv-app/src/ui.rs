@@ -6,6 +6,21 @@ use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
 
+#[cfg(unix)]
+fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 use crate::runtime::{GalleryChild, GallerySnapshot, ImportRequest, OpenKind, VaultSession};
 use crate::{
     Appearance, Command, CssOutcome, Density, PanelPlacement, Revocable, Route, ShellState, Theme,
@@ -76,6 +91,7 @@ impl AnimationPlayback {
 
 type SensitiveAnimations = Rc<RefCell<Vec<Rc<AnimationPlayback>>>>;
 type SensitiveGalleries = Rc<RefCell<Vec<Rc<GalleryPresentation>>>>;
+type SensitiveImports = Rc<RefCell<Vec<Rc<ImportPresentation>>>>;
 
 #[derive(Clone, Copy)]
 enum GalleryUiEntry {
@@ -88,6 +104,23 @@ struct GalleryPresentation {
     entries: Rc<RefCell<Vec<GalleryUiEntry>>>,
     path: Rc<RefCell<Vec<osv_catalog::GalleryId>>>,
     model: gtk::StringList,
+}
+
+struct ImportPresentation {
+    authority: Rc<RefCell<Option<gio::File>>>,
+    status: gtk::Label,
+    decisions: [gtk::Button; 3],
+}
+
+impl ImportPresentation {
+    fn revoke(&self) {
+        self.authority.borrow_mut().take();
+        self.status.set_label("");
+        for button in &self.decisions {
+            button.set_visible(false);
+            button.set_sensitive(true);
+        }
+    }
 }
 
 impl GalleryPresentation {
@@ -199,6 +232,7 @@ fn build_window(app: &gtk::Application) {
     let sensitive_pictures = Rc::new(RefCell::new(Vec::<gtk::Picture>::new()));
     let sensitive_animations: SensitiveAnimations = Rc::new(RefCell::new(Vec::new()));
     let sensitive_galleries: SensitiveGalleries = Rc::new(RefCell::new(Vec::new()));
+    let sensitive_imports: SensitiveImports = Rc::new(RefCell::new(Vec::new()));
     css.set_appearance(&state.borrow().appearance);
     let password = gtk::PasswordEntry::builder()
         .placeholder_text("Password")
@@ -228,6 +262,7 @@ fn build_window(app: &gtk::Application) {
             &sensitive_pictures,
             &sensitive_animations,
             &sensitive_galleries,
+            &sensitive_imports,
         ),
         Some("vault"),
     );
@@ -247,6 +282,7 @@ fn build_window(app: &gtk::Application) {
         &sensitive_pictures,
         &sensitive_animations,
         &sensitive_galleries,
+        &sensitive_imports,
         &session,
     );
     window.present();
@@ -261,6 +297,7 @@ fn install_keyboard(
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
     sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
     session: &Rc<RefCell<Option<VaultSession>>>,
 ) {
     let keys = gtk::EventControllerKey::new();
@@ -270,6 +307,7 @@ fn install_keyboard(
     let sensitive_pictures = Rc::clone(sensitive_pictures);
     let sensitive_animations = Rc::clone(sensitive_animations);
     let sensitive_galleries = Rc::clone(sensitive_galleries);
+    let sensitive_imports = Rc::clone(sensitive_imports);
     let session = Rc::clone(session);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let command = [
@@ -303,6 +341,7 @@ fn install_keyboard(
                 clear_sensitive_pictures(&sensitive_pictures);
                 clear_sensitive_animations(&sensitive_animations);
                 clear_sensitive_galleries(&sensitive_galleries);
+                clear_sensitive_imports(&sensitive_imports);
             }
             sync_route(&outer, state.borrow().route(), &password);
             glib::Propagation::Stop
@@ -572,6 +611,7 @@ fn vault_page(
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
     sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -584,6 +624,7 @@ fn vault_page(
             sensitive_pictures,
             sensitive_animations,
             sensitive_galleries,
+            sensitive_imports,
         ),
         Some("gallery"),
     );
@@ -644,6 +685,7 @@ fn vault_page(
     let sensitive_pictures_for_lock = Rc::clone(sensitive_pictures);
     let sensitive_animations_for_lock = Rc::clone(sensitive_animations);
     let sensitive_galleries_for_lock = Rc::clone(sensitive_galleries);
+    let sensitive_imports_for_lock = Rc::clone(sensitive_imports);
     lock.connect_clicked(move |_| {
         if let Some(session) = session_for_lock.borrow_mut().take() {
             session.revoke();
@@ -651,6 +693,7 @@ fn vault_page(
         clear_sensitive_pictures(&sensitive_pictures_for_lock);
         clear_sensitive_animations(&sensitive_animations_for_lock);
         clear_sensitive_galleries(&sensitive_galleries_for_lock);
+        clear_sensitive_imports(&sensitive_imports_for_lock);
         state_for_lock.borrow_mut().lock();
         sync_route(&outer_for_lock, Route::Choose, &password_for_lock);
     });
@@ -704,6 +747,7 @@ fn gallery_view(
     sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
     sensitive_animations: &SensitiveAnimations,
     sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let import = gtk::Button::with_mnemonic("_Import image…");
@@ -877,6 +921,13 @@ fn gallery_view(
     }
 
     let selected_authority = Rc::new(RefCell::new(None::<gio::File>));
+    sensitive_imports
+        .borrow_mut()
+        .push(Rc::new(ImportPresentation {
+            authority: Rc::clone(&selected_authority),
+            status: status.clone(),
+            decisions: [confirm.clone(), skip.clone(), another.clone()],
+        }));
     let commit: Rc<dyn Fn(Option<osv_import::DuplicateDecision>)> = {
         let session = Rc::clone(session);
         let status = status.clone();
@@ -886,12 +937,11 @@ fn gallery_view(
         let another = another.clone();
         let picture = picture.clone();
         Rc::new(move |decision| {
-            let receiver = session
+            let request = session
                 .borrow()
                 .as_ref()
-                .ok_or(crate::runtime::RuntimeError::Closed)
-                .and_then(|session| session.commit_import(decision));
-            let Ok(receiver) = receiver else {
+                .map(|active| (active.generation(), active.commit_import(decision)));
+            let Some((generation, Ok(receiver))) = request else {
                 status.set_label("The unlocked session is no longer available.");
                 return;
             };
@@ -905,7 +955,12 @@ fn gallery_view(
             let skip = skip.clone();
             let another = another.clone();
             let picture = picture.clone();
+            let session = Rc::clone(&session);
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                    *selected_authority.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(Ok(Some(imported))) => {
                         let Ok(width) = i32::try_from(imported.width) else {
@@ -967,6 +1022,14 @@ fn gallery_view(
     let session_for_import = Rc::clone(session);
     let status_for_import = status.clone();
     import.connect_clicked(move |button| {
+        let Some(generation) = session_for_import
+            .borrow()
+            .as_ref()
+            .map(VaultSession::generation)
+        else {
+            status_for_import.set_label("Unlock a vault before importing.");
+            return;
+        };
         let dialog = gtk::FileDialog::builder()
             .title("Choose an image to import")
             .modal(true)
@@ -987,6 +1050,9 @@ fn gallery_view(
         let skip = skip.clone();
         let another = another.clone();
         dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+            if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                return;
+            }
             let file = match result {
                 Ok(file) => file,
                 Err(error) if portal_error_is_cancelled(&error) => return,
@@ -999,6 +1065,13 @@ fn gallery_view(
                 status.set_label("The selected portal file is not locally accessible.");
                 return;
             };
+            let source = match open_portal_file(&path) {
+                Ok(source) => source,
+                Err(_) => {
+                    status.set_label("The selected portal file could not be opened safely.");
+                    return;
+                }
+            };
             let original_name = file
                 .basename()
                 .and_then(|name| name.into_string().ok())
@@ -1010,7 +1083,7 @@ fn gallery_view(
                 .ok_or(crate::runtime::RuntimeError::Closed)
                 .and_then(|session| {
                     session.prepare_import(ImportRequest {
-                        source_path: path,
+                        source,
                         original_name,
                     })
                 });
@@ -1023,7 +1096,13 @@ fn gallery_view(
             let confirm = confirm.clone();
             let skip = skip.clone();
             let another = another.clone();
+            let session = Rc::clone(&session);
+            let selected_authority = Rc::clone(&selected_authority);
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                    *selected_authority.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
                 match receiver.try_recv() {
                     Ok(Ok(preview)) => {
                         status.set_label(&format!(
@@ -1053,6 +1132,7 @@ fn gallery_view(
                         return glib::ControlFlow::Continue;
                     }
                 }
+                *selected_authority.borrow_mut() = None;
                 glib::ControlFlow::Break
             });
         });
@@ -1408,6 +1488,12 @@ fn clear_sensitive_animations(animations: &SensitiveAnimations) {
 fn clear_sensitive_galleries(galleries: &SensitiveGalleries) {
     for gallery in galleries.borrow().iter() {
         gallery.revoke();
+    }
+}
+
+fn clear_sensitive_imports(imports: &SensitiveImports) {
+    for import in imports.borrow().iter() {
+        import.revoke();
     }
 }
 

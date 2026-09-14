@@ -1468,6 +1468,15 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   or Import Another Copy. The helper returns a bounded RGBA display plane beside
   the durable PNG; GTK constructs a memory texture without invoking an image
   decoder, and lock revokes the session and drops the paintable.
+- Portal selection now opens the chosen regular file immediately in the GTK
+  callback and transfers that stable descriptor to the serial vault owner.
+  Background import no longer reopens a pathname after selection, closing the
+  selection-to-read substitution window; helpers still receive authenticated
+  chunks only and never receive the descriptor or path.
+- Extended session-generation rejection to the entire import UI lifecycle.
+  Portal completions, prepare results, and commit results from a revoked session
+  are discarded, so an old callback cannot enqueue work into a newly unlocked
+  vault or restore decrypted preview pixels after lock.
 - Added bounded encrypted-catalog image and gallery summaries that omit original
   filenames from tile composition. The production gallery now replaces its
   synthetic model with catalog-backed image records; the 100k synthetic model
@@ -1502,6 +1511,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   bounded delay plus exact full-canvas RGBA bytes. The broker independently
   validates frame count, timing, per-plane length, aggregate length, and result
   purpose before copying every plane into protected storage.
+- APNGs with a separate default/poster image now put the true first animation
+  frame in the first display plane rather than displaying the poster and
+  skipping frame one. The authenticated result-stream ceiling is 97 chunks,
+  the minimum needed to carry the existing 96 MiB viewer byte cap after per-
+  chunk authentication framing, and permits a bounded 4096×4096 RGBA plane.
 - GTK now owns bounded animation frames as protected-memory-backed textures,
   advances them using validated frame delays, and exposes play/pause and manual
   frame-step controls plus Space/period shortcuts. Both lock paths synchronously
@@ -1562,6 +1576,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Expanded animated-WebP hostile corpus coverage for frames outside the canvas,
   truncated frame records, and a 201-frame 1000×1000 cumulative pixel-frame
   pressure case rejected by the allocation-free probe before decoder entry.
+- Tightened allocation-free container validation so GIF requires a final trailer
+  with no trailing bytes, while still and animated WebP require an exact RIFF
+  extent, canonical extended header length, and completely framed chunks.
 - Added a real-runtime close-during-regeneration integration using the installed
   media-helper protocol and a 4096×4096 authenticated PNG. The test waits until
   serial maintenance is actively decoding, revokes and closes the session under
