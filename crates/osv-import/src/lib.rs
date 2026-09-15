@@ -246,6 +246,7 @@ fn prepare_rendition_cancellable(
     if worker_result.purpose != purpose || worker_result.requested_edge != edge {
         return Err(ImageImportError::Input);
     }
+    validate_worker_dimensions(&worker_result, edge)?;
     validate_worker_frame_cardinality(&worker_result, purpose)?;
     let png_len =
         usize::try_from(worker_result.thumbnail_png_len).map_err(|_| ImageImportError::Input)?;
@@ -307,6 +308,33 @@ fn prepare_rendition_cancellable(
         first_delay_ms: worker_result.first_delay_ms,
         additional_frames,
     })
+}
+
+fn validate_worker_dimensions(
+    result: &osv_media::WorkerImageResult,
+    edge: u32,
+) -> Result<(), ImageImportError> {
+    let (source_width, source_height) = match result.source.orientation {
+        osv_media::Orientation::MirrorHorizontalRotate270
+        | osv_media::Orientation::Rotate90
+        | osv_media::Orientation::MirrorHorizontalRotate90
+        | osv_media::Orientation::Rotate270 => (result.source.height, result.source.width),
+        _ => (result.source.width, result.source.height),
+    };
+    let expected = if source_width <= edge && source_height <= edge {
+        (source_width, source_height)
+    } else {
+        let ratio = (f64::from(edge) / f64::from(source_width))
+            .min(f64::from(edge) / f64::from(source_height));
+        (
+            ((f64::from(source_width) * ratio).round() as u32).max(1),
+            ((f64::from(source_height) * ratio).round() as u32).max(1),
+        )
+    };
+    if (result.thumbnail_width, result.thumbnail_height) != expected {
+        return Err(ImageImportError::Input);
+    }
+    Ok(())
 }
 
 fn validate_worker_frame_cardinality(
@@ -793,6 +821,29 @@ mod tests {
         assert!(validate_worker_frame_cardinality(&thumbnail, thumbnail.purpose).is_ok());
         thumbnail.first_delay_ms = 20;
         assert!(validate_worker_frame_cardinality(&thumbnail, thumbnail.purpose).is_err());
+    }
+
+    #[test]
+    fn broker_binds_rendition_dimensions_to_edge_and_oriented_source() {
+        let mut result = worker_result(osv_media::ImagePurpose::Thumbnail, 1);
+        result.source.width = 1_200;
+        result.source.height = 600;
+        result.thumbnail_width = 512;
+        result.thumbnail_height = 256;
+        result.rgba_len = 512 * 256 * 4;
+        assert!(validate_worker_dimensions(&result, 512).is_ok());
+
+        result.thumbnail_width = 1_024;
+        result.thumbnail_height = 512;
+        result.rgba_len = 1_024 * 512 * 4;
+        assert!(validate_worker_dimensions(&result, 512).is_err());
+
+        result.source.width = 100;
+        result.source.height = 1_000;
+        result.source.orientation = osv_media::Orientation::Rotate90;
+        result.thumbnail_width = 512;
+        result.thumbnail_height = 51;
+        assert!(validate_worker_dimensions(&result, 512).is_ok());
     }
 
     #[test]

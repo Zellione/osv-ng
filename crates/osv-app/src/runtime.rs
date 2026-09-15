@@ -17,6 +17,10 @@ use osv_vault::{OpenMode, VaultService};
 
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 static SESSION_ID: AtomicU64 = AtomicU64::new(1);
+static PREPARATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparationId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OpenKind {
@@ -150,10 +154,12 @@ enum Command {
         response: mpsc::Sender<Result<OpenedImage, RuntimeError>>,
     },
     PrepareImport {
+        preparation_id: PreparationId,
         request: ImportRequest,
         response: mpsc::Sender<Result<ImportPreview, RuntimeError>>,
     },
     CommitImport {
+        preparation_id: PreparationId,
         decision: Option<DuplicateDecision>,
         response: mpsc::Sender<Result<Option<ImportedImage>, RuntimeError>>,
     },
@@ -299,11 +305,15 @@ impl VaultSession {
                         let result = open_viewer(&vault, media_id, &worker_cancelled);
                         let _ = response.send(result);
                     }
-                    Command::PrepareImport { request, response } => {
+                    Command::PrepareImport {
+                        preparation_id,
+                        request,
+                        response,
+                    } => {
                         pending = None;
                         match prepare_import(&vault, request, &worker_cancelled) {
                             Ok((prepared, original_name, preview)) => {
-                                pending = Some((prepared, original_name));
+                                pending = Some((preparation_id, (prepared, original_name)));
                                 let _ = response.send(Ok(preview));
                             }
                             Err(error) => {
@@ -311,8 +321,12 @@ impl VaultSession {
                             }
                         }
                     }
-                    Command::CommitImport { decision, response } => {
-                        let result = pending.take().ok_or(RuntimeError::Input).and_then(
+                    Command::CommitImport {
+                        preparation_id,
+                        decision,
+                        response,
+                    } => {
+                        let result = take_pending_for(&mut pending, preparation_id).and_then(
                             |(prepared, name)| commit_import(&mut vault, prepared, name, decision),
                         );
                         if matches!(result, Ok(Some(_))) {
@@ -368,12 +382,23 @@ impl VaultSession {
     pub fn prepare_import(
         &self,
         request: ImportRequest,
-    ) -> Result<mpsc::Receiver<Result<ImportPreview, RuntimeError>>, RuntimeError> {
+    ) -> Result<
+        (
+            PreparationId,
+            mpsc::Receiver<Result<ImportPreview, RuntimeError>>,
+        ),
+        RuntimeError,
+    > {
         let (response, receiver) = mpsc::channel();
+        let preparation_id = PreparationId(PREPARATION_ID.fetch_add(1, Ordering::Relaxed));
         self.commands
-            .send(Command::PrepareImport { request, response })
+            .send(Command::PrepareImport {
+                preparation_id,
+                request,
+                response,
+            })
             .map_err(|_| RuntimeError::Closed)?;
-        Ok(receiver)
+        Ok((preparation_id, receiver))
     }
 
     pub fn list_gallery(
@@ -410,11 +435,16 @@ impl VaultSession {
 
     pub fn commit_import(
         &self,
+        preparation_id: PreparationId,
         decision: Option<DuplicateDecision>,
     ) -> Result<mpsc::Receiver<Result<Option<ImportedImage>, RuntimeError>>, RuntimeError> {
         let (response, receiver) = mpsc::channel();
         self.commands
-            .send(Command::CommitImport { decision, response })
+            .send(Command::CommitImport {
+                preparation_id,
+                decision,
+                response,
+            })
             .map_err(|_| RuntimeError::Closed)?;
         Ok(receiver)
     }
@@ -432,6 +462,22 @@ impl VaultSession {
             let _ = thread.join();
         }
     }
+}
+
+fn take_pending_for<T>(
+    pending: &mut Option<(PreparationId, T)>,
+    preparation_id: PreparationId,
+) -> Result<T, RuntimeError> {
+    if pending
+        .as_ref()
+        .is_none_or(|(pending_id, _)| *pending_id != preparation_id)
+    {
+        return Err(RuntimeError::Input);
+    }
+    pending
+        .take()
+        .map(|(_, value)| value)
+        .ok_or(RuntimeError::Input)
 }
 
 impl Drop for VaultSession {
@@ -720,6 +766,21 @@ fn media_worker_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_import_confirmation_does_not_consume_current_preparation() {
+        let first = PreparationId(41);
+        let second = PreparationId(42);
+        let mut pending = Some((second, "prepared B"));
+
+        assert_eq!(
+            take_pending_for(&mut pending, first),
+            Err(RuntimeError::Input)
+        );
+        assert_eq!(pending, Some((second, "prepared B")));
+        assert_eq!(take_pending_for(&mut pending, second), Ok("prepared B"));
+        assert!(pending.is_none());
+    }
 
     #[test]
     fn import_request_keeps_selected_inode_after_path_substitution() {

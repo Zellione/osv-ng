@@ -931,6 +931,7 @@ fn gallery_view(
     }
 
     let selected_authority = Rc::new(RefCell::new(None::<gio::File>));
+    let active_preparation = Rc::new(Cell::new(None::<crate::runtime::PreparationId>));
     sensitive_imports
         .borrow_mut()
         .push(Rc::new(ImportPresentation {
@@ -942,15 +943,22 @@ fn gallery_view(
         let session = Rc::clone(session);
         let status = status.clone();
         let selected_authority = Rc::clone(&selected_authority);
+        let active_preparation = Rc::clone(&active_preparation);
         let confirm = confirm.clone();
         let skip = skip.clone();
         let another = another.clone();
         let picture = picture.clone();
         Rc::new(move |decision| {
-            let request = session
-                .borrow()
-                .as_ref()
-                .map(|active| (active.generation(), active.commit_import(decision)));
+            let Some(preparation_id) = active_preparation.get() else {
+                status.set_label("Choose and inspect an image before importing.");
+                return;
+            };
+            let request = session.borrow().as_ref().map(|active| {
+                (
+                    active.generation(),
+                    active.commit_import(preparation_id, decision),
+                )
+            });
             let Some((generation, Ok(receiver))) = request else {
                 status.set_label("The unlocked session is no longer available.");
                 return;
@@ -966,6 +974,7 @@ fn gallery_view(
             let another = another.clone();
             let picture = picture.clone();
             let session = Rc::clone(&session);
+            let active_preparation = Rc::clone(&active_preparation);
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
                     *selected_authority.borrow_mut() = None;
@@ -1009,6 +1018,9 @@ fn gallery_view(
                     }
                 }
                 *selected_authority.borrow_mut() = None;
+                if active_preparation.get() == Some(preparation_id) {
+                    active_preparation.set(None);
+                }
                 for button in [&confirm, &skip, &another] {
                     button.set_visible(false);
                     button.set_sensitive(true);
@@ -1056,6 +1068,7 @@ fn gallery_view(
         let session = Rc::clone(&session_for_import);
         let status = status_for_import.clone();
         let selected_authority = Rc::clone(&selected_authority);
+        let active_preparation = Rc::clone(&active_preparation);
         let confirm = confirm.clone();
         let skip = skip.clone();
         let another = another.clone();
@@ -1087,6 +1100,10 @@ fn gallery_view(
                 .and_then(|name| name.into_string().ok())
                 .unwrap_or_else(|| "imported-image".to_owned());
             *selected_authority.borrow_mut() = Some(file);
+            active_preparation.set(None);
+            for button in [&confirm, &skip, &another] {
+                button.set_visible(false);
+            }
             let receiver = release_authority_on_error(
                 session
                     .borrow()
@@ -1100,10 +1117,11 @@ fn gallery_view(
                     }),
                 &selected_authority,
             );
-            let Ok(receiver) = receiver else {
+            let Ok((preparation_id, receiver)) = receiver else {
                 status.set_label("Unlock a vault before importing.");
                 return;
             };
+            active_preparation.set(Some(preparation_id));
             status.set_label("Inspecting image in the isolated worker…");
             let status = status.clone();
             let confirm = confirm.clone();
@@ -1111,9 +1129,13 @@ fn gallery_view(
             let another = another.clone();
             let session = Rc::clone(&session);
             let selected_authority = Rc::clone(&selected_authority);
+            let active_preparation = Rc::clone(&active_preparation);
             glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
                 if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
                     *selected_authority.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                if active_preparation.get() != Some(preparation_id) {
                     return glib::ControlFlow::Break;
                 }
                 match receiver.try_recv() {
@@ -1139,6 +1161,7 @@ fn gallery_view(
                         another.set_visible(preview.duplicate);
                     }
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        active_preparation.set(None);
                         status.set_label("The image was rejected safely.");
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {

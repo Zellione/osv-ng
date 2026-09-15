@@ -1423,7 +1423,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
-**Status (2026-09-14): In progress**
+**Status (2026-09-15): In progress**
 
 **Delivered scope**
 
@@ -1616,6 +1616,14 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Regression coverage proves that loading a new animation immediately drops
   every prior frame owner and that lock clearing drops every replacement owner,
   in addition to clearing delays and playback state.
+- Bound import decisions to monotonic per-preparation identities. Starting a new
+  preparation immediately hides and invalidates the prior decision controls;
+  stale preview callbacks cannot restore them, and a stale confirmation is
+  rejected without consuming the current pending import.
+- Tightened broker-side rendition validation to derive the exact expected
+  dimensions from the independently probed source, its EXIF orientation, and
+  the requested edge. A self-consistent helper response can no longer exceed a
+  512-pixel thumbnail request or substitute different aspect-ratio dimensions.
 
 **Verification**
 
@@ -1660,15 +1668,23 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   authenticated result stream without exceeding the 96 MiB result or 97-chunk
   protocol ceilings. The test is ignored in routine runs because of its memory
   cost and remains directly runnable as a release/resource gate.
+- The import-preparation identity regression passes the adversarial
+  A-preview/B-prepare/A-confirm ordering and proves the stale confirmation does
+  not consume B. The complete `osv-app` test suite and warnings-as-errors Clippy
+  gate pass with the identity threaded through the production GTK path.
+- The rendition-dimension regression accepts exact bounded and orientation-
+  swapped geometry while rejecting a self-consistent 1024×512 result for a
+  512-edge request; the `osv-import` warnings-as-errors Clippy gate passes.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
-- **P1 — Import confirmation is not bound to one preparation.** Preparing B
+- **Resolved — Import confirmation is not bound to one preparation.** Preparing B
   while A's decision controls remain active can replace the serial owner's
   unversioned pending value, after which A's visible confirmation commits B.
-  Add a per-prepare identity to preview and commit, reject stale identities
-  without consuming the current pending import, clear decisions when a new
-  prepare starts, and regress the A-preview/B-prepare/A-confirm ordering.
+  Per-preparation identities now bind prepare and commit, stale identities are
+  rejected without consuming the current pending import, and starting a new
+  prepare clears the old controls. The A-preview/B-prepare/A-confirm ordering
+  has a dedicated regression.
 - **P1 — Revocation cannot interrupt silent or partial helper transport.** The
   supervisor checks cancellation before a receive, but header/body polling,
   backpressured sends, and exit waiting can retain the serial vault owner and
@@ -1689,10 +1705,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   combines worker/IPC lock status, but rendition preparation does not propagate
   it through the session security state. Aggregate and surface transient and
   retained image-operation degradation, with a memlock exhaustion regression.
-- **P2 — A hostile helper can exceed the requested rendition edge.** Broker
+- **Resolved — A hostile helper can exceed the requested rendition edge.** Broker
   validation permits dimensions up to the global 4096 limit even for a 512-edge
-  thumbnail. Bind actual dimensions to the requested edge and independently
-  oriented source geometry; regress a self-consistent oversized thumbnail.
+  thumbnail. Actual dimensions are now bound to the requested edge and
+  independently oriented source geometry, with a self-consistent oversized
+  thumbnail regression.
 - **P2 — Thumbnail failure can hide an already committed original.** Original
   publication precedes thumbnail publication, but a derived failure reports the
   whole import as failed without refreshing the gallery or scheduling the now-
@@ -1723,8 +1740,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; its two P1 and six P2 findings above remain
-  Phase 9 blockers. Third-party decoder working allocations remain subject to
+  adversarial review is complete; one P1 and five P2 findings above remain Phase
+  9 blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.
