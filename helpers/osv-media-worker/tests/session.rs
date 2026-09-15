@@ -443,9 +443,12 @@ fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts
         .read_to_end(&mut original)
         .unwrap();
     assert_eq!(original, source);
+    let thumbnail_id = committed
+        .thumbnail
+        .expect("successful helper import publishes its thumbnail");
     let mut thumbnail = Vec::new();
     vault
-        .open_object(committed.thumbnail)
+        .open_object(thumbnail_id)
         .unwrap()
         .read_to_end(&mut thumbnail)
         .unwrap();
@@ -453,7 +456,7 @@ fn import_publishes_encrypted_original_and_thumbnail_without_plaintext_artifacts
     let cancelled = std::sync::atomic::AtomicBool::new(false);
     let reopened = osv_import::decode_image_object_cancellable(
         &vault,
-        committed.thumbnail,
+        thumbnail_id,
         executable,
         101,
         &cancelled,
