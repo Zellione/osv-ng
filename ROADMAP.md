@@ -1642,6 +1642,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   strings and GTK label-formatting buffers are wiped after transfer; GTK's
   internal text/model copies remain an explicitly unavoidable toolkit-owned
   allocation and are synchronously released at lock.
+- Made import publication explicitly represent original-only success. If
+  thumbnail publication fails after the original catalog commit, the runtime
+  publishes a catalog revision, reports the original as securely imported, and
+  queues that exact media/original pair for derived regeneration instead of
+  presenting the whole import as failed or hiding the new record.
 
 **Verification**
 
@@ -1706,6 +1711,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Catalog and application suites pass with protected gallery/import names;
   `GalleryRecord` debug output is explicitly redacted, and the existing gallery
   lock regression continues to prove model/name release at revocation.
+- Thumbnail-publication fault injection at the derived object-durable boundary
+  proves the committed original remains catalog-visible, the outcome is marked
+  original-only, and the encrypted-catalog missing-recipe query returns the
+  exact regeneration target.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1743,11 +1752,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   thumbnail. Actual dimensions are now bound to the requested edge and
   independently oriented source geometry, with a self-consistent oversized
   thumbnail regression.
-- **P2 — Thumbnail failure can hide an already committed original.** Original
+- **Resolved — Thumbnail failure can hide an already committed original.** Original
   publication precedes thumbnail publication, but a derived failure reports the
   whole import as failed without refreshing the gallery or scheduling the now-
-  missing thumbnail. Represent partial success and enqueue regeneration, or use
-  a reviewed combined transition; add fault injection at this boundary.
+  missing thumbnail. Original-only success is now explicit, refreshes the
+  gallery, and queues regeneration, with fault injection at this boundary.
 - **Resolved — A one-frame APNG with a separate poster displays the poster.** Animation
   dispatch currently depends on frame count being greater than one rather than
   animation-container presence. APNG animation presence is now tracked and
@@ -1774,7 +1783,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; two P2 findings above remain Phase 9
+  adversarial review is complete; one P2 finding above remains Phase 9
   blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state

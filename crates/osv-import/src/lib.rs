@@ -109,7 +109,7 @@ impl std::fmt::Debug for PreparedImageImport {
 
 pub struct CommittedImage {
     pub original: osv_storage::ObjectId,
-    pub thumbnail: osv_storage::ObjectId,
+    pub thumbnail: Option<osv_storage::ObjectId>,
     pub display_pixels: osv_crypto::SecretBytes,
     pub display_width: u32,
     pub display_height: u32,
@@ -685,6 +685,23 @@ impl PreparedImageImport {
         original_name: &str,
         imported_at_ms: i64,
     ) -> Result<CommittedImage, ImageImportError> {
+        self.commit_with_thumbnail_faults(
+            vault,
+            id,
+            original_name,
+            imported_at_ms,
+            &mut osv_vault::NoServiceFaults,
+        )
+    }
+
+    fn commit_with_thumbnail_faults(
+        self,
+        vault: &mut osv_vault::VaultService,
+        id: osv_catalog::MediaId,
+        original_name: &str,
+        imported_at_ms: i64,
+        faults: &mut impl osv_vault::ServiceFaultInjector,
+    ) -> Result<CommittedImage, ImageImportError> {
         if !self.preview.may_import() {
             return Err(ImageImportError::DecisionRequired);
         }
@@ -714,7 +731,7 @@ impl PreparedImageImport {
         let thumbnail_len = self.thumbnail.len();
         let thumbnail_len = u64::try_from(thumbnail_len).map_err(|_| ImageImportError::Input)?;
         let thumbnail = vault
-            .replace_derived(
+            .replace_derived_with(
                 &mut thumbnail_reader,
                 thumbnail_len,
                 id,
@@ -723,8 +740,9 @@ impl PreparedImageImport {
                 self.thumbnail_width,
                 self.thumbnail_height,
                 imported_at_ms,
+                faults,
             )
-            .map_err(ImageImportError::Vault)?;
+            .ok();
         Ok(CommittedImage {
             original,
             thumbnail,
@@ -1089,5 +1107,62 @@ mod tests {
             }
             vault.close().unwrap();
         }
+    }
+
+    #[test]
+    fn thumbnail_failure_reports_committed_original_and_missing_derived() {
+        let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+        let password = osv_crypto::Password::new(b"partial image import password").unwrap();
+        let mut vault = osv_vault::VaultService::create(
+            &parent.path().join("partial-image-import"),
+            &password,
+            None,
+            osv_crypto::KdfParams::new(8, 1, 1).unwrap(),
+            1,
+        )
+        .unwrap();
+        let probe = osv_media::ImageProbe {
+            format: osv_media::ImageFormat::Png,
+            width: 2,
+            height: 2,
+            frames: 1,
+            animated: false,
+            orientation: osv_media::Orientation::Normal,
+            has_color_profile: false,
+        };
+        let prepared = PreparedImageImport {
+            source: osv_crypto::SecretBytes::new(b"authenticated original").unwrap(),
+            thumbnail: osv_crypto::SecretBytes::new(b"derived thumbnail").unwrap(),
+            preview: ImportPreview::from_probe(b"authenticated original", probe, false),
+            probe,
+            thumbnail_width: 2,
+            thumbnail_height: 2,
+            display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
+        };
+        let media_id = osv_catalog::MediaId::from_bytes([0x91; 16]);
+        let committed = prepared
+            .commit_with_thumbnail_faults(
+                &mut vault,
+                media_id,
+                "private.png",
+                1,
+                &mut FailAt(osv_vault::ServicePoint::ObjectDurable),
+            )
+            .unwrap();
+        assert!(committed.thumbnail.is_none());
+        let record = vault.reader().image_records(1, 10).unwrap().remove(0);
+        assert_eq!(record.id, media_id);
+        assert_eq!(record.original_object_id, committed.original);
+        assert!(record.thumbnail_object_id.is_none());
+        let missing = vault
+            .reader()
+            .derived_needing_recipe(
+                osv_storage::ObjectRole::Thumbnail,
+                osv_media::THUMBNAIL_RECIPE_VERSION,
+                10,
+            )
+            .unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].media_id, media_id);
     }
 }

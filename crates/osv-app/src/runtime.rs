@@ -54,7 +54,7 @@ pub struct ImportPreview {
 pub struct ImportedImage {
     pub media_id: osv_catalog::MediaId,
     pub original: osv_storage::ObjectId,
-    pub thumbnail: osv_storage::ObjectId,
+    pub thumbnail: Option<osv_storage::ObjectId>,
     pub pixels: osv_crypto::SecretBytes,
     pub width: u32,
     pub height: u32,
@@ -329,8 +329,17 @@ impl VaultSession {
                         let result = take_pending_for(&mut pending, preparation_id).and_then(
                             |(prepared, name)| commit_import(&mut vault, prepared, name, decision),
                         );
-                        if matches!(result, Ok(Some(_))) {
+                        if let Ok(Some(imported)) = &result {
                             worker_catalog_revision.fetch_add(1, Ordering::Release);
+                            if imported.thumbnail.is_none() {
+                                regeneration.push_back(osv_catalog::DerivedRegeneration {
+                                    media_id: imported.media_id,
+                                    original_object_id: imported.original,
+                                });
+                                if let Ok(mut status) = worker_maintenance.lock() {
+                                    status.total = status.total.saturating_add(1);
+                                }
+                            }
                         }
                         let _ = response.send(result);
                     }

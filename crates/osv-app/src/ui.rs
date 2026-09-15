@@ -1013,7 +1013,11 @@ fn gallery_view(
                             stride,
                         );
                         picture.set_paintable(Some(&texture));
-                        status.set_label("Image imported securely.");
+                        status.set_label(if imported.thumbnail.is_some() {
+                            "Image imported securely."
+                        } else {
+                            "Original imported securely; thumbnail retry scheduled."
+                        });
                     }
                     Ok(Ok(None)) => status.set_label("Duplicate skipped."),
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
