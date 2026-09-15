@@ -190,15 +190,21 @@ fn prepare_rendition_cancellable(
     .map_err(ImageImportError::Worker)?;
     let request =
         osv_media::encode_worker_request(purpose, edge).map_err(|_| ImageImportError::Input)?;
-    worker
-        .send_authenticated(
-            0,
-            osv_isolation::PlaintextBuffer::from_secret(
-                osv_crypto::SecretBytes::new(&request).map_err(|_| ImageImportError::Input)?,
-            )
-            .map_err(|_| ImageImportError::Input)?,
-        )
-        .map_err(ImageImportError::Worker)?;
+    let request = osv_isolation::PlaintextBuffer::from_secret(
+        osv_crypto::SecretBytes::new(&request).map_err(|_| ImageImportError::Input)?,
+    )
+    .map_err(|_| ImageImportError::Input)?;
+    let sent = if let Some(cancelled) = cancelled {
+        worker.send_authenticated_cancellable(0, request, cancelled)
+    } else {
+        worker.send_authenticated(0, request)
+    };
+    if let Err(error) = sent {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(ImageImportError::Cancelled);
+        }
+        return Err(ImageImportError::Worker(error));
+    }
     for (sequence, chunk) in source
         .expose()
         .chunks(osv_worker_protocol::MAX_DATA_LEN)
@@ -213,13 +219,19 @@ fn prepare_rendition_cancellable(
             .and_then(|sequence| sequence.checked_add(1))
             .ok_or(ImageImportError::Input)?;
         let bytes = osv_crypto::SecretBytes::new(chunk).map_err(|_| ImageImportError::Input)?;
-        worker
-            .send_authenticated(
-                sequence,
-                osv_isolation::PlaintextBuffer::from_secret(bytes)
-                    .map_err(|_| ImageImportError::Input)?,
-            )
-            .map_err(ImageImportError::Worker)?;
+        let plaintext = osv_isolation::PlaintextBuffer::from_secret(bytes)
+            .map_err(|_| ImageImportError::Input)?;
+        let sent = if let Some(cancelled) = cancelled {
+            worker.send_authenticated_cancellable(sequence, plaintext, cancelled)
+        } else {
+            worker.send_authenticated(sequence, plaintext)
+        };
+        if let Err(error) = sent {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                return Err(ImageImportError::Cancelled);
+            }
+            return Err(ImageImportError::Worker(error));
+        }
     }
     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         worker.cancel();

@@ -1,6 +1,6 @@
 use osv_isolation::{FramedChannel, WORKER_CONTROL_FD, apply_worker_sandbox};
 use osv_worker_protocol::{Frame, Message, Role, VERSION};
-use std::{os::fd::FromRawFd, os::unix::net::UnixStream, time::Duration};
+use std::{io::Write, os::fd::FromRawFd, os::unix::net::UnixStream, time::Duration};
 
 #[allow(unsafe_code)]
 fn make_landlock_unavailable() {
@@ -251,6 +251,53 @@ fn run_hostile_worker() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        12 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            handshake(&mut channel, &hello);
+            let _ = channel.receive().unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        13 | 14 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            handshake(&mut channel, &hello);
+            let _ = channel.receive().unwrap();
+            let result = Frame {
+                request_id: hello.request_id,
+                message: Message::ResultData {
+                    sequence: 0,
+                    bytes: osv_crypto::SecretBytes::new(b"partial payload").unwrap(),
+                },
+            };
+            let mut encoded = vec![0; result.encoded_len().unwrap()];
+            result.encode_into(&mut encoded).unwrap();
+            let length = if hello.request_id == 13 {
+                osv_worker_protocol::HEADER_LEN / 2
+            } else {
+                osv_worker_protocol::HEADER_LEN + 2
+            };
+            channel.stream().write_all(&encoded[..length]).unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+        15 => {
+            apply_worker_sandbox(WORKER_CONTROL_FD).unwrap();
+            handshake(&mut channel, &hello);
+            let _ = channel.receive().unwrap();
+            channel
+                .send(&Frame {
+                    request_id: hello.request_id,
+                    message: Message::Complete {
+                        page_locks: channel.lock_status(),
+                    },
+                })
+                .unwrap();
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
         _ => std::process::exit(64),

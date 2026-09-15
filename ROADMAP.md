@@ -1624,6 +1624,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   dimensions from the independently probed source, its EXIF orientation, and
   the requested edge. A self-consistent helper response can no longer exceed a
   512-pixel thumbnail request or substitute different aspect-ratio dimensions.
+- Made authenticated helper input, result-frame assembly, and post-completion
+  process waiting cancellation-aware with bounded polling. Cancellation now
+  retains partial framing state only until immediate worker revocation, then
+  reaps the helper and drops accumulated protected output instead of inheriting
+  the 30-second operation deadline.
 
 **Verification**
 
@@ -1675,6 +1680,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - The rendition-dimension regression accepts exact bounded and orientation-
   swapped geometry while rejecting a self-consistent 1024×512 result for a
   512-edge request; the `osv-import` warnings-as-errors Clippy gate passes.
+- Isolation regressions cancel silent workers, partial headers, partial bodies,
+  backpressured input, and a worker that reports Complete without exiting. Each
+  path revokes within 500 ms under a five-second operation deadline and exposes
+  no accumulated result bytes.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1685,12 +1694,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   rejected without consuming the current pending import, and starting a new
   prepare clears the old controls. The A-preview/B-prepare/A-confirm ordering
   has a dedicated regression.
-- **P1 — Revocation cannot interrupt silent or partial helper transport.** The
+- **Resolved — Revocation cannot interrupt silent or partial helper transport.** The
   supervisor checks cancellation before a receive, but header/body polling,
   backpressured sends, and exit waiting can retain the serial vault owner and
-  keys until the 30-second operation deadline. Make transport and exit polling
-  cancellation-aware while retaining partial-frame state; cover silence,
-  partial headers/bodies, blocked input, and Complete-without-exit workers.
+  keys until the 30-second operation deadline. Transport and exit polling are
+  now cancellation-aware while retaining partial-frame state, with coverage for
+  silence, partial headers/bodies, blocked input, and Complete-without-exit
+  workers.
 - **P2 — Some application-owned decoded pixels are not wiped.** Collected
   animation frames, full-resolution scaling inputs, still-image decode and
   orientation intermediates, and the PNG encoder's error path can drop ordinary
@@ -1740,8 +1750,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; one P1 and five P2 findings above remain Phase
-  9 blockers. Third-party decoder working allocations remain subject to
+  adversarial review is complete; five P2 findings above remain Phase 9
+  blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.

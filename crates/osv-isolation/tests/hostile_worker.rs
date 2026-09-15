@@ -268,6 +268,35 @@ fn cancellation_during_result_streaming_revokes_and_discards_output() {
 }
 
 #[test]
+fn cancellation_interrupts_silent_partial_and_post_complete_workers() {
+    let _guard = TEST_PROCESSES
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for request_id in [12, 13, 14, 15] {
+        let mut configured = limits();
+        configured.operation = Duration::from_secs(5);
+        let mut worker = Supervisor::spawn(fixture(), Role::Media, request_id, configured).unwrap();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = std::sync::Arc::clone(&cancelled);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            trigger.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let (_, output) = worker
+            .finish_with_output_cancellable(1024, &cancelled)
+            .unwrap();
+        setter.join().unwrap();
+        assert_eq!(output.logical_len(), 0, "request {request_id}");
+        assert!(output.chunks().next().is_none(), "request {request_id}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "request {request_id} retained the worker until its operation deadline"
+        );
+    }
+}
+
+#[test]
 fn sandbox_denies_path_mutation_with_and_without_landlock() {
     if address_sanitizer_active() {
         return;

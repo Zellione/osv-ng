@@ -310,7 +310,33 @@ impl Supervisor {
         sequence: u64,
         plaintext: PlaintextBuffer,
     ) -> Result<(), SupervisorError> {
+        self.send_authenticated_inner(sequence, plaintext, None)
+    }
+
+    pub fn send_authenticated_cancellable(
+        &mut self,
+        sequence: u64,
+        plaintext: PlaintextBuffer,
+        cancelled: &AtomicBool,
+    ) -> Result<(), SupervisorError> {
+        self.send_authenticated_inner(sequence, plaintext, Some(cancelled))
+    }
+
+    fn send_authenticated_inner(
+        &mut self,
+        sequence: u64,
+        plaintext: PlaintextBuffer,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), SupervisorError> {
         self.refresh_operation_timeout()?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            self.cancel();
+            return Err(SupervisorError {
+                class: ExitClass::Deadline,
+                lock_status: self.lock_status(),
+                source: None,
+            });
+        }
         self.lock_status = self.lock_status.combine(plaintext.lock_status());
         let frame = Frame {
             request_id: self.request_id(),
@@ -322,10 +348,22 @@ impl Supervisor {
         self.machine
             .sent(&frame)
             .map_err(|error| protocol(error, self.lock_status()))?;
-        let send_status = self
-            .channel
-            .send(&frame)
-            .map_err(|error| transport(error, self.lock_status()))?;
+        let sent = if let Some(cancelled) = cancelled {
+            self.channel.send_cancellable(&frame, cancelled)
+        } else {
+            self.channel.send(&frame)
+        };
+        let send_status = match sent {
+            Err(TransportError::Cancelled) => {
+                self.cancel();
+                return Err(SupervisorError {
+                    class: ExitClass::Deadline,
+                    lock_status: self.lock_status(),
+                    source: None,
+                });
+            }
+            result => result.map_err(|error| transport(error, self.lock_status()))?,
+        };
         self.lock_status = self.lock_status.combine(send_status);
         Ok(())
     }
@@ -372,11 +410,19 @@ impl Supervisor {
         self.machine
             .sent(&end)
             .map_err(|error| protocol(error, self.lock_status()))?;
-        self.lock_status = self.lock_status.combine(
-            self.channel
-                .send(&end)
-                .map_err(|error| transport(error, self.lock_status()))?,
-        );
+        let sent = if let Some(cancelled) = cancelled {
+            self.channel.send_cancellable(&end, cancelled)
+        } else {
+            self.channel.send(&end)
+        };
+        let send_status = match sent {
+            Err(TransportError::Cancelled) => {
+                let class = self.cancel();
+                return Ok((class, empty_output(self.lock_status())));
+            }
+            result => result.map_err(|error| transport(error, self.lock_status()))?,
+        };
+        self.lock_status = self.lock_status.combine(send_status);
         let mut output = Vec::new();
         let mut output_len = 0usize;
         let mut output_chunks = 0u64;
@@ -394,10 +440,18 @@ impl Supervisor {
                     },
                 ));
             }
-            let (result, receive_status) = self
-                .channel
-                .receive()
-                .map_err(|error| transport(error, self.lock_status()))?;
+            let received = if let Some(cancelled) = cancelled {
+                self.channel.receive_cancellable(cancelled)
+            } else {
+                self.channel.receive()
+            };
+            let (result, receive_status) = match received {
+                Err(TransportError::Cancelled) => {
+                    let class = self.cancel();
+                    return Ok((class, empty_output(self.lock_status())));
+                }
+                result => result.map_err(|error| transport(error, self.lock_status()))?,
+            };
             self.lock_status = self.lock_status.combine(receive_status);
             self.machine
                 .received(&result)
@@ -438,7 +492,9 @@ impl Supervisor {
                 _ => break ExitClass::Protocol,
             }
         };
-        let status = self.wait_for_exit()?;
+        let Some(status) = self.wait_for_exit(cancelled)? else {
+            return Ok((ExitClass::Deadline, empty_output(self.lock_status())));
+        };
         if response_class == ExitClass::Success {
             let class = classify_status(status);
             Ok((
@@ -505,14 +561,21 @@ impl Supervisor {
         Ok(())
     }
 
-    fn wait_for_exit(&mut self) -> Result<ExitStatus, SupervisorError> {
+    fn wait_for_exit(
+        &mut self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<ExitStatus>, SupervisorError> {
         loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                self.cancel();
+                return Ok(None);
+            }
             if let Some(status) = self.child.try_wait().map_err(|error| {
                 let mut result = SupervisorError::new(ExitClass::WorkerFailure, error);
                 result.lock_status = self.lock_status();
                 result
             })? {
-                return Ok(status);
+                return Ok(Some(status));
             }
             let Some(remaining) = self
                 .operation_deadline
@@ -526,6 +589,15 @@ impl Supervisor {
             };
             std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
+    }
+}
+
+fn empty_output(lock_status: osv_crypto::LockStatus) -> WorkerOutput {
+    WorkerOutput {
+        chunks: Vec::new(),
+        logical_len: 0,
+        lock_status,
+        failure_class: None,
     }
 }
 
@@ -554,6 +626,7 @@ fn transport(error: TransportError, lock_status: osv_crypto::LockStatus) -> Supe
             ExitClass::Deadline
         }
         TransportError::Protocol(_) => ExitClass::Protocol,
+        TransportError::Cancelled => ExitClass::Deadline,
         _ => ExitClass::WorkerFailure,
     };
     let mut result = SupervisorError::new(class, error);
