@@ -1629,6 +1629,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   retains partial framing state only until immediate worker revocation, then
   reaps the helper and drops accumulated protected output instead of inheriting
   the 30-second operation deadline.
+- Wrapped decoder-returned still pixels and every collected animation frame in
+  wipe-on-drop owners immediately after decode. Orientation and scaling inputs,
+  intermediate mirrored images, extracted raw frames, and partially encoded PNG
+  output now remain under wiping ownership across all early-return paths.
 
 **Verification**
 
@@ -1684,6 +1688,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   backpressured input, and a worker that reports Complete without exiting. Each
   path revokes within 500 ms under a five-second operation deadline and exposes
   no accumulated result bytes.
+- The complete 25-test `osv-media` suite covers genuine still and animated
+  formats, all orientation mappings, malformed decode paths, and explicit RGBA
+  wiping with the expanded owners; its warnings-as-errors Clippy gate passes.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1701,11 +1708,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   now cancellation-aware while retaining partial-frame state, with coverage for
   silence, partial headers/bodies, blocked input, and Complete-without-exit
   workers.
-- **P2 — Some application-owned decoded pixels are not wiped.** Collected
+- **Resolved — Some application-owned decoded pixels are not wiped.** Collected
   animation frames, full-resolution scaling inputs, still-image decode and
   orientation intermediates, and the PNG encoder's error path can drop ordinary
-  pixel vectors. Guard every decoder-returned image immediately, process frames
-  with wiping ownership, and exercise early-return paths.
+  pixel vectors. Every decoder-returned image and collected frame is now guarded
+  immediately, and orientation, scaling, raw-frame transfer, and encoder output
+  remain under wiping ownership through early returns.
 - **P2 — Decrypted names use non-wiping and potentially revealing owners.**
   Gallery and import names are retained and formatted as ordinary `String`s;
   `GalleryRecord` also derives unredacted `Debug`. Use protected/redacted owners
@@ -1750,7 +1758,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; five P2 findings above remain Phase 9
+  adversarial review is complete; four P2 findings above remain Phase 9
   blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state

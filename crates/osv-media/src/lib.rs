@@ -146,11 +146,47 @@ impl WipeRgba {
     fn wipe(&mut self) {
         self.0.as_mut().zeroize();
     }
+
+    fn take_raw(&mut self) -> Vec<u8> {
+        std::mem::replace(&mut self.0, image::RgbaImage::new(0, 0)).into_raw()
+    }
 }
 
 impl Drop for WipeRgba {
     fn drop(&mut self) {
         self.wipe();
+    }
+}
+
+struct WipeVec(Vec<u8>);
+
+impl std::io::Write for WipeVec {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for WipeVec {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+struct WipeFrame(image::Frame);
+
+impl WipeFrame {
+    fn take_buffer(&mut self) -> image::RgbaImage {
+        std::mem::replace(self.0.buffer_mut(), image::RgbaImage::new(0, 0))
+    }
+}
+
+impl Drop for WipeFrame {
+    fn drop(&mut self) {
+        self.0.buffer_mut().as_mut().zeroize();
     }
 }
 
@@ -201,21 +237,24 @@ pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationF
         }
         ImageFormat::Jpeg => return Err(ImageError::Unsupported),
     }
-    .map_err(|_| ImageError::Decode)?;
+    .map_err(|_| ImageError::Decode)?
+    .into_iter()
+    .map(WipeFrame)
+    .collect::<Vec<_>>();
     if frames.len() != info.frames as usize || frames.len() > MAX_ANIMATION_FRAMES as usize {
         return Err(ImageError::Malformed);
     }
     let mut protected = Vec::with_capacity(frames.len());
     let mut total = 0usize;
-    for frame in frames {
-        if frame.left() != 0
-            || frame.top() != 0
-            || frame.buffer().width() != info.width
-            || frame.buffer().height() != info.height
+    for mut frame in frames {
+        if frame.0.left() != 0
+            || frame.0.top() != 0
+            || frame.0.buffer().width() != info.width
+            || frame.0.buffer().height() != info.height
         {
             return Err(ImageError::Malformed);
         }
-        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        let (numerator, denominator) = frame.0.delay().numer_denom_ms();
         if denominator == 0 {
             return Err(ImageError::Malformed);
         }
@@ -227,23 +266,20 @@ pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationF
         if delay_ms > 60_000 {
             return Err(ImageError::ResourceLimit);
         }
-        let buffer = frame.into_buffer();
-        let scaled = if buffer.width() > edge || buffer.height() > edge {
-            image::DynamicImage::ImageRgba8(buffer)
-                .thumbnail(edge, edge)
-                .to_rgba8()
+        let buffer = WipeRgba(frame.take_buffer());
+        let mut scaled = if buffer.0.width() > edge || buffer.0.height() > edge {
+            WipeRgba(image::imageops::thumbnail(&buffer.0, edge, edge))
         } else {
-            buffer
+            WipeRgba(buffer.0.clone())
         };
-        let width = scaled.width();
-        let height = scaled.height();
-        let mut raw = scaled.into_raw();
+        let width = scaled.0.width();
+        let height = scaled.0.height();
+        let raw = WipeVec(scaled.take_raw());
         total = total
-            .checked_add(raw.len())
+            .checked_add(raw.0.len())
             .filter(|total| *total <= MAX_VIEWER_RESULT_BYTES)
             .ok_or(ImageError::ResourceLimit)?;
-        let pixels = SecretBytes::new(&raw).map_err(|_| ImageError::Decode)?;
-        raw.zeroize();
+        let pixels = SecretBytes::new(&raw.0).map_err(|_| ImageError::Decode)?;
         protected.push(DecodedAnimationFrame {
             pixels,
             width,
@@ -784,18 +820,36 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
         .with_guessed_format()
         .map_err(|_| ImageError::Decode)?;
     reader.limits(decoder_limits());
-    let decoded = apply_orientation(
-        reader.decode().map_err(|_| ImageError::Decode)?,
-        info.orientation,
-    );
-    let scaled = WipeRgba(if decoded.width() > edge || decoded.height() > edge {
-        decoded.thumbnail(edge, edge).to_rgba8()
+    let decoded = WipeRgba(reader.decode().map_err(|_| ImageError::Decode)?.to_rgba8());
+    let oriented = orient_rgba(&decoded.0, info.orientation);
+    let scaled = WipeRgba(if oriented.0.width() > edge || oriented.0.height() > edge {
+        image::imageops::thumbnail(&oriented.0, edge, edge)
     } else {
-        decoded.to_rgba8()
+        oriented.0.clone()
     });
     encode_png_rgba(&scaled.0)
 }
 
+fn orient_rgba(decoded: &image::RgbaImage, orientation: Orientation) -> WipeRgba {
+    WipeRgba(match orientation {
+        Orientation::Normal => decoded.clone(),
+        Orientation::MirrorHorizontal => image::imageops::flip_horizontal(decoded),
+        Orientation::Rotate180 => image::imageops::rotate180(decoded),
+        Orientation::MirrorVertical => image::imageops::flip_vertical(decoded),
+        Orientation::MirrorHorizontalRotate270 => {
+            let mirrored = WipeRgba(image::imageops::flip_horizontal(decoded));
+            image::imageops::rotate270(&mirrored.0)
+        }
+        Orientation::Rotate90 => image::imageops::rotate90(decoded),
+        Orientation::MirrorHorizontalRotate90 => {
+            let mirrored = WipeRgba(image::imageops::flip_horizontal(decoded));
+            image::imageops::rotate90(&mirrored.0)
+        }
+        Orientation::Rotate270 => image::imageops::rotate270(decoded),
+    })
+}
+
+#[cfg(test)]
 fn apply_orientation(
     decoded: image::DynamicImage,
     orientation: Orientation,
@@ -813,7 +867,7 @@ fn apply_orientation(
 }
 
 fn encode_png_rgba(scaled: &image::RgbaImage) -> Result<SecretBytes, ImageError> {
-    let mut encoded = Vec::new();
+    let mut encoded = WipeVec(Vec::new());
     PngEncoder::new(&mut encoded)
         .write_image(
             scaled.as_raw(),
@@ -822,9 +876,7 @@ fn encode_png_rgba(scaled: &image::RgbaImage) -> Result<SecretBytes, ImageError>
             image::ExtendedColorType::Rgba8,
         )
         .map_err(|_| ImageError::Decode)?;
-    let protected = SecretBytes::new(&encoded).map_err(|_| ImageError::Decode);
-    encoded.zeroize();
-    protected
+    SecretBytes::new(&encoded.0).map_err(|_| ImageError::Decode)
 }
 
 fn thumbnail_dimensions(bytes: &[u8]) -> Result<(u32, u32), ImageError> {
