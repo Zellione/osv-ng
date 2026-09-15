@@ -1633,6 +1633,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   wipe-on-drop owners immediately after decode. Orientation and scaling inputs,
   intermediate mirrored images, extracted raw frames, and partially encoded PNG
   output now remain under wiping ownership across all early-return paths.
+- Versioned the helper result contract to version 5 so an authenticated,
+  allocation-free animation-container flag is carried independently of frame
+  count. Viewer dispatch now decodes a one-frame APNG as animation, preserving
+  its timing and selecting its true frame instead of a separate default poster.
 
 **Verification**
 
@@ -1691,6 +1695,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - The complete 25-test `osv-media` suite covers genuine still and animated
   formats, all orientation mappings, malformed decode paths, and explicit RGBA
   wiping with the expanded owners; its warnings-as-errors Clippy gate passes.
+- A genuine one-frame APNG with visibly distinct poster and animation pixels
+  passes probe, protected frame decode, and the complete version-5 worker result;
+  the 26-test media suite, import suite, and warnings-as-errors Clippy pass.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1733,10 +1740,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   whole import as failed without refreshing the gallery or scheduling the now-
   missing thumbnail. Represent partial success and enqueue regeneration, or use
   a reviewed combined transition; add fault injection at this boundary.
-- **P2 — A one-frame APNG with a separate poster displays the poster.** Animation
+- **Resolved — A one-frame APNG with a separate poster displays the poster.** Animation
   dispatch currently depends on frame count being greater than one rather than
-  animation-container presence. Track APNG animation presence independently and
-  regress a one-frame animation whose poster has visibly different pixels.
+  animation-container presence. APNG animation presence is now tracked and
+  authenticated independently, with a one-frame regression whose poster has
+  visibly different pixels.
 - The review found no additional stable-descriptor authority escape, helper
   descriptor-confinement failure, revoked-session successful-result leak, or
   missing-ciphertext catalog reference in the durable publication transitions.
@@ -1758,7 +1766,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; four P2 findings above remain Phase 9
+  adversarial review is complete; three P2 findings above remain Phase 9
   blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state

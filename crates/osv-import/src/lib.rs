@@ -51,7 +51,7 @@ impl ImportPreview {
             mime: probe.format.mime(),
             width: probe.width,
             height: probe.height,
-            animated: probe.frames > 1,
+            animated: probe.animated,
             duplicate: if duplicate_exists {
                 DuplicateState::AwaitingDecision
             } else {
@@ -667,7 +667,7 @@ impl ImportPreview {
             mime: probe.format.mime(),
             width: probe.width,
             height: probe.height,
-            animated: probe.frames > 1,
+            animated: probe.animated,
             duplicate: if duplicate_exists {
                 DuplicateState::AwaitingDecision
             } else {
@@ -780,6 +780,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 frames: 1,
+                animated: false,
                 orientation: osv_media::Orientation::Normal,
                 has_color_profile: false,
             },
@@ -802,6 +803,7 @@ mod tests {
                 width: 2,
                 height: 2,
                 frames: source_frames,
+                animated: source_frames > 1,
                 orientation: osv_media::Orientation::Normal,
                 has_color_profile: false,
             },
@@ -865,6 +867,7 @@ mod tests {
             width: 1,
             height: 1,
             frames: 1,
+            animated: false,
             orientation: osv_media::Orientation::Normal,
             has_color_profile: true,
         };

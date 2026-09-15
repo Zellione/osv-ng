@@ -73,6 +73,7 @@ pub struct ImageProbe {
     pub width: u32,
     pub height: u32,
     pub frames: u32,
+    pub animated: bool,
     pub orientation: Orientation,
     pub has_color_profile: bool,
 }
@@ -198,7 +199,7 @@ impl fmt::Debug for DecodedAnimationFrame {
 
 pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationFrame>, ImageError> {
     let info = probe(bytes)?;
-    if info.frames <= 1 || !(THUMBNAIL_EDGE..=MAX_VIEWER_EDGE).contains(&edge) {
+    if !info.animated || !(THUMBNAIL_EDGE..=MAX_VIEWER_EDGE).contains(&edge) {
         return Err(ImageError::Unsupported);
     }
     let cursor = std::io::Cursor::new(bytes);
@@ -450,6 +451,7 @@ fn probe_png(b: &[u8]) -> Result<ImageProbe, ImageError> {
         width,
         height,
         frames,
+        animated: saw_animation_control,
         orientation: Orientation::Normal,
         has_color_profile: profile,
     })
@@ -499,6 +501,7 @@ fn probe_gif(b: &[u8]) -> Result<ImageProbe, ImageError> {
         width,
         height,
         frames,
+        animated: frames > 1,
         orientation: Orientation::Normal,
         has_color_profile: false,
     })
@@ -663,6 +666,7 @@ fn probe_jpeg(b: &[u8]) -> Result<ImageProbe, ImageError> {
         width,
         height,
         frames: 1,
+        animated: false,
         orientation,
         has_color_profile: profile,
     })
@@ -765,6 +769,7 @@ fn probe_webp(b: &[u8]) -> Result<ImageProbe, ImageError> {
         width,
         height,
         frames,
+        animated: flags & 2 != 0,
         orientation: Orientation::Normal,
         has_color_profile: flags & 0x20 != 0,
     })
@@ -921,7 +926,7 @@ fn image_worker_result_for(
     if rgba.0.len() != expected_rgba_len {
         return Err(ImageError::Decode);
     }
-    let animation = if purpose == ImagePurpose::Viewer && info.frames > 1 {
+    let animation = if purpose == ImagePurpose::Viewer && info.animated {
         animation_frames(bytes, edge)?
     } else {
         Vec::new()
@@ -965,7 +970,7 @@ fn image_worker_result_for(
         .ok_or(ImageError::ResourceLimit)?;
     let mut result = SecretBytes::zeroed(total).map_err(|_| ImageError::Decode)?;
     let header = &mut result.expose_mut()[..WORKER_RESULT_HEADER_LEN];
-    header[..8].copy_from_slice(b"OSVIMG4\0");
+    header[..8].copy_from_slice(b"OSVIMG5\0");
     header[8..12].copy_from_slice(&info.width.to_le_bytes());
     header[12..16].copy_from_slice(&info.height.to_le_bytes());
     header[16..20].copy_from_slice(&info.frames.to_le_bytes());
@@ -993,6 +998,7 @@ fn image_worker_result_for(
             .map_err(|_| ImageError::ResourceLimit)?
             .to_le_bytes(),
     );
+    header[60] = u8::from(info.animated);
     let png_end = WORKER_RESULT_HEADER_LEN + thumbnail.len();
     result.expose_mut()[WORKER_RESULT_HEADER_LEN..png_end].copy_from_slice(thumbnail.expose());
     result.expose_mut()[png_end..png_end + rgba.0.len()].copy_from_slice(display_rgba);
@@ -1009,8 +1015,9 @@ fn image_worker_result_for(
 
 pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, ImageError> {
     if bytes.len() < WORKER_RESULT_HEADER_LEN
-        || &bytes[..8] != b"OSVIMG4\0"
-        || bytes[60..64] != [0; 4]
+        || &bytes[..8] != b"OSVIMG5\0"
+        || bytes[60] > 1
+        || bytes[61..64] != [0; 3]
     {
         return Err(ImageError::Malformed);
     }
@@ -1065,6 +1072,7 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
                 .try_into()
                 .map_err(|_| ImageError::Malformed)?,
         ),
+        animated: bytes[60] == 1,
         orientation,
         has_color_profile: bytes[22] == 1,
     };
@@ -1127,8 +1135,11 @@ pub fn decode_worker_result_header(bytes: &[u8]) -> Result<WorkerImageResult, Im
         || output_frames == 0
         || output_frames > info.frames
         || additional_frames_len != expected_additional
-        || (output_frames == 1 && first_delay_ms != 0)
-        || (output_frames > 1 && !(10..=60_000).contains(&first_delay_ms))
+        || (purpose == ImagePurpose::Thumbnail && first_delay_ms != 0)
+        || (purpose == ImagePurpose::Viewer
+            && info.animated
+            && !(10..=60_000).contains(&first_delay_ms))
+        || (purpose == ImagePurpose::Viewer && !info.animated && first_delay_ms != 0)
     {
         Err(ImageError::ResourceLimit)
     } else {
@@ -1786,7 +1797,7 @@ mod tests {
             (48usize, [3, 0, 0, 0]),
             (52, [0, 0, 0, 0]),
             (56, [1, 0, 0, 0]),
-            (60, [1, 0, 0, 0]),
+            (60, [2, 0, 0, 0]),
         ] {
             let mut hostile = valid.expose().to_vec();
             hostile[mutate.0..mutate.0 + 4].copy_from_slice(&mutate.1);
@@ -1913,6 +1924,45 @@ mod tests {
         request.extend_from_slice(&encoded);
         let result = image_worker_result_from_request(&request).unwrap();
         let header = decode_worker_result_header(result.expose()).unwrap();
+        let first_pixel =
+            WORKER_RESULT_HEADER_LEN + usize::try_from(header.thumbnail_png_len).unwrap();
+        assert_eq!(
+            result.expose()[first_pixel..first_pixel + 4],
+            [1, 2, 3, 255]
+        );
+    }
+
+    #[test]
+    fn one_frame_apng_displays_animation_frame_instead_of_poster() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_animated(1, 0).unwrap();
+            encoder.set_sep_def_img(true).unwrap();
+            encoder.validate_sequence(true);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[9, 9, 9, 255].repeat(4)).unwrap();
+            writer.set_frame_delay(1, 10).unwrap();
+            writer.write_image_data(&[1, 2, 3, 255].repeat(4)).unwrap();
+            writer.finish().unwrap();
+        }
+        let probe = probe(&encoded).unwrap();
+        assert_eq!(probe.frames, 1);
+        assert!(probe.animated);
+        let frames = animation_frames(&encoded, 512).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].pixels.expose()[..4], [1, 2, 3, 255]);
+
+        let mut request = encode_worker_request(ImagePurpose::Viewer, 512)
+            .unwrap()
+            .to_vec();
+        request.extend_from_slice(&encoded);
+        let result = image_worker_result_from_request(&request).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert!(header.source.animated);
+        assert_eq!((header.output_frames, header.first_delay_ms), (1, 100));
         let first_pixel =
             WORKER_RESULT_HEADER_LEN + usize::try_from(header.thumbnail_png_len).unwrap();
         assert_eq!(
