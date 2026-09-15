@@ -1637,6 +1637,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   allocation-free animation-container flag is carried independently of frame
   count. Viewer dispatch now decodes a one-frame APNG as animation, preserving
   its timing and selecting its true frame instead of a separate default poster.
+- Moved catalog-returned gallery names and pending import names into redacted,
+  protected, wipe-on-drop `SecretString` owners. Controllable SQL/portal transfer
+  strings and GTK label-formatting buffers are wiped after transfer; GTK's
+  internal text/model copies remain an explicitly unavoidable toolkit-owned
+  allocation and are synchronously released at lock.
 
 **Verification**
 
@@ -1698,6 +1703,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - A genuine one-frame APNG with visibly distinct poster and animation pixels
   passes probe, protected frame decode, and the complete version-5 worker result;
   the 26-test media suite, import suite, and warnings-as-errors Clippy pass.
+- Catalog and application suites pass with protected gallery/import names;
+  `GalleryRecord` debug output is explicitly redacted, and the existing gallery
+  lock regression continues to prove model/name release at revocation.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1721,11 +1729,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   pixel vectors. Every decoder-returned image and collected frame is now guarded
   immediately, and orientation, scaling, raw-frame transfer, and encoder output
   remain under wiping ownership through early returns.
-- **P2 — Decrypted names use non-wiping and potentially revealing owners.**
+- **Resolved — Decrypted names use non-wiping and potentially revealing owners.**
   Gallery and import names are retained and formatted as ordinary `String`s;
-  `GalleryRecord` also derives unredacted `Debug`. Use protected/redacted owners
-  for controllable Rust allocations, wipe transfer/formatting buffers, redact
-  debug output, and separately document unavoidable GTK text copies.
+  `GalleryRecord` also derives unredacted `Debug`. Controllable Rust allocations
+  now use protected/redacted owners, transfer and formatting buffers are wiped,
+  debug output is redacted, and unavoidable GTK text copies are documented.
 - **P2 — Image orchestration discards memory-lock degradation.** The supervisor
   combines worker/IPC lock status, but rendition preparation does not propagate
   it through the session security state. Aggregate and surface transient and
@@ -1766,7 +1774,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; three P2 findings above remain Phase 9
+  adversarial review is complete; two P2 findings above remain Phase 9
   blockers. Third-party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state

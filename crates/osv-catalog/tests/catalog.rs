@@ -219,10 +219,9 @@ fn bounded_image_and_gallery_records_expose_only_composition_facts() {
     );
     assert_eq!(images[0].thumbnail_object_id, Some(thumbnail.id()));
     assert_eq!((images[0].width, images[0].height), (800, 600));
-    assert_eq!(
-        catalog.reader().gallery_records(10).unwrap()[0].name,
-        "Private gallery"
-    );
+    let galleries = catalog.reader().gallery_records(10).unwrap();
+    assert_eq!(galleries[0].name.expose(), "Private gallery");
+    assert!(!format!("{:?}", galleries[0]).contains("Private gallery"));
     assert!(catalog.reader().image_records(0, 10).is_err());
     assert!(catalog.reader().image_records(2, 0).is_err());
     assert!(catalog.reader().gallery_records(0).is_err());

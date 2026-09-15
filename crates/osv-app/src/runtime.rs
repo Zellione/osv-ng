@@ -39,7 +39,7 @@ pub enum RuntimeError {
 
 pub struct ImportRequest {
     pub source: std::fs::File,
-    pub original_name: String,
+    pub original_name: osv_crypto::SecretString,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,7 +71,7 @@ pub struct GalleryImage {
 
 pub struct GalleryFolder {
     pub id: osv_catalog::GalleryId,
-    pub name: String,
+    pub name: osv_crypto::SecretString,
 }
 
 #[derive(Clone, Copy)]
@@ -500,7 +500,14 @@ fn prepare_import(
     vault: &VaultService,
     request: ImportRequest,
     cancelled: &AtomicBool,
-) -> Result<(osv_import::PreparedImageImport, String, ImportPreview), RuntimeError> {
+) -> Result<
+    (
+        osv_import::PreparedImageImport,
+        osv_crypto::SecretString,
+        ImportPreview,
+    ),
+    RuntimeError,
+> {
     let worker = media_worker_path();
     let request_id = REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let mut source = request.source;
@@ -691,7 +698,7 @@ fn open_viewer(
 fn commit_import(
     vault: &mut VaultService,
     mut prepared: osv_import::PreparedImageImport,
-    original_name: String,
+    original_name: osv_crypto::SecretString,
     decision: Option<DuplicateDecision>,
 ) -> Result<Option<ImportedImage>, RuntimeError> {
     if prepared.preview.duplicate == osv_import::DuplicateState::AwaitingDecision {
@@ -712,7 +719,7 @@ fn commit_import(
     let media_id = osv_catalog::MediaId::from_bytes(id);
     let imported_at_ms = now_ms().ok_or(RuntimeError::Input)?;
     let committed = prepared
-        .commit(vault, media_id, &original_name, imported_at_ms)
+        .commit(vault, media_id, original_name.expose(), imported_at_ms)
         .map_err(map_import_error)?;
     Ok(Some(ImportedImage {
         media_id,
@@ -793,7 +800,7 @@ mod tests {
         std::fs::write(&replacement, b"replacement public fixture").unwrap();
         let mut request = ImportRequest {
             source: std::fs::File::open(&selected).unwrap(),
-            original_name: "fixture.png".to_owned(),
+            original_name: osv_crypto::SecretString::new("fixture.png").unwrap(),
         };
         std::fs::rename(&replacement, &selected).unwrap();
         let mut bytes = Vec::new();
@@ -820,7 +827,7 @@ mod tests {
                 id,
                 GalleryFolder {
                     id,
-                    name: format!("Level {depth}"),
+                    name: osv_crypto::SecretString::new(&format!("Level {depth}")).unwrap(),
                 },
             );
             let level = ids

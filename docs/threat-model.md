@@ -104,6 +104,10 @@ allocation failure, and partial copy may occur between any persistence steps.
 
 - Application-owned secrets and plaintext use wipe-on-release owners with
   best-effort page locking and `MADV_DONTDUMP`; degradation is observable.
+- Decrypted names use protected, redacted application owners, and controllable
+  transfer/formatting buffers are wiped. GTK necessarily makes opaque internal
+  text/model copies while names are displayed; these copies cannot be directly
+  page-locked or wipe-observed and are released when lock clears the model.
 - Release processes disable core dumps. Logs, panics, arguments, environment,
   filenames, and tracing exclude secrets and sensitive user metadata.
 - Helpers use descriptor allowlists, bounded messages/queues, deadlines,

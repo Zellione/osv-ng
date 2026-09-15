@@ -774,6 +774,7 @@ dependencies = [
  "osv-test-support",
  "rusqlite",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]

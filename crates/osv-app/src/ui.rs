@@ -5,6 +5,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
+use zeroize::Zeroize;
 
 #[cfg(unix)]
 fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -148,18 +149,18 @@ fn show_gallery_level(
 ) {
     let source = snapshot.level(folder);
     let mut next = Vec::with_capacity(source.len());
-    let mut labels = Vec::with_capacity(source.len());
+    let mut owned_labels = Vec::with_capacity(source.len());
     for (index, child) in source.iter().enumerate() {
         match child {
             GalleryChild::Gallery(id) => {
                 if let Some(folder) = snapshot.folders.get(id) {
                     next.push(GalleryUiEntry::Folder(*id));
-                    labels.push(format!("Gallery — {}", folder.name));
+                    owned_labels.push(format!("Gallery — {}", folder.name.expose()));
                 }
             }
             GalleryChild::Image(image) => {
                 next.push(GalleryUiEntry::Image(*image));
-                labels.push(format!(
+                owned_labels.push(format!(
                     "Image {} — {} × {}{}",
                     index + 1,
                     image.width,
@@ -169,8 +170,13 @@ fn show_gallery_level(
             }
         }
     }
-    let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-    model.splice(0, model.n_items(), &labels);
+    {
+        let labels: Vec<&str> = owned_labels.iter().map(String::as_str).collect();
+        model.splice(0, model.n_items(), &labels);
+    }
+    for label in &mut owned_labels {
+        label.as_mut_str().zeroize();
+    }
     *entries.borrow_mut() = next;
 }
 
@@ -1095,10 +1101,16 @@ fn gallery_view(
                     return;
                 }
             };
-            let original_name = file
+            let mut original_name = file
                 .basename()
                 .and_then(|name| name.into_string().ok())
                 .unwrap_or_else(|| "imported-image".to_owned());
+            let protected_name = osv_crypto::SecretString::new(&original_name);
+            original_name.as_mut_str().zeroize();
+            let Ok(original_name) = protected_name else {
+                status.set_label("The selected image name could not be protected in memory.");
+                return;
+            };
             *selected_authority.borrow_mut() = Some(file);
             active_preparation.set(None);
             for button in [&confirm, &skip, &another] {
@@ -1890,7 +1902,7 @@ mod tests {
             id,
             crate::runtime::GalleryFolder {
                 id,
-                name: "sensitive name".to_owned(),
+                name: osv_crypto::SecretString::new("sensitive name").unwrap(),
             },
         );
         let snapshot = RefCell::new(Some(GallerySnapshot {

@@ -21,6 +21,7 @@ osv-crypto.workspace = true
 osv-storage.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }

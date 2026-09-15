@@ -30,10 +30,19 @@ pub struct ImageRecord {
     pub favorite: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GalleryRecord {
     pub id: GalleryId,
-    pub name: String,
+    pub name: osv_crypto::SecretString,
+}
+
+impl std::fmt::Debug for GalleryRecord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GalleryRecord")
+            .field("id", &self.id)
+            .field("name", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Minimum encrypted-catalog authority needed to regenerate a missing or stale
@@ -641,11 +650,13 @@ fn read_gallery_records(connection: &Connection, maximum: u32) -> Result<Vec<Gal
         Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?))
     })?;
     rows.map(|row| {
-        let (id, name) = row?;
+        let (id, mut name) = row?;
         validate_text(&name, MAX_NAME_BYTES, false, "gallery name")?;
+        let protected = osv_crypto::SecretString::new(&name);
+        zeroize::Zeroize::zeroize(name.as_mut_str());
         Ok(GalleryRecord {
             id: GalleryId::parse(id)?,
-            name,
+            name: protected.map_err(|_| CatalogError::IntegrityFailed)?,
         })
     })
     .collect()
