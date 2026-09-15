@@ -1462,6 +1462,13 @@ fn gallery_view(
                 task_status.set_label("Regenerating encrypted image thumbnails…");
             } else if maintenance.failed > 0 && finished {
                 task_status.set_label("Some thumbnails could not be regenerated safely.");
+            } else if session
+                .borrow()
+                .as_ref()
+                .is_some_and(|active| active.page_locks() == osv_crypto::LockStatus::Degraded)
+            {
+                task_status
+                    .set_label("Memory locking is degraded; sensitive image data may be swapped.");
             }
             if loaded_revision.get() == session_state {
                 return glib::ControlFlow::Continue;

@@ -1647,6 +1647,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   publishes a catalog revision, reports the original as securely imported, and
   queues that exact media/original pair for derived regeneration instead of
   presenting the whole import as failed or hiding the new record.
+- Propagated conservative page-lock status from authenticated source buffers,
+  helper/IPC result storage, decoded planes, protected names, publication, and
+  regeneration into a monotonic serial-session security state. The gallery
+  surfaces an explicit warning when locking is degraded rather than silently
+  discarding transient or retained image-operation status.
 
 **Verification**
 
@@ -1715,6 +1720,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   proves the committed original remains catalog-visible, the outcome is marked
   original-only, and the encrypted-catalog missing-recipe query returns the
   exact regeneration target.
+- A subprocess regression exhausts `RLIMIT_MEMLOCK`, creates a real background
+  vault session, and proves the degradation is retained and observable through
+  the same session status consumed by the production GTK warning. Import and
+  application tests plus warnings-as-errors Clippy pass.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
@@ -1743,10 +1752,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   `GalleryRecord` also derives unredacted `Debug`. Controllable Rust allocations
   now use protected/redacted owners, transfer and formatting buffers are wiped,
   debug output is redacted, and unavoidable GTK text copies are documented.
-- **P2 — Image orchestration discards memory-lock degradation.** The supervisor
+- **Resolved — Image orchestration discards memory-lock degradation.** The supervisor
   combines worker/IPC lock status, but rendition preparation does not propagate
-  it through the session security state. Aggregate and surface transient and
-  retained image-operation degradation, with a memlock exhaustion regression.
+  it through the session security state. Transient and retained image-operation
+  degradation is now aggregated monotonically and surfaced, with a memlock
+  exhaustion regression.
 - **Resolved — A hostile helper can exceed the requested rendition edge.** Broker
   validation permits dimensions up to the global 4096 limit even for a 512-edge
   thumbnail. Actual dimensions are now bound to the requested edge and
@@ -1783,8 +1793,8 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   initiation but could not select or dismiss the compositor-owned dialog.
   Mixed-output scaling was explicitly skipped by user direction after the
   session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
-  adversarial review is complete; one P2 finding above remains Phase 9
-  blockers. Third-party decoder working allocations remain subject to
+  adversarial review is complete and all findings above are resolved. Third-
+  party decoder working allocations remain subject to
   the documented opaque-library limitation and the helper's process resource
   ceiling; protected IPC and broker-owned buffers report their page-lock state
   explicitly.

@@ -99,6 +99,7 @@ pub struct PreparedImageImport {
     thumbnail_width: u32,
     thumbnail_height: u32,
     display_pixels: osv_crypto::SecretBytes,
+    lock_status: osv_crypto::LockStatus,
 }
 
 impl std::fmt::Debug for PreparedImageImport {
@@ -113,6 +114,7 @@ pub struct CommittedImage {
     pub display_pixels: osv_crypto::SecretBytes,
     pub display_width: u32,
     pub display_height: u32,
+    pub lock_status: osv_crypto::LockStatus,
 }
 
 pub struct DecodedImage {
@@ -122,6 +124,7 @@ pub struct DecodedImage {
     pub frames: u32,
     pub first_delay_ms: u32,
     pub additional_frames: Vec<DecodedFrame>,
+    pub lock_status: osv_crypto::LockStatus,
 }
 
 pub struct DecodedFrame {
@@ -149,6 +152,7 @@ struct PreparedThumbnail {
     display_pixels: osv_crypto::SecretBytes,
     first_delay_ms: u32,
     additional_frames: Vec<DecodedFrame>,
+    lock_status: osv_crypto::LockStatus,
 }
 
 fn prepare_thumbnail_cancellable(
@@ -243,6 +247,7 @@ fn prepare_rendition_cancellable(
         worker.finish_with_output(maximum_result)
     };
     let (class, derived) = result.map_err(ImageImportError::Worker)?;
+    let mut lock_status = source.lock_status().combine(derived.lock_status());
     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Err(ImageImportError::Cancelled);
     }
@@ -269,6 +274,9 @@ fn prepare_rendition_cancellable(
     let display_pixels = derived
         .copy_span(osv_media::WORKER_RESULT_HEADER_LEN + png_len, rgba_len)
         .map_err(ImageImportError::Worker)?;
+    lock_status = lock_status
+        .combine(bytes.lock_status())
+        .combine(display_pixels.lock_status());
     let mut offset = osv_media::WORKER_RESULT_HEADER_LEN + png_len + rgba_len;
     let mut additional_frames = Vec::with_capacity(
         usize::try_from(worker_result.output_frames.saturating_sub(1))
@@ -291,6 +299,7 @@ fn prepare_rendition_cancellable(
         let pixels = derived
             .copy_span(offset, rgba_len)
             .map_err(ImageImportError::Worker)?;
+        lock_status = lock_status.combine(pixels.lock_status());
         offset = offset
             .checked_add(rgba_len)
             .ok_or(ImageImportError::Input)?;
@@ -319,6 +328,7 @@ fn prepare_rendition_cancellable(
         display_pixels,
         first_delay_ms: worker_result.first_delay_ms,
         additional_frames,
+        lock_status,
     })
 }
 
@@ -433,6 +443,7 @@ pub fn prepare_image_import_cancellable(
     let duplicate = catalog
         .has_fingerprint(&fingerprint)
         .map_err(|_| ImageImportError::Input)?;
+    let lock_status = prepared.lock_status.combine(protected.lock_status());
     Ok(PreparedImageImport {
         source: protected,
         thumbnail: prepared.bytes,
@@ -441,6 +452,7 @@ pub fn prepare_image_import_cancellable(
         thumbnail_width: prepared.width,
         thumbnail_height: prepared.height,
         display_pixels: prepared.display_pixels,
+        lock_status,
     })
 }
 
@@ -472,6 +484,25 @@ pub fn regenerate_image_thumbnail_cancellable(
     now_ms: i64,
     cancelled: Option<&AtomicBool>,
 ) -> Result<osv_storage::ObjectId, ImageImportError> {
+    regenerate_image_thumbnail_cancellable_observed(
+        vault,
+        target,
+        worker_executable,
+        request_id,
+        now_ms,
+        cancelled,
+    )
+    .map(|(object, _)| object)
+}
+
+pub fn regenerate_image_thumbnail_cancellable_observed(
+    vault: &mut osv_vault::VaultService,
+    target: osv_catalog::DerivedRegeneration,
+    worker_executable: &Path,
+    request_id: u64,
+    now_ms: i64,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(osv_storage::ObjectId, osv_crypto::LockStatus), ImageImportError> {
     let logical_len = vault
         .reader()
         .object(target.original_object_id)
@@ -512,13 +543,21 @@ pub fn regenerate_image_thumbnail_cancellable(
     if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
         return Err(ImageImportError::Cancelled);
     }
-    publish_regenerated_thumbnail(
+    let lock_status = prepared
+        .lock_status
+        .combine(source.lock_status())
+        .combine(vault.security_status().page_locks());
+    let object = publish_regenerated_thumbnail(
         vault,
         target,
         prepared,
         now_ms,
         &mut osv_vault::NoServiceFaults,
-    )
+    )?;
+    Ok((
+        object,
+        lock_status.combine(vault.security_status().page_locks()),
+    ))
 }
 
 fn publish_regenerated_thumbnail(
@@ -647,6 +686,7 @@ fn decode_image_object_for(
         frames,
         first_delay_ms: prepared.first_delay_ms,
         additional_frames: prepared.additional_frames,
+        lock_status: prepared.lock_status,
     })
 }
 
@@ -678,6 +718,11 @@ impl ImportPreview {
 }
 
 impl PreparedImageImport {
+    #[must_use]
+    pub const fn lock_status(&self) -> osv_crypto::LockStatus {
+        self.lock_status
+    }
+
     pub fn commit(
         self,
         vault: &mut osv_vault::VaultService,
@@ -749,6 +794,9 @@ impl PreparedImageImport {
             display_pixels: self.display_pixels,
             display_width: self.thumbnail_width,
             display_height: self.thumbnail_height,
+            lock_status: self
+                .lock_status
+                .combine(vault.security_status().page_locks()),
         })
     }
 }
@@ -808,6 +856,7 @@ mod tests {
             display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
             first_delay_ms: 0,
             additional_frames: Vec::new(),
+            lock_status: osv_crypto::LockStatus::Locked,
         }
     }
 
@@ -1138,6 +1187,7 @@ mod tests {
             thumbnail_width: 2,
             thumbnail_height: 2,
             display_pixels: osv_crypto::SecretBytes::zeroed(16).unwrap(),
+            lock_status: osv_crypto::LockStatus::Locked,
         };
         let media_id = osv_catalog::MediaId::from_bytes([0x91; 16]);
         let committed = prepared

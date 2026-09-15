@@ -58,6 +58,7 @@ pub struct ImportedImage {
     pub pixels: osv_crypto::SecretBytes,
     pub width: u32,
     pub height: u32,
+    pub lock_status: osv_crypto::LockStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +104,7 @@ pub struct OpenedImage {
     pub frames: u32,
     pub first_delay_ms: u32,
     pub additional_frames: Vec<osv_import::DecodedFrame>,
+    pub lock_status: osv_crypto::LockStatus,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -174,6 +176,7 @@ pub struct VaultSession {
     cancelled: Arc<AtomicBool>,
     maintenance: Arc<Mutex<MaintenanceStatus>>,
     catalog_revision: Arc<AtomicU64>,
+    security_degraded: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -195,6 +198,8 @@ impl VaultSession {
         let worker_maintenance = Arc::clone(&maintenance);
         let catalog_revision = Arc::new(AtomicU64::new(0));
         let worker_catalog_revision = Arc::clone(&catalog_revision);
+        let security_degraded = Arc::new(AtomicBool::new(false));
+        let worker_security_degraded = Arc::clone(&security_degraded);
         let thread = thread::spawn(move || {
             let password = match Password::take(&mut password_bytes) {
                 Ok(password) => password,
@@ -217,6 +222,10 @@ impl VaultSession {
                 let _ = ready_tx.send(Err(RuntimeError::Open));
                 return;
             };
+            record_lock_status(
+                &worker_security_degraded,
+                vault.security_status().page_locks(),
+            );
             if ready_tx.send(Ok(())).is_err() {
                 let _ = vault.close();
                 return;
@@ -254,7 +263,7 @@ impl VaultSession {
                     if let Ok(mut status) = worker_maintenance.lock() {
                         status.running = true;
                     }
-                    let result = osv_import::regenerate_image_thumbnail_cancellable(
+                    let result = osv_import::regenerate_image_thumbnail_cancellable_observed(
                         &mut vault,
                         target,
                         &media_worker_path(),
@@ -262,6 +271,9 @@ impl VaultSession {
                         now_ms().unwrap_or(0),
                         Some(&worker_cancelled),
                     );
+                    if let Ok((_, lock_status)) = &result {
+                        record_lock_status(&worker_security_degraded, *lock_status);
+                    }
                     if let Ok(mut status) = worker_maintenance.lock() {
                         status.running = false;
                         if result.is_ok() {
@@ -295,14 +307,28 @@ impl VaultSession {
                 match command {
                     Command::ListGallery { response } => {
                         let result = list_gallery(&vault);
+                        if let Ok(snapshot) = &result {
+                            for folder in snapshot.folders.values() {
+                                record_lock_status(
+                                    &worker_security_degraded,
+                                    folder.name.lock_status(),
+                                );
+                            }
+                        }
                         let _ = response.send(result);
                     }
                     Command::OpenThumbnail { media_id, response } => {
                         let result = open_thumbnail(&vault, media_id, &worker_cancelled);
+                        if let Ok(opened) = &result {
+                            record_lock_status(&worker_security_degraded, opened.lock_status);
+                        }
                         let _ = response.send(result);
                     }
                     Command::OpenViewer { media_id, response } => {
                         let result = open_viewer(&vault, media_id, &worker_cancelled);
+                        if let Ok(opened) = &result {
+                            record_lock_status(&worker_security_degraded, opened.lock_status);
+                        }
                         let _ = response.send(result);
                     }
                     Command::PrepareImport {
@@ -313,6 +339,14 @@ impl VaultSession {
                         pending = None;
                         match prepare_import(&vault, request, &worker_cancelled) {
                             Ok((prepared, original_name, preview)) => {
+                                record_lock_status(
+                                    &worker_security_degraded,
+                                    prepared.lock_status(),
+                                );
+                                record_lock_status(
+                                    &worker_security_degraded,
+                                    original_name.lock_status(),
+                                );
                                 pending = Some((preparation_id, (prepared, original_name)));
                                 let _ = response.send(Ok(preview));
                             }
@@ -330,6 +364,7 @@ impl VaultSession {
                             |(prepared, name)| commit_import(&mut vault, prepared, name, decision),
                         );
                         if let Ok(Some(imported)) = &result {
+                            record_lock_status(&worker_security_degraded, imported.lock_status);
                             worker_catalog_revision.fetch_add(1, Ordering::Release);
                             if imported.thumbnail.is_none() {
                                 regeneration.push_back(osv_catalog::DerivedRegeneration {
@@ -355,6 +390,7 @@ impl VaultSession {
             cancelled,
             maintenance,
             catalog_revision,
+            security_degraded,
             thread: Some(thread),
         }
     }
@@ -378,6 +414,15 @@ impl VaultSession {
     #[must_use]
     pub fn catalog_revision(&self) -> u64 {
         self.catalog_revision.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn page_locks(&self) -> osv_crypto::LockStatus {
+        if self.security_degraded.load(Ordering::Acquire) {
+            osv_crypto::LockStatus::Degraded
+        } else {
+            osv_crypto::LockStatus::Locked
+        }
     }
 
     pub fn try_ready(&self) -> Option<Result<(), RuntimeError>> {
@@ -487,6 +532,12 @@ fn take_pending_for<T>(
         .take()
         .map(|(_, value)| value)
         .ok_or(RuntimeError::Input)
+}
+
+fn record_lock_status(degraded: &AtomicBool, status: osv_crypto::LockStatus) {
+    if status == osv_crypto::LockStatus::Degraded {
+        degraded.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for VaultSession {
@@ -670,6 +721,7 @@ fn open_thumbnail(
         frames: decoded.frames,
         first_delay_ms: decoded.first_delay_ms,
         additional_frames: decoded.additional_frames,
+        lock_status: decoded.lock_status,
     })
 }
 
@@ -701,6 +753,7 @@ fn open_viewer(
         frames: decoded.frames,
         first_delay_ms: decoded.first_delay_ms,
         additional_frames: decoded.additional_frames,
+        lock_status: decoded.lock_status,
     })
 }
 
@@ -737,6 +790,7 @@ fn commit_import(
         pixels: committed.display_pixels,
         width: committed.display_width,
         height: committed.display_height,
+        lock_status: committed.lock_status,
     }))
 }
 
@@ -796,6 +850,51 @@ mod tests {
         assert_eq!(pending, Some((second, "prepared B")));
         assert_eq!(take_pending_for(&mut pending, second), Ok("prepared B"));
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn memlock_exhaustion_is_visible_in_session_security_state() {
+        const CHILD: &str = "OSV_APP_MEMLOCK_STATUS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            #[cfg(target_os = "linux")]
+            {
+                #[allow(unsafe_code)]
+                fn disable_memlock() {
+                    let limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) }, 0);
+                }
+                disable_memlock();
+            }
+            let parent = osv_test_support::TempVault::create_in(Path::new("/tmp")).unwrap();
+            let session = VaultSession::begin(
+                parent.path().join("degraded-session"),
+                b"degraded session password".to_vec(),
+                OpenKind::Create,
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(result) = session.try_ready() {
+                    result.unwrap();
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(session.page_locks(), osv_crypto::LockStatus::Degraded);
+            session.close();
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("runtime::tests::memlock_exhaustion_is_visible_in_session_security_state")
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "memlock child status: {status:?}");
     }
 
     #[test]
