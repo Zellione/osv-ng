@@ -1423,7 +1423,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
-**Status (2026-09-19): In progress**
+**Status:** Complete as of 2026-09-19.
 
 **Delivered scope**
 
@@ -1785,8 +1785,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - The application suite and warnings-as-errors Clippy pass after the import
   guidance and clean-shutdown changes. A native hardened-shell launch emits no
   portal warnings; the user-confirmed native flow creates and reopens a vault
-  and reaches image preparation through the broker. Final import/view and clean
-  SQLCipher shutdown remain to be reconfirmed against the rebuilt binary.
+  and reaches image preparation through the broker.
 - A real 803×169 PNG that reproduced the user-visible rejection now probes and
   decodes to the required 512×108 result. Dedicated landscape/portrait geometry
   regressions, the 27-test media suite, the import suite, and warnings-as-errors
@@ -1805,6 +1804,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   allocation while retaining content-fit and native GSK transforms. Native
   visual reconfirmation shows both the encrypted thumbnail and authenticated
   full viewer rendition with the correct non-square aspect ratio.
+- Final native acceptance confirms visible zoom, pan, and rotation behavior;
+  lock synchronously removes viewer pixels and gallery thumbnails; reopening
+  restores the authenticated thumbnail and full viewer; and normal window close
+  completes without the SQLCipher private-heap shutdown warning.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
