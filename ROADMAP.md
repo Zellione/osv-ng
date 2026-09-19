@@ -1791,13 +1791,20 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   decodes to the required 512×108 result. Dedicated landscape/portrait geometry
   regressions, the 27-test media suite, the import suite, and warnings-as-errors
   Clippy pass; the current app and media-helper binaries were rebuilt together.
+- The 2026-09-19 post-native-fix closure checkpoint passes workspace format,
+  warnings-as-errors Clippy, the complete workspace test suite, the exact
+  secret-canary gate, `cargo audit`, and dependency policy. The explicit
+  near-limit release helper again streams its authenticated result above 90 MiB
+  under the process ceiling. A fresh no-FUSE Flatpak build passes the complete
+  offline release suite, and the built app plus both helper self-checks pass.
 - Native user verification now completes portal selection, explicit import,
   encrypted publication, and catalog refresh for a 1920×1080 image. The
   follow-up authenticated tile presentation is visually confirmed. The viewer
   decoded the authenticated original but its fixed-layout picture had no width
   request and remained blank; it now receives an explicit bounded 640×360
-  allocation while retaining content-fit and native GSK transforms, and awaits
-  visual reconfirmation.
+  allocation while retaining content-fit and native GSK transforms. Native
+  visual reconfirmation shows both the encrypted thumbnail and authenticated
+  full viewer rendition with the correct non-square aspect ratio.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
