@@ -1738,6 +1738,14 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   activation succeeded, but the managed desktop portal rejected the process
   before presenting its compositor-owned dialog, so selection/cancellation
   remains an external interactive gate rather than a claimed pass.
+- The same continuation reran the ignored near-limit helper test in release
+  mode and passed the real sandboxed authenticated stream above 90 MiB. The
+  separate fuzz workspace format, audit, and dependency-policy gates pass. A
+  fresh no-FUSE Phase 2 Flatpak build passed its complete offline release test
+  suite, and the built app self-check plus both helper hardening checks pass.
+  Launching the interactive app from this bootstrap build environment cannot
+  close the remaining portal gate because that self-check manifest deliberately
+  carries no release application integration or D-Bus permissions.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
