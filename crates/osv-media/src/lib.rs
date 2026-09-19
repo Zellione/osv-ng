@@ -269,7 +269,13 @@ pub fn animation_frames(bytes: &[u8], edge: u32) -> Result<Vec<DecodedAnimationF
         }
         let buffer = WipeRgba(frame.take_buffer());
         let mut scaled = if buffer.0.width() > edge || buffer.0.height() > edge {
-            WipeRgba(image::imageops::thumbnail(&buffer.0, edge, edge))
+            let (width, height) = rendition_dimensions(buffer.0.width(), buffer.0.height(), edge)?;
+            WipeRgba(image::imageops::resize(
+                &buffer.0,
+                width,
+                height,
+                image::imageops::FilterType::Triangle,
+            ))
         } else {
             WipeRgba(buffer.0.clone())
         };
@@ -828,11 +834,46 @@ pub fn thumbnail_png(bytes: &[u8], edge: u32) -> Result<SecretBytes, ImageError>
     let decoded = WipeRgba(reader.decode().map_err(|_| ImageError::Decode)?.to_rgba8());
     let oriented = orient_rgba(&decoded.0, info.orientation);
     let scaled = WipeRgba(if oriented.0.width() > edge || oriented.0.height() > edge {
-        image::imageops::thumbnail(&oriented.0, edge, edge)
+        let (width, height) = rendition_dimensions(oriented.0.width(), oriented.0.height(), edge)?;
+        image::imageops::resize(
+            &oriented.0,
+            width,
+            height,
+            image::imageops::FilterType::Triangle,
+        )
     } else {
         oriented.0.clone()
     });
     encode_png_rgba(&scaled.0)
+}
+
+/// Exact aspect-preserving geometry shared by helper production and broker
+/// validation. The longer edge is capped and the shorter edge is rounded to
+/// the nearest pixel using checked integer arithmetic.
+pub fn rendition_dimensions(width: u32, height: u32, edge: u32) -> Result<(u32, u32), ImageError> {
+    if width == 0 || height == 0 || edge == 0 || edge > MAX_VIEWER_EDGE {
+        return Err(ImageError::ResourceLimit);
+    }
+    if width <= edge && height <= edge {
+        return Ok((width, height));
+    }
+    let (long, short, width_is_long) = if width >= height {
+        (width, height, true)
+    } else {
+        (height, width, false)
+    };
+    let scaled_short = u64::from(short)
+        .checked_mul(u64::from(edge))
+        .and_then(|value| value.checked_add(u64::from(long / 2)))
+        .map(|value| value / u64::from(long))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(ImageError::ResourceLimit)?
+        .max(1);
+    Ok(if width_is_long {
+        (edge, scaled_short)
+    } else {
+        (scaled_short, edge)
+    })
 }
 
 fn orient_rgba(decoded: &image::RgbaImage, orientation: Orientation) -> WipeRgba {
@@ -1709,6 +1750,23 @@ mod tests {
                 .width,
             2
         );
+    }
+
+    #[test]
+    fn non_square_rendition_preserves_aspect_ratio() {
+        let image = image::RgbaImage::from_pixel(803, 169, image::Rgba([1, 2, 3, 255]));
+        let mut encoded = Vec::new();
+        PngEncoder::new(&mut encoded)
+            .write_image(image.as_raw(), 803, 169, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let result = image_worker_result(&encoded, 512).unwrap();
+        let header = decode_worker_result_header(result.expose()).unwrap();
+        assert_eq!(
+            (header.thumbnail_width, header.thumbnail_height),
+            (512, 108)
+        );
+        assert_eq!(header.rgba_len, 512 * 108 * 4);
+        assert_eq!(rendition_dimensions(169, 803, 512).unwrap(), (108, 512));
     }
 
     #[test]

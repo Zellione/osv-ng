@@ -1670,6 +1670,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 - Import progress/preview/failure text now has a dedicated status channel;
   maintenance and page-lock warnings can no longer overwrite the explicit
   confirmation prompt or a rejected-image result while the user is deciding.
+- Corrected non-square rendition scaling: the low-level image operation had
+  stretched every oversized source to a square, after which the broker rightly
+  rejected the helper's dimensions. Helper production and broker validation
+  now share one checked integer aspect-ratio calculation for still and animated
+  frames.
 
 **Verification**
 
@@ -1776,6 +1781,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   portal warnings; the user-confirmed native flow creates and reopens a vault
   and reaches image preparation through the broker. Final import/view and clean
   SQLCipher shutdown remain to be reconfirmed against the rebuilt binary.
+- A real 803×169 PNG that reproduced the user-visible rejection now probes and
+  decodes to the required 512×108 result. Dedicated landscape/portrait geometry
+  regressions, the 27-test media suite, the import suite, and warnings-as-errors
+  Clippy pass; the current app and media-helper binaries were rebuilt together.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 

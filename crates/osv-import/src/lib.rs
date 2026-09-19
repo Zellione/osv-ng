@@ -343,16 +343,8 @@ fn validate_worker_dimensions(
         | osv_media::Orientation::Rotate270 => (result.source.height, result.source.width),
         _ => (result.source.width, result.source.height),
     };
-    let expected = if source_width <= edge && source_height <= edge {
-        (source_width, source_height)
-    } else {
-        let ratio = (f64::from(edge) / f64::from(source_width))
-            .min(f64::from(edge) / f64::from(source_height));
-        (
-            ((f64::from(source_width) * ratio).round() as u32).max(1),
-            ((f64::from(source_height) * ratio).round() as u32).max(1),
-        )
-    };
+    let expected = osv_media::rendition_dimensions(source_width, source_height, edge)
+        .map_err(|_| ImageImportError::Input)?;
     if (result.thumbnail_width, result.thumbnail_height) != expected {
         return Err(ImageImportError::Input);
     }
@@ -924,6 +916,13 @@ mod tests {
         result.source.orientation = osv_media::Orientation::Rotate90;
         result.thumbnail_width = 512;
         result.thumbnail_height = 51;
+        assert!(validate_worker_dimensions(&result, 512).is_ok());
+
+        result.source.width = 803;
+        result.source.height = 169;
+        result.source.orientation = osv_media::Orientation::Normal;
+        result.thumbnail_width = 512;
+        result.thumbnail_height = 108;
         assert!(validate_worker_dimensions(&result, 512).is_ok());
     }
 
