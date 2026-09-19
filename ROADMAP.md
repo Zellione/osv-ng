@@ -1793,8 +1793,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Clippy pass; the current app and media-helper binaries were rebuilt together.
 - Native user verification now completes portal selection, explicit import,
   encrypted publication, and catalog refresh for a 1920×1080 image. The
-  follow-up authenticated tile/viewer presentation fix passes the application
-  suite and warnings-as-errors Clippy and awaits visual reconfirmation.
+  follow-up authenticated tile presentation is visually confirmed. The viewer
+  decoded the authenticated original but its fixed-layout picture had no width
+  request and remained blank; it now receives an explicit bounded 640×360
+  allocation while retaining content-fit and native GSK transforms, and awaits
+  visual reconfirmation.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 

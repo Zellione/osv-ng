@@ -828,6 +828,7 @@ fn gallery_view(
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
+        .width_request(640)
         .height_request(360)
         .build();
     picture.update_property(&[gtk::accessible::Property::Label("Imported image preview")]);
