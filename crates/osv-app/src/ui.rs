@@ -8,7 +8,7 @@ use gtk::{gdk, gio, glib, prelude::*};
 use zeroize::Zeroize;
 
 #[cfg(unix)]
-fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     std::fs::OpenOptions::new()
@@ -18,7 +18,7 @@ fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     std::fs::File::open(path)
 }
 
@@ -461,20 +461,24 @@ enum PortalSelection {
 
 fn select_folder(
     button: &gtk::Button,
-    title: &str,
+    _title: &str,
     complete: impl FnOnce(PortalSelection) + 'static,
 ) {
-    let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
-    let parent = button.root().and_downcast::<gtk::Window>();
-    dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-        complete(match result {
-            Ok(file) => PortalSelection::Selected(file),
-            Err(error) if portal_error_is_cancelled(&error) => PortalSelection::Cancelled,
-            Err(_) => PortalSelection::Failed,
-        });
+    button.set_sensitive(false);
+    let button = button.clone();
+    crate::portal::select(crate::portal::Purpose::Folder, move |outcome| {
+        button.set_sensitive(true);
+        complete(match outcome {
+            crate::portal::Outcome::Selected(selection) => {
+                PortalSelection::Selected(selection.file())
+            }
+            crate::portal::Outcome::Cancelled => PortalSelection::Cancelled,
+            crate::portal::Outcome::Failed => PortalSelection::Failed,
+        })
     });
 }
 
+#[cfg(test)]
 fn portal_error_is_cancelled(error: &glib::Error) -> bool {
     error.matches(gtk::DialogError::Dismissed)
         || error.matches(gtk::DialogError::Cancelled)
@@ -1062,19 +1066,6 @@ fn gallery_view(
             status_for_import.set_label("Unlock a vault before importing.");
             return;
         };
-        let dialog = gtk::FileDialog::builder()
-            .title("Choose an image to import")
-            .modal(true)
-            .build();
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("Supported images"));
-        for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
-            filter.add_mime_type(mime);
-        }
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
-        dialog.set_filters(Some(&filters));
-        let parent = button.root().and_downcast::<gtk::Window>();
         let session = Rc::clone(&session_for_import);
         let status = status_for_import.clone();
         let selected_authority = Rc::clone(&selected_authority);
@@ -1082,29 +1073,22 @@ fn gallery_view(
         let confirm = confirm.clone();
         let skip = skip.clone();
         let another = another.clone();
-        dialog.open(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+        button.set_sensitive(false);
+        let button = button.clone();
+        crate::portal::select(crate::portal::Purpose::Image, move |result| {
+            button.set_sensitive(true);
             if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
                 return;
             }
-            let file = match result {
-                Ok(file) => file,
-                Err(error) if portal_error_is_cancelled(&error) => return,
-                Err(_) => {
+            let selection = match result {
+                crate::portal::Outcome::Selected(selection) => selection,
+                crate::portal::Outcome::Cancelled => return,
+                crate::portal::Outcome::Failed => {
                     status.set_label("The image chooser failed. Try again.");
                     return;
                 }
             };
-            let Some(path) = file.path() else {
-                status.set_label("The selected portal file is not locally accessible.");
-                return;
-            };
-            let source = match open_portal_file(&path) {
-                Ok(source) => source,
-                Err(_) => {
-                    status.set_label("The selected portal file could not be opened safely.");
-                    return;
-                }
-            };
+            let (file, source) = selection.into_parts();
             let mut original_name = file
                 .basename()
                 .and_then(|name| name.into_string().ok())

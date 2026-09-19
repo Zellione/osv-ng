@@ -1652,6 +1652,14 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   regeneration into a monotonic serial-session security state. The gallery
   surfaces an explicit warning when locking is degraded rather than silently
   discarding transient or retained image-operation status.
+- Native portal verification exposed a conflict between whole-process
+  non-dumpability and `xdg-desktop-portal` caller authentication through
+  `/proc/<pid>/root`. ADR 0012 records the implemented short-lived, no-secret
+  portal broker. It receives only a chooser purpose and inherited datagram,
+  returns one bounded path plus a type-checked stable descriptor over
+  `SCM_RIGHTS`, and leaves the secret-bearing application non-dumpable. Image
+  preparation consumes that selected descriptor directly rather than reopening
+  the returned path.
 
 **Verification**
 
@@ -1746,6 +1754,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   Launching the interactive app from this bootstrap build environment cannot
   close the remaining portal gate because that self-check manifest deliberately
   carries no release application integration or D-Bus permissions.
+- Portal-broker protocol regressions reject missing and wrong-type descriptors,
+  unbounded or malformed path framing, and descriptors on cancellation. The
+  complete workspace test suite and workspace warnings-as-errors Clippy pass.
+  In a native-Wayland run, accessible chooser activation created a real GTK
+  portal window and accessible Cancel activation dismissed it; the hardened
+  main process's expected portal-settings warning no longer prevents selection
+  because the no-secret broker owns the portal request.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
