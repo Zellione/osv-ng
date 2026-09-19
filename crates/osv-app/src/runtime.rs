@@ -516,6 +516,13 @@ impl VaultSession {
             let _ = thread.join();
         }
     }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
 }
 
 fn take_pending_for<T>(

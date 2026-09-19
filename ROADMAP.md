@@ -1660,6 +1660,13 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   `SCM_RIGHTS`, and leaves the secret-bearing application non-dumpable. Image
   preparation consumes that selected descriptor directly rather than reopening
   the returned path.
+- The hardened GTK process now disables its unused portal integration before
+  initialization, eliminating misleading portal-authentication warnings while
+  the broker remains the sole chooser owner. Import preview status explicitly
+  identifies the required confirmation action. Window close hides immediately,
+  revokes the vault session, and asynchronously waits for its serial owner to
+  close SQLCipher before application teardown instead of racing library-global
+  shutdown.
 
 **Verification**
 
@@ -1761,6 +1768,11 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   portal window and accessible Cancel activation dismissed it; the hardened
   main process's expected portal-settings warning no longer prevents selection
   because the no-secret broker owns the portal request.
+- The application suite and warnings-as-errors Clippy pass after the import
+  guidance and clean-shutdown changes. A native hardened-shell launch emits no
+  portal warnings; the user-confirmed native flow creates and reopens a vault
+  and reaches image preparation through the broker. Final import/view and clean
+  SQLCipher shutdown remain to be reconfirmed against the rebuilt binary.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 

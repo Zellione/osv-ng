@@ -219,6 +219,10 @@ impl CssSlots {
 }
 
 pub fn run() -> glib::ExitCode {
+    // Portal requests are owned by the deliberately dumpable, no-secret broker.
+    // Prevent GDK from making incompatible portal requests from this hardened
+    // process while retaining the normal native Wayland display path.
+    gtk::disable_portals();
     let app = gtk::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
         if let Some(window) = app.active_window() {
@@ -291,7 +295,48 @@ fn build_window(app: &gtk::Application) {
         &sensitive_imports,
         &session,
     );
+    install_clean_shutdown(&window, &session);
     window.present();
+}
+
+fn install_clean_shutdown(
+    window: &gtk::ApplicationWindow,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+) {
+    let session = Rc::clone(session);
+    let closing = Rc::new(Cell::new(false));
+    window.connect_close_request(move |window| {
+        if closing.replace(true) {
+            return glib::Propagation::Stop;
+        }
+        {
+            let borrowed = session.borrow();
+            let Some(active) = borrowed.as_ref() else {
+                return glib::Propagation::Proceed;
+            };
+            active.revoke();
+        }
+        window.set_visible(false);
+        let session = Rc::clone(&session);
+        let application = window.application();
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+            if !session
+                .borrow()
+                .as_ref()
+                .is_none_or(VaultSession::is_finished)
+            {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(finished) = session.borrow_mut().take() {
+                finished.close();
+            }
+            if let Some(application) = &application {
+                application.quit();
+            }
+            glib::ControlFlow::Break
+        });
+        glib::Propagation::Stop
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1141,7 +1186,7 @@ fn gallery_view(
                 match receiver.try_recv() {
                     Ok(Ok(preview)) => {
                         status.set_label(&format!(
-                            "{} — {} × {}{}{}",
+                            "{} — {} × {}{}{}{}",
                             preview.mime,
                             preview.width,
                             preview.height,
@@ -1154,6 +1199,11 @@ fn gallery_view(
                                 " — exact duplicate"
                             } else {
                                 ""
+                            },
+                            if preview.duplicate {
+                                " — choose Skip or Import another copy"
+                            } else {
+                                " — choose Import to confirm"
                             }
                         ));
                         confirm.set_visible(!preview.duplicate);
