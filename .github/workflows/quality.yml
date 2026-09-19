@@ -16,16 +16,15 @@ concurrency:
 jobs:
   workspace:
     runs-on: ubuntu-24.04
+    container: archlinux:base-devel
     timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install native dependencies
+        run: pacman --sync --refresh --sysupgrade --needed --noconfirm curl gtk4 openssl rustup
       - name: Install the MSRV toolchain
         run: rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
-      - name: Install GTK development dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes libgtk-4-dev
       - name: Build pinned SQLCipher
         working-directory: ${{ runner.temp }}
         run: |
@@ -46,15 +45,15 @@ jobs:
               --with-tempstore=yes \
               --fts5
           make --jobs 2
-          sudo make install
-          sudo mv /usr/local/bin/sqlite3 /usr/local/bin/sqlcipher
-          sudo mv /usr/local/lib/libsqlite3.so.3.53.4 /usr/local/lib/libsqlcipher.so.0.8.6
-          sudo ln --symbolic libsqlcipher.so.0.8.6 /usr/local/lib/libsqlcipher.so.0
-          sudo ln --symbolic libsqlcipher.so.0 /usr/local/lib/libsqlcipher.so
-          sudo rm /usr/local/lib/libsqlite3.so /usr/local/lib/libsqlite3.so.0
-          sudo mv /usr/local/lib/pkgconfig/sqlite3.pc /usr/local/lib/pkgconfig/sqlcipher.pc
-          sudo sed --in-place 's/-lsqlite3/-lsqlcipher/' /usr/local/lib/pkgconfig/sqlcipher.pc
-          sudo ldconfig
+          make install
+          mv /usr/local/bin/sqlite3 /usr/local/bin/sqlcipher
+          mv /usr/local/lib/libsqlite3.so.3.53.4 /usr/local/lib/libsqlcipher.so.0.8.6
+          ln --symbolic libsqlcipher.so.0.8.6 /usr/local/lib/libsqlcipher.so.0
+          ln --symbolic libsqlcipher.so.0 /usr/local/lib/libsqlcipher.so
+          rm /usr/local/lib/libsqlite3.so /usr/local/lib/libsqlite3.so.0
+          mv /usr/local/lib/pkgconfig/sqlite3.pc /usr/local/lib/pkgconfig/sqlcipher.pc
+          sed --in-place 's/-lsqlite3/-lsqlcipher/' /usr/local/lib/pkgconfig/sqlcipher.pc
+          ldconfig
       - name: Check formatting
         run: |
           cargo +1.98.0 fmt --all -- --check
