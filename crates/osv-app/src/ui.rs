@@ -170,6 +170,7 @@ fn show_gallery_level(
             }
         }
     }
+    *entries.borrow_mut() = next;
     {
         let labels: Vec<&str> = owned_labels.iter().map(String::as_str).collect();
         model.splice(0, model.n_items(), &labels);
@@ -177,7 +178,6 @@ fn show_gallery_level(
     for label in &mut owned_labels {
         label.as_mut_str().zeroize();
     }
-    *entries.borrow_mut() = next;
 }
 
 impl AsRef<[u8]> for TexturePixels {
@@ -1279,22 +1279,106 @@ fn gallery_view(
         });
     }
     let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    let tile_pictures = Rc::clone(sensitive_pictures);
+    factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
+        let tile = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        tile.add_css_class("osv-tile");
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Contain)
+            .can_shrink(true)
+            .width_request(160)
+            .height_request(100)
+            .build();
+        picture.update_property(&[gtk::accessible::Property::Label("Encrypted thumbnail")]);
         let label = gtk::Label::builder().wrap(true).xalign(0.0).build();
-        label.add_css_class("osv-tile");
-        item.set_child(Some(&label));
+        tile.append(&picture);
+        tile.append(&label);
+        tile_pictures.borrow_mut().push(picture);
+        item.set_child(Some(&tile));
     });
-    factory.connect_bind(|_, item| {
+    let session_for_tiles = Rc::clone(session);
+    let records_for_tiles = Rc::clone(&records);
+    factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
         let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
             return;
         };
-        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+        let Some(tile) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
+        let Some(picture) = tile.first_child().and_downcast::<gtk::Picture>() else {
+            return;
+        };
+        let Some(label) = picture.next_sibling().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        picture.set_paintable(gdk::Paintable::NONE);
         label.set_label(&value.string());
         item.set_accessible_label(&format!("Gallery {}", value.string()));
+        let position = item.position();
+        let Some(GalleryUiEntry::Image(record)) = records_for_tiles
+            .borrow()
+            .get(position as usize)
+            .copied()
+        else {
+            picture.set_visible(false);
+            return;
+        };
+        picture.set_visible(true);
+        if !record.has_thumbnail {
+            return;
+        }
+        let (generation, receiver) = {
+            let borrowed = session_for_tiles.borrow();
+            let Some(active) = borrowed.as_ref() else {
+                return;
+            };
+            let Ok(receiver) = active.open_thumbnail(record.media_id) else {
+                return;
+            };
+            (active.generation(), receiver)
+        };
+        let item = item.downgrade();
+        let session = Rc::clone(&session_for_tiles);
+        let records = Rc::clone(&records_for_tiles);
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+            match receiver.try_recv() {
+                Ok(Ok(opened)) => {
+                    let Some(item) = item.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let current_position = item.position();
+                    let still_current = session
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|active| active.generation() == generation)
+                        && current_position == position
+                        && matches!(
+                            records.borrow().get(current_position as usize),
+                            Some(GalleryUiEntry::Image(current)) if current.media_id == record.media_id
+                        );
+                    if !still_current {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(tile) = item.child().and_downcast::<gtk::Box>() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let Some(picture) = tile.first_child().and_downcast::<gtk::Picture>() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if let Some(texture) = memory_texture(opened.pixels, opened.width, opened.height)
+                    {
+                        picture.set_paintable(Some(&texture));
+                    }
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return glib::ControlFlow::Continue;
+                }
+            }
+            glib::ControlFlow::Break
+        });
     });
     {
         let session = Rc::clone(session);

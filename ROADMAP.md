@@ -1675,6 +1675,12 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   rejected the helper's dimensions. Helper production and broker validation
   now share one checked integer aspect-ratio calculation for still and animated
   frames.
+- Catalog-backed grid cells now authenticate and decode their encrypted
+  thumbnail objects into protected memory textures instead of rendering only a
+  metadata placeholder. Gallery model entries are published before GTK model
+  notifications, so automatic first-item selection can no longer miss the
+  corresponding record and leave the viewer blank. Tile callbacks bind both
+  session generation and recycled-list position/media identity before release.
 
 **Verification**
 
@@ -1785,6 +1791,10 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   decodes to the required 512×108 result. Dedicated landscape/portrait geometry
   regressions, the 27-test media suite, the import suite, and warnings-as-errors
   Clippy pass; the current app and media-helper binaries were rebuilt together.
+- Native user verification now completes portal selection, explicit import,
+  encrypted publication, and catalog refresh for a 1920×1080 image. The
+  follow-up authenticated tile/viewer presentation fix passes the application
+  suite and warnings-as-errors Clippy and awaits visual reconfirmation.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
