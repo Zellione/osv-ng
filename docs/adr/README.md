@@ -21,3 +21,5 @@ Start new decisions from [the ADR template](0000-template.md).
 | [0008](0008-gstreamer-media-stack.md) | GStreamer as the initial media stack | Accepted |
 | [0009](0009-brokered-media-plaintext.md) | Brokered authenticated plaintext for media workers | Accepted |
 | [0010](0010-worker-protocol-and-sandbox.md) | Short-lived brokered worker sessions | Accepted |
+| [0011](0011-pure-rust-image-decoding.md) | Pure-Rust decoding for the initial image path | Accepted |
+| [0012](0012-portal-broker-process.md) | Isolated desktop-portal broker process | Accepted |

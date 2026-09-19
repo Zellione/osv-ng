@@ -8,9 +8,18 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+osv-catalog.workspace = true
+osv-crypto.workspace = true
 osv-domain.workspace = true
 osv-isolation.workspace = true
+osv-media.workspace = true
+osv-storage.workspace = true
+osv-vault.workspace = true
 osv-worker-protocol.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+osv-test-support = { path = "../osv-test-support", version = "=0.1.0" }
 
 [lints]
 workspace = true

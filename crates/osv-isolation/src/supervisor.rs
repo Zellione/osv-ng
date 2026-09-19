@@ -1,11 +1,14 @@
 use crate::{FramedChannel, PlaintextBuffer, TransportError};
+use osv_crypto::SecretBytes;
 use osv_worker_protocol::{BrokerMachine, BrokerState, Frame, Message, Role, VERSION};
 use std::{
     error::Error,
-    fmt, io,
+    fmt,
+    io::{self, Read},
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -87,6 +90,101 @@ pub struct Supervisor {
     request_id: u64,
     operation_deadline: Instant,
     lock_status: osv_crypto::LockStatus,
+}
+
+pub struct WorkerOutput {
+    chunks: Vec<SecretBytes>,
+    logical_len: usize,
+    lock_status: osv_crypto::LockStatus,
+    failure_class: Option<osv_worker_protocol::FailureClass>,
+}
+
+impl WorkerOutput {
+    pub fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.chunks.iter().map(SecretBytes::expose)
+    }
+    #[must_use]
+    pub const fn logical_len(&self) -> usize {
+        self.logical_len
+    }
+    #[must_use]
+    pub const fn lock_status(&self) -> osv_crypto::LockStatus {
+        self.lock_status
+    }
+    #[must_use]
+    pub const fn failure_class(&self) -> Option<osv_worker_protocol::FailureClass> {
+        self.failure_class
+    }
+
+    pub fn body(&self, skip: usize) -> Result<WorkerOutputReader<'_>, SupervisorError> {
+        if skip > self.logical_len {
+            return Err(protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            ));
+        }
+        Ok(WorkerOutputReader {
+            output: self,
+            position: skip,
+        })
+    }
+
+    pub fn copy_range(&self, skip: usize) -> Result<SecretBytes, SupervisorError> {
+        let length = self.logical_len.checked_sub(skip).ok_or_else(|| {
+            protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            )
+        })?;
+        self.copy_span(skip, length)
+    }
+
+    pub fn copy_span(&self, skip: usize, length: usize) -> Result<SecretBytes, SupervisorError> {
+        if skip
+            .checked_add(length)
+            .is_none_or(|end| end > self.logical_len)
+        {
+            return Err(protocol(
+                osv_worker_protocol::ProtocolError::Truncated,
+                self.lock_status,
+            ));
+        }
+        let mut copied = SecretBytes::zeroed(length)
+            .map_err(|_| protocol(osv_worker_protocol::ProtocolError::Memory, self.lock_status))?;
+        let mut reader = self.body(skip)?;
+        reader.read_exact(copied.expose_mut()).map_err(|error| {
+            let mut failure = SupervisorError::new(ExitClass::Protocol, error);
+            failure.lock_status = self.lock_status.combine(copied.lock_status());
+            failure
+        })?;
+        Ok(copied)
+    }
+}
+
+pub struct WorkerOutputReader<'a> {
+    output: &'a WorkerOutput,
+    position: usize,
+}
+
+impl io::Read for WorkerOutputReader<'_> {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        if target.is_empty() || self.position == self.output.logical_len {
+            return Ok(0);
+        }
+        let mut base = 0usize;
+        for chunk in &self.output.chunks {
+            let end = base + chunk.len();
+            if self.position < end {
+                let offset = self.position - base;
+                let copied = target.len().min(chunk.len() - offset);
+                target[..copied].copy_from_slice(&chunk.expose()[offset..offset + copied]);
+                self.position += copied;
+                return Ok(copied);
+            }
+            base = end;
+        }
+        Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+    }
 }
 
 impl Supervisor {
@@ -212,7 +310,33 @@ impl Supervisor {
         sequence: u64,
         plaintext: PlaintextBuffer,
     ) -> Result<(), SupervisorError> {
+        self.send_authenticated_inner(sequence, plaintext, None)
+    }
+
+    pub fn send_authenticated_cancellable(
+        &mut self,
+        sequence: u64,
+        plaintext: PlaintextBuffer,
+        cancelled: &AtomicBool,
+    ) -> Result<(), SupervisorError> {
+        self.send_authenticated_inner(sequence, plaintext, Some(cancelled))
+    }
+
+    fn send_authenticated_inner(
+        &mut self,
+        sequence: u64,
+        plaintext: PlaintextBuffer,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(), SupervisorError> {
         self.refresh_operation_timeout()?;
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            self.cancel();
+            return Err(SupervisorError {
+                class: ExitClass::Deadline,
+                lock_status: self.lock_status(),
+                source: None,
+            });
+        }
         self.lock_status = self.lock_status.combine(plaintext.lock_status());
         let frame = Frame {
             request_id: self.request_id(),
@@ -224,15 +348,50 @@ impl Supervisor {
         self.machine
             .sent(&frame)
             .map_err(|error| protocol(error, self.lock_status()))?;
-        let send_status = self
-            .channel
-            .send(&frame)
-            .map_err(|error| transport(error, self.lock_status()))?;
+        let sent = if let Some(cancelled) = cancelled {
+            self.channel.send_cancellable(&frame, cancelled)
+        } else {
+            self.channel.send(&frame)
+        };
+        let send_status = match sent {
+            Err(TransportError::Cancelled) => {
+                self.cancel();
+                return Err(SupervisorError {
+                    class: ExitClass::Deadline,
+                    lock_status: self.lock_status(),
+                    source: None,
+                });
+            }
+            result => result.map_err(|error| transport(error, self.lock_status()))?,
+        };
         self.lock_status = self.lock_status.combine(send_status);
         Ok(())
     }
 
     pub fn finish(&mut self) -> Result<ExitClass, SupervisorError> {
+        self.finish_with_output(0).map(|(class, _)| class)
+    }
+
+    pub fn finish_with_output(
+        &mut self,
+        maximum_output: usize,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
+        self.finish_with_output_inner(maximum_output, None)
+    }
+
+    pub fn finish_with_output_cancellable(
+        &mut self,
+        maximum_output: usize,
+        cancelled: &AtomicBool,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
+        self.finish_with_output_inner(maximum_output, Some(cancelled))
+    }
+
+    fn finish_with_output_inner(
+        &mut self,
+        maximum_output: usize,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<(ExitClass, WorkerOutput), SupervisorError> {
         self.refresh_operation_timeout()?;
         let chunks = match self.machine.state() {
             BrokerState::Streaming { next_sequence } => next_sequence,
@@ -251,35 +410,112 @@ impl Supervisor {
         self.machine
             .sent(&end)
             .map_err(|error| protocol(error, self.lock_status()))?;
-        self.lock_status = self.lock_status.combine(
-            self.channel
-                .send(&end)
-                .map_err(|error| transport(error, self.lock_status()))?,
-        );
-        let (result, receive_status) = self
-            .channel
-            .receive()
-            .map_err(|error| transport(error, self.lock_status()))?;
-        self.lock_status = self.lock_status.combine(receive_status);
-        self.machine
-            .received(&result)
-            .map_err(|error| protocol(error, self.lock_status()))?;
-        let response_class = match result.message {
-            Message::Complete { page_locks } => {
-                self.lock_status = self.lock_status.combine(page_locks);
-                ExitClass::Success
-            }
-            Message::Failed { page_locks, .. } => {
-                self.lock_status = self.lock_status.combine(page_locks);
-                ExitClass::WorkerFailure
-            }
-            _ => ExitClass::Protocol,
-        };
-        let status = self.wait_for_exit()?;
-        if response_class == ExitClass::Success {
-            Ok(classify_status(status))
+        let sent = if let Some(cancelled) = cancelled {
+            self.channel.send_cancellable(&end, cancelled)
         } else {
-            Ok(response_class)
+            self.channel.send(&end)
+        };
+        let send_status = match sent {
+            Err(TransportError::Cancelled) => {
+                let class = self.cancel();
+                return Ok((class, empty_output(self.lock_status())));
+            }
+            result => result.map_err(|error| transport(error, self.lock_status()))?,
+        };
+        self.lock_status = self.lock_status.combine(send_status);
+        let mut output = Vec::new();
+        let mut output_len = 0usize;
+        let mut output_chunks = 0u64;
+        let mut failure_class = None;
+        let response_class = loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                let class = self.cancel();
+                return Ok((
+                    class,
+                    WorkerOutput {
+                        chunks: Vec::new(),
+                        logical_len: 0,
+                        lock_status: self.lock_status(),
+                        failure_class: None,
+                    },
+                ));
+            }
+            let received = if let Some(cancelled) = cancelled {
+                self.channel.receive_cancellable(cancelled)
+            } else {
+                self.channel.receive()
+            };
+            let (result, receive_status) = match received {
+                Err(TransportError::Cancelled) => {
+                    let class = self.cancel();
+                    return Ok((class, empty_output(self.lock_status())));
+                }
+                result => result.map_err(|error| transport(error, self.lock_status()))?,
+            };
+            self.lock_status = self.lock_status.combine(receive_status);
+            self.machine
+                .received(&result)
+                .map_err(|error| protocol(error, self.lock_status()))?;
+            match result.message {
+                Message::ResultData { bytes, .. } => {
+                    output_chunks = output_chunks
+                        .checked_add(1)
+                        .filter(|count| *count <= osv_worker_protocol::MAX_RESULT_CHUNKS)
+                        .ok_or_else(|| {
+                            protocol(
+                                osv_worker_protocol::ProtocolError::Oversized,
+                                self.lock_status(),
+                            )
+                        })?;
+                    output_len = output_len
+                        .checked_add(bytes.len())
+                        .filter(|len| *len <= maximum_output)
+                        .ok_or_else(|| {
+                            protocol(
+                                osv_worker_protocol::ProtocolError::Oversized,
+                                self.lock_status(),
+                            )
+                        })?;
+                    self.lock_status = self.lock_status.combine(bytes.lock_status());
+                    output.push(bytes);
+                }
+                Message::ResultEnd { .. } => {}
+                Message::Complete { page_locks } => {
+                    self.lock_status = self.lock_status.combine(page_locks);
+                    break ExitClass::Success;
+                }
+                Message::Failed { class, page_locks } => {
+                    failure_class = Some(class);
+                    self.lock_status = self.lock_status.combine(page_locks);
+                    break ExitClass::WorkerFailure;
+                }
+                _ => break ExitClass::Protocol,
+            }
+        };
+        let Some(status) = self.wait_for_exit(cancelled)? else {
+            return Ok((ExitClass::Deadline, empty_output(self.lock_status())));
+        };
+        if response_class == ExitClass::Success {
+            let class = classify_status(status);
+            Ok((
+                class,
+                WorkerOutput {
+                    chunks: output,
+                    logical_len: output_len,
+                    lock_status: self.lock_status(),
+                    failure_class,
+                },
+            ))
+        } else {
+            Ok((
+                response_class,
+                WorkerOutput {
+                    chunks: output,
+                    logical_len: output_len,
+                    lock_status: self.lock_status(),
+                    failure_class,
+                },
+            ))
         }
     }
 
@@ -325,14 +561,21 @@ impl Supervisor {
         Ok(())
     }
 
-    fn wait_for_exit(&mut self) -> Result<ExitStatus, SupervisorError> {
+    fn wait_for_exit(
+        &mut self,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Option<ExitStatus>, SupervisorError> {
         loop {
+            if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                self.cancel();
+                return Ok(None);
+            }
             if let Some(status) = self.child.try_wait().map_err(|error| {
                 let mut result = SupervisorError::new(ExitClass::WorkerFailure, error);
                 result.lock_status = self.lock_status();
                 result
             })? {
-                return Ok(status);
+                return Ok(Some(status));
             }
             let Some(remaining) = self
                 .operation_deadline
@@ -346,6 +589,15 @@ impl Supervisor {
             };
             std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
+    }
+}
+
+fn empty_output(lock_status: osv_crypto::LockStatus) -> WorkerOutput {
+    WorkerOutput {
+        chunks: Vec::new(),
+        logical_len: 0,
+        lock_status,
+        failure_class: None,
     }
 }
 
@@ -374,6 +626,7 @@ fn transport(error: TransportError, lock_status: osv_crypto::LockStatus) -> Supe
             ExitClass::Deadline
         }
         TransportError::Protocol(_) => ExitClass::Protocol,
+        TransportError::Cancelled => ExitClass::Deadline,
         _ => ExitClass::WorkerFailure,
     };
     let mut result = SupervisorError::new(class, error);

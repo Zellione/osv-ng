@@ -7,7 +7,8 @@ use std::{
 
 use osv_catalog::{
     Catalog, CatalogConfig, CatalogError, CatalogMode, Child, GalleryId, MediaClass, MediaId,
-    MigrationFaultInjector, MigrationPoint, NewGallery, NewMedia, NewObject, ObjectState, Result,
+    MigrationFaultInjector, MigrationPoint, NewDerivedObject, NewGallery, NewMedia, NewObject,
+    ObjectState, Result,
 };
 use osv_crypto::{LockStatus, SecretKey};
 use osv_storage::{ObjectDescriptor, ObjectId, ObjectRole, WrappedObjectKey};
@@ -121,6 +122,109 @@ fn malformed_search_errors_redact_query_text_and_sources() {
     assert!(!format!("{error:?}").contains(canary));
     assert!(!error.to_string().contains(canary));
     assert!(error.source().is_none());
+}
+
+#[test]
+fn regeneration_query_finds_missing_and_stale_recipes_only() {
+    let directory = temp();
+    let path = directory.path().join("catalog.db");
+    let catalog_key = key(0x29);
+    let mut catalog = Catalog::create(&path, &catalog_key, &VAULT_ID, 1).unwrap();
+    let missing = add_media(&mut catalog, 0x21, "missing.png");
+    let stale = add_media(&mut catalog, 0x22, "stale.png");
+    let current = add_media(&mut catalog, 0x23, "current.png");
+    for (byte, media, recipe) in [(0x31, stale, 1), (0x32, current, 2)] {
+        let derived = descriptor(byte, ObjectRole::Thumbnail);
+        let transaction = catalog.transaction().unwrap();
+        transaction
+            .insert_object(NewObject {
+                descriptor: &derived,
+                locator: &format!("derived/thumbnails/{byte:02x}/{byte:02x}.osvo"),
+                state: ObjectState::Ready,
+            })
+            .unwrap();
+        transaction
+            .insert_derived_object(NewDerivedObject {
+                object_id: derived.id(),
+                media_id: media,
+                recipe_version: recipe,
+                width: 100,
+                height: 75,
+            })
+            .unwrap();
+        transaction.commit().unwrap();
+    }
+    let pending = catalog
+        .reader()
+        .derived_needing_recipe(ObjectRole::Thumbnail, 2, 10)
+        .unwrap();
+    assert_eq!(
+        pending.iter().map(|item| item.media_id).collect::<Vec<_>>(),
+        vec![missing, stale]
+    );
+    assert!(
+        pending
+            .iter()
+            .all(|item| item.original_object_id != ObjectId::from_bytes([0; 16]))
+    );
+    assert!(
+        catalog
+            .reader()
+            .derived_needing_recipe(ObjectRole::Original, 2, 10)
+            .is_err()
+    );
+}
+
+#[test]
+fn bounded_image_and_gallery_records_expose_only_composition_facts() {
+    let directory = temp();
+    let path = directory.path().join("catalog.db");
+    let catalog_key = key(0x39);
+    let mut catalog = Catalog::create(&path, &catalog_key, &VAULT_ID, 1).unwrap();
+    let media = add_media(&mut catalog, 0x41, "private-original-name.png");
+    let thumbnail = descriptor(0x51, ObjectRole::Thumbnail);
+    let gallery = GalleryId::from_bytes([0x61; 16]);
+    let transaction = catalog.transaction().unwrap();
+    transaction
+        .insert_object(NewObject {
+            descriptor: &thumbnail,
+            locator: "derived/thumbnails/51/51.osvo",
+            state: ObjectState::Ready,
+        })
+        .unwrap();
+    transaction
+        .insert_derived_object(NewDerivedObject {
+            object_id: thumbnail.id(),
+            media_id: media,
+            recipe_version: 2,
+            width: 100,
+            height: 75,
+        })
+        .unwrap();
+    transaction
+        .create_gallery(NewGallery {
+            id: gallery,
+            name: "Private gallery",
+            created_at_ms: 2,
+        })
+        .unwrap();
+    transaction.commit().unwrap();
+
+    let images = catalog.reader().image_records(2, 10).unwrap();
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].id, media);
+    assert_eq!(
+        images[0].original_object_id,
+        ObjectId::from_bytes([0x41; 16])
+    );
+    assert_eq!(images[0].thumbnail_object_id, Some(thumbnail.id()));
+    assert_eq!((images[0].width, images[0].height), (800, 600));
+    let galleries = catalog.reader().gallery_records(10).unwrap();
+    assert_eq!(galleries[0].name.expose(), "Private gallery");
+    assert!(!format!("{:?}", galleries[0]).contains("Private gallery"));
+    assert!(catalog.reader().image_records(0, 10).is_err());
+    assert!(catalog.reader().image_records(2, 0).is_err());
+    assert!(catalog.reader().gallery_records(0).is_err());
 }
 
 #[cfg(feature = "test-fixtures")]

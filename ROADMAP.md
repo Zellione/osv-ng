@@ -1423,6 +1423,466 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
+**Status:** Complete as of 2026-09-19.
+
+**Delivered scope**
+
+- Added allocation-free preliminary PNG, JPEG, GIF, and extended-WebP probing with MIME
+  identification, dimensions, animation frame counts, JPEG EXIF orientation,
+  and an allowlist-only color-profile presence flag. Encoded size, dimensions,
+  canvas pixels, cumulative canvas pixel-frames, animation frames, and worker
+  chunk counts are rejected before decoder allocation. Format-specific
+  structural validation and hostile corpus expansion continue below.
+- The media helper now retains authenticated IPC chunks only in protected,
+  wipe-on-drop storage, validates the reconstructed object under the existing
+  seccomp/resource/descriptor sandbox, and reports malformed and resource-limit
+  failures without accepting a path, key, or vault-directory descriptor.
+- Added bounded, pure-Rust image decoding and PNG thumbnail generation with a
+  versioned recipe. EXIF orientation is applied before scaling and the encoder's
+  application-owned output is wiped after transfer to protected storage. Added
+  conservatively allocation-bounded protected caches and UI-independent bounded
+  zoom, pan, rotation, animation pause, and frame-advance state.
+- Added SHA-256 import previews and an explicit duplicate state machine: an
+  existing fingerprint cannot proceed until Skip or Import Another Copy is
+  selected. Fingerprint existence is queried only inside the encrypted catalog.
+- Versioned IPC now streams bounded protected worker results back to the broker.
+  The image coordinator publishes the original durably, then publishes the
+  thumbnail as an independently encrypted derived object through the existing
+  crash-safe catalog transition. Neither helper nor decoder receives a path,
+  vault key, or vault-directory descriptor.
+- The worker-result contract carries actual derived dimensions, caps both total
+  bytes and chunk count, and requires broker-side PNG structure, CRC, recipe,
+  and dimension validation before publication. Checked conversions keep the
+  import protocol correct on 32-bit targets.
+- Added an encrypted-catalog query for missing/stale recipes and regeneration
+  from an authenticated original. Regeneration failure happens before
+  publication; successful replacement retains the existing crash-safe
+  durable-object-before-catalog transition.
+- Decoder features are exactly pinned to PNG, JPEG, GIF, and WebP. ADR 0011
+  records the pure-Rust helper decision, opaque decoder-allocation limitation,
+  and the initial sRGB-assumed/no-profile-transform display policy.
+- The production GTK shell now retains portal-returned `gio::File` authority,
+  creates/unlocks a real writer `VaultService` on a serial background owner,
+  and performs isolated prepare/explicit confirm/atomic commit without blocking
+  GTK. Duplicate previews expose only allowlisted display facts and require Skip
+  or Import Another Copy. The helper returns a bounded RGBA display plane beside
+  the durable PNG; GTK constructs a memory texture without invoking an image
+  decoder, and lock revokes the session and drops the paintable.
+- Portal selection now opens the chosen regular file immediately in the GTK
+  callback and transfers that stable descriptor to the serial vault owner.
+  Background import no longer reopens a pathname after selection, closing the
+  selection-to-read substitution window; helpers still receive authenticated
+  chunks only and never receive the descriptor or path.
+- Extended session-generation rejection to the entire import UI lifecycle.
+  Portal completions, prepare results, and commit results from a revoked session
+  are discarded, so an old callback cannot enqueue work into a newly unlocked
+  vault or restore decrypted preview pixels after lock. Failure to enqueue a
+  selected file now also releases the retained portal authority immediately.
+- Reading a stable portal-selected descriptor into protected memory is now
+  split into protocol-sized chunks with revocation checks between reads. Lock
+  no longer waits for the complete bounded source read before cancellation can
+  stop initial import preparation.
+- Added bounded encrypted-catalog image and gallery summaries that omit original
+  filenames from tile composition. The production gallery now replaces its
+  synthetic model with catalog-backed image records; the 100k synthetic model
+  remains only as a performance regression. Selecting a tile authenticates and
+  decrypts its current versioned thumbnail into protected memory, sends only
+  those bytes to the confined helper, and rejects callbacks from an older
+  session generation before constructing a GTK memory texture.
+- Missing/stale thumbnail regeneration is now scheduled on the serial vault
+  owner after unlock, yields to queued UI commands between objects, reports a
+  bounded redacted task summary, and uses the same monotonic session revocation
+  flag through authenticated read and helper streaming. Lock can no longer be
+  undone by a queued command resetting cancellation. A completed maintenance
+  pass refreshes the catalog-backed gallery model.
+- Versioned the media transform contract with a broker-authored request envelope
+  that binds thumbnail versus viewer purpose and the requested edge. Helper
+  results echo both fields and are rejected on mismatch. Catalog tile selection
+  now authenticates the encrypted original and requests a separately capped
+  4096-edge viewer rendition instead of enlarging the stored 512-edge thumbnail.
+- Wired visible viewer controls for bounded zoom, directional pan, clockwise
+  rotation, and previous/next catalog navigation. GTK applies zoom/pan/rotation
+  as a native GSK child transform over the protected texture owner, avoiding a
+  second application pixel buffer. Page, arrow, plus/minus, and rotation keys
+  invoke the same controls, with Ctrl/Alt combinations left to global shortcuts.
+- Added the helper-side bounded animation-frame decoder foundation for GIF,
+  WebP, and APNG dispatch. It requires the probed frame count, full-canvas frame
+  geometry, bounded 10–60000 ms normalized timing, per-frame scaling, and a
+  cumulative protected-pixel ceiling. A genuine two-frame GIF regression
+  verifies composited RGBA pixels and timing. Frame IPC and playback remain
+  follow-up work, so animated display is not yet claimed.
+- Extended the purpose-bound helper result to version 4 for viewer animation.
+  The first plane carries validated timing and subsequent records carry a
+  bounded delay plus exact full-canvas RGBA bytes. The broker independently
+  validates frame count, timing, per-plane length, aggregate length, and result
+  purpose before copying every plane into protected storage.
+- APNGs with a separate default/poster image now put the true first animation
+  frame in the first display plane rather than displaying the poster and
+  skipping frame one. The authenticated result-stream ceiling is 97 chunks,
+  the minimum needed to carry the existing 96 MiB viewer byte cap after per-
+  chunk authentication framing, and permits a bounded 4096×4096 RGBA plane.
+- GTK now owns bounded animation frames as protected-memory-backed textures,
+  advances them using validated frame delays, and exposes play/pause and manual
+  frame-step controls plus Space/period shortcuts. Both lock paths synchronously
+  clear the current paintable and the complete animation texture registry; the
+  continuing UI timer retains only the emptied registry rather than frame data.
+- The serial session publishes a monotonic catalog revision after successful
+  import or derived regeneration. Production composition observes that revision
+  and reruns its bounded image query, so newly imported and regenerated items
+  appear without synthetic state or an unrelated maintenance trigger.
+- Added cancellation inside the supervisor's result receive loop. Cancellation
+  between authenticated output chunks revokes and reaps the helper, discards all
+  accumulated protected output, and is translated to a cancelled image task.
+  Hostile-worker coverage exercises this path under a continuing chunk stream;
+  animation-header mutations cover inflated frame count, invalid timing,
+  inconsistent aggregate size, and nonzero reserved fields.
+- Added exact pixel-map coverage for all eight EXIF orientations, beyond the
+  existing geometry assertions. A valid PNG sRGB-chunk pair proves profile
+  presence is allowlisted while decoded display pixels remain identical under
+  the documented no-transform policy. Truncated genuine JPEG, GIF, and WebP
+  containers now also fail the complete decoder path.
+- Applied the same 400 MiB non-strict `image::Limits` value to still, GIF, WebP,
+  and APNG decoder construction and documented the audited per-decoder behavior
+  in ADR 0011. PNG, GIF, and JPEG consume the limit in their implementations;
+  WebP checks strict dimensions but relies on the preliminary pixel/frame caps
+  and the helper's 1 GiB address-space ceiling for opaque internal allocations.
+  Paired JPEG ICC-marker fixtures also confirm profile presence does not alter
+  output pixels under the version-1 display policy.
+- Added a genuine two-frame APNG produced by the pinned `png 0.18.1` encoder.
+  Probe count, full-canvas pixels, 100/50 ms timing, protected frame decode, and
+  the complete version-4 viewer result all pass. APNG is therefore explicitly
+  supported rather than inferred only from an `acTL` marker.
+- Tightened the broker contract so thumbnails must contain exactly one untimed
+  frame and viewer results must contain every frame declared by the
+  independently probed source; self-consistent truncated animations now fail
+  closed. Lock now revokes the complete playback object, including protected
+  texture owners, frame delays, frame index/count, play state, and scheduling
+  deadline retained by timer closures.
+- Added a genuine two-frame animated WebP assembled from lossless WebP frame
+  bitstreams. The corpus proves exact full-canvas pixels, 25/50 ms timing,
+  protected decode, and the complete version-4 viewer result.
+- Replaced flat production composition with a bounded catalog-backed gallery
+  snapshot that preserves ordered media/gallery children, presents root and
+  unfiled items, and supports arbitrary acyclic nesting with explicit upward
+  navigation. A single 10,000-entry aggregate budget bounds galleries, images,
+  and relationships rather than multiplying per-gallery limits. Both lock paths
+  synchronously drop decrypted gallery names, navigation state, entries, and
+  GTK string-model contents.
+- Routed regeneration publication through a fault-injectable form of the exact
+  production transition. Orchestration regressions at object-durable,
+  before-catalog-commit, and catalog-committed boundaries prove that the old
+  derived object remains referenced and readable until commit, the new durable
+  object is readable after commit, and maintenance removes orphan/journal state
+  without ever leaving a catalog reference to missing ciphertext.
+- Added revocation-at-object-durable evidence for regeneration: cancellation is
+  monotonic, but once the serial owner enters the allowed atomic replacement
+  region it completes the new-object/catalog transition and leaves the newly
+  referenced object authenticated and readable before servicing queued close.
+- Expanded animated-WebP hostile corpus coverage for frames outside the canvas,
+  truncated frame records, and a 201-frame 1000×1000 cumulative pixel-frame
+  pressure case rejected by the allocation-free probe before decoder entry.
+- Tightened allocation-free container validation so GIF requires a final trailer
+  with no trailing bytes, while still and animated WebP require an exact RIFF
+  extent, canonical extended header length, and completely framed chunks.
+- Added hostile PNG chunk-order and extended-WebP reserved-field cases. PNG now
+  requires its canonical first `IHDR`, rejects repeated headers, and accepts at
+  most one pre-image animation-control chunk; WebP rejects reserved feature and
+  extended-header bits before decoder entry.
+- Allocation-free APNG probing now validates every frame-control size, sequence,
+  canvas extent, disposal/blend operation, data-chunk sequence, and declared
+  frame count before decoder entry. Genuine-APNG mutations cover each boundary.
+- Allocation-free GIF probing now allowlists extension labels and validates
+  fixed graphic-control, application, and plain-text header sizes, reserved
+  graphic-control bits, disposal values, terminators, and sub-block bounds.
+- JPEG probing now walks every entropy-coded scan, handles byte stuffing and
+  restart markers, supports repeated scans, rejects illegal marker transitions,
+  and requires an exact end-of-image marker before decoder allocation.
+- Added an explicit near-limit helper integration using a 3500×3500 two-frame
+  APNG. It exercises the real process ceiling, protected animation planes, and
+  authenticated multi-chunk streaming above 90 MiB while remaining under the
+  96 MiB viewer-result contract.
+- Decoder-produced RGBA buffers owned by the helper application are now wrapped
+  in wipe-on-drop owners during thumbnail scaling and result assembly, including
+  early-return paths. This does not change the documented limitation for opaque
+  decoder-library working allocations.
+- Added a real-runtime close-during-regeneration integration using the installed
+  media-helper protocol and a 4096×4096 authenticated PNG. The test waits until
+  serial maintenance is actively decoding, revokes and closes the session under
+  two seconds, then reopens the vault as writer and verifies an empty operation
+  journal plus a usable catalog image record. Development helper discovery now
+  handles Cargo integration-test executables under `target/*/deps` without a
+  production environment override.
+- Made animation frame replacement an explicit owner registry operation.
+  Regression coverage proves that loading a new animation immediately drops
+  every prior frame owner and that lock clearing drops every replacement owner,
+  in addition to clearing delays and playback state.
+- Bound import decisions to monotonic per-preparation identities. Starting a new
+  preparation immediately hides and invalidates the prior decision controls;
+  stale preview callbacks cannot restore them, and a stale confirmation is
+  rejected without consuming the current pending import.
+- Tightened broker-side rendition validation to derive the exact expected
+  dimensions from the independently probed source, its EXIF orientation, and
+  the requested edge. A self-consistent helper response can no longer exceed a
+  512-pixel thumbnail request or substitute different aspect-ratio dimensions.
+- Made authenticated helper input, result-frame assembly, and post-completion
+  process waiting cancellation-aware with bounded polling. Cancellation now
+  retains partial framing state only until immediate worker revocation, then
+  reaps the helper and drops accumulated protected output instead of inheriting
+  the 30-second operation deadline.
+- Wrapped decoder-returned still pixels and every collected animation frame in
+  wipe-on-drop owners immediately after decode. Orientation and scaling inputs,
+  intermediate mirrored images, extracted raw frames, and partially encoded PNG
+  output now remain under wiping ownership across all early-return paths.
+- Versioned the helper result contract to version 5 so an authenticated,
+  allocation-free animation-container flag is carried independently of frame
+  count. Viewer dispatch now decodes a one-frame APNG as animation, preserving
+  its timing and selecting its true frame instead of a separate default poster.
+- Moved catalog-returned gallery names and pending import names into redacted,
+  protected, wipe-on-drop `SecretString` owners. Controllable SQL/portal transfer
+  strings and GTK label-formatting buffers are wiped after transfer; GTK's
+  internal text/model copies remain an explicitly unavoidable toolkit-owned
+  allocation and are synchronously released at lock.
+- Made import publication explicitly represent original-only success. If
+  thumbnail publication fails after the original catalog commit, the runtime
+  publishes a catalog revision, reports the original as securely imported, and
+  queues that exact media/original pair for derived regeneration instead of
+  presenting the whole import as failed or hiding the new record.
+- Propagated conservative page-lock status from authenticated source buffers,
+  helper/IPC result storage, decoded planes, protected names, publication, and
+  regeneration into a monotonic serial-session security state. The gallery
+  surfaces an explicit warning when locking is degraded rather than silently
+  discarding transient or retained image-operation status.
+- Native portal verification exposed a conflict between whole-process
+  non-dumpability and `xdg-desktop-portal` caller authentication through
+  `/proc/<pid>/root`. ADR 0012 records the implemented short-lived, no-secret
+  portal broker. It receives only a chooser purpose and inherited datagram,
+  returns one bounded path plus a type-checked stable descriptor over
+  `SCM_RIGHTS`, and leaves the secret-bearing application non-dumpable. Image
+  preparation consumes that selected descriptor directly rather than reopening
+  the returned path.
+- The hardened GTK process now disables its unused portal integration before
+  initialization, eliminating misleading portal-authentication warnings while
+  the broker remains the sole chooser owner. Import preview status explicitly
+  identifies the required confirmation action. Window close hides immediately,
+  revokes the vault session, and asynchronously waits for its serial owner to
+  close SQLCipher before application teardown instead of racing library-global
+  shutdown.
+- Import progress/preview/failure text now has a dedicated status channel;
+  maintenance and page-lock warnings can no longer overwrite the explicit
+  confirmation prompt or a rejected-image result while the user is deciding.
+- Corrected non-square rendition scaling: the low-level image operation had
+  stretched every oversized source to a square, after which the broker rightly
+  rejected the helper's dimensions. Helper production and broker validation
+  now share one checked integer aspect-ratio calculation for still and animated
+  frames.
+- Catalog-backed grid cells now authenticate and decode their encrypted
+  thumbnail objects into protected memory textures instead of rendering only a
+  metadata placeholder. Gallery model entries are published before GTK model
+  notifications, so automatic first-item selection can no longer miss the
+  corresponding record and leave the viewer blank. Tile callbacks bind both
+  session generation and recycled-list position/media identity before release.
+
+**Verification**
+
+- Unit and helper-session regressions cover malformed input, oversized pixel
+  geometry, allowlisted probing, duplicate decisions, cache eviction/clear,
+  viewer bounds/animation, authenticated worker streaming, rejection, and
+  cancellation, encrypted original/thumbnail reopen, duplicate blocking, and
+  recursive plaintext-artifact scanning. Genuine PNG/JPEG/GIF/extended-WebP,
+  PNG CRC/truncation, all eight EXIF orientation geometries, missing-derived
+  regeneration, pre-publication worker failure, hostile output sequence, and
+  output chunk flooding are also covered. Workspace formatting and
+  warnings-as-errors Clippy pass. The full serial workspace command again
+  reached the known debug-build isolation-test process interference; both
+  affected isolation library tests pass when run in their documented isolated
+  gate. Dependency audit/policy checks and the Phase 2 Flatpak release build,
+  installed app self-check, and both installed helper hardening checks pass.
+  Background real-vault create/clean-close and pre-cancelled import paths have
+  dedicated regressions. Catalog-backed composition bounds and authenticated
+  encrypted-thumbnail reopen have dedicated regressions.
+- The 2026-09-14 post-gallery/regeneration checkpoint passes workspace format,
+  warnings-as-errors Clippy, all tests through the documented combined-process
+  isolation interference, the independent serial `osv-isolation` gate, the
+  exact secret-canary redaction gate, `cargo audit`, and dependency policy.
+  The combined run reproduced only the known `InvalidDescriptor` and
+  `PermissionDenied` isolation failures; both tests pass independently.
+- The separate fuzz workspace format, audit, and deny gates pass. The pinned
+  nightly ASan secret-canary smoke completed 11,269,460 executions in 21
+  seconds without a finding. A fresh Phase 2 Flatpak release rebuild passed its
+  complete offline workspace suite (including the new runtime close and
+  animation/gallery lifetime regressions), and the installed app self-check and
+  both installed helper hardening checks pass.
+- A 2026-09-14 native-Wayland production-shell run reached and remained in the
+  GTK event loop. Direct AT-SPI inspection identified GTK 4.22.5, the named
+  `Obscura Safe Vault` application window, and the visible chooser buttons with
+  button roles and `Choose vault folder`/`Create a vault` names. Invoking the
+  chooser through `org.a11y.atspi.Action.DoAction` succeeded and initiated the
+  portal path. After the latest import/framing changes, a fresh no-FUSE Phase 2
+  Flatpak release rebuild passed the complete offline suite; the installed app
+  and both installed helper self-checks also pass.
+- The explicit near-limit media-helper gate passed in 10.16 seconds with a
+  sandboxed 3500×3500 two-frame APNG, producing more than 90 MiB through the
+  authenticated result stream without exceeding the 96 MiB result or 97-chunk
+  protocol ceilings. The test is ignored in routine runs because of its memory
+  cost and remains directly runnable as a release/resource gate.
+- The import-preparation identity regression passes the adversarial
+  A-preview/B-prepare/A-confirm ordering and proves the stale confirmation does
+  not consume B. The complete `osv-app` test suite and warnings-as-errors Clippy
+  gate pass with the identity threaded through the production GTK path.
+- The rendition-dimension regression accepts exact bounded and orientation-
+  swapped geometry while rejecting a self-consistent 1024×512 result for a
+  512-edge request; the `osv-import` warnings-as-errors Clippy gate passes.
+- Isolation regressions cancel silent workers, partial headers, partial bodies,
+  backpressured input, and a worker that reports Complete without exiting. Each
+  path revokes within 500 ms under a five-second operation deadline and exposes
+  no accumulated result bytes.
+- The complete 25-test `osv-media` suite covers genuine still and animated
+  formats, all orientation mappings, malformed decode paths, and explicit RGBA
+  wiping with the expanded owners; its warnings-as-errors Clippy gate passes.
+- A genuine one-frame APNG with visibly distinct poster and animation pixels
+  passes probe, protected frame decode, and the complete version-5 worker result;
+  the 26-test media suite, import suite, and warnings-as-errors Clippy pass.
+- Catalog and application suites pass with protected gallery/import names;
+  `GalleryRecord` debug output is explicitly redacted, and the existing gallery
+  lock regression continues to prove model/name release at revocation.
+- Thumbnail-publication fault injection at the derived object-durable boundary
+  proves the committed original remains catalog-visible, the outcome is marked
+  original-only, and the encrypted-catalog missing-recipe query returns the
+  exact regeneration target.
+- A subprocess regression exhausts `RLIMIT_MEMLOCK`, creates a real background
+  vault session, and proves the degradation is retained and observable through
+  the same session status consumed by the production GTK warning. Import and
+  application tests plus warnings-as-errors Clippy pass.
+- The 2026-09-15 post-review checkpoint passes workspace format, workspace
+  warnings-as-errors Clippy, and the complete workspace test suite, including
+  all isolation tests in the combined run. The exact secret-canary redaction
+  gate, `cargo audit`, and dependency advisories/bans/licenses/sources policy
+  gates also pass. Both P1 and all six P2 review findings are resolved.
+- The 2026-09-19 continuation checkpoint again passes workspace format,
+  warnings-as-errors Clippy, the complete workspace test suite (including the
+  combined isolation tests), the exact secret-canary redaction gate,
+  `cargo audit`, and the dependency advisories/bans/licenses/sources policy
+  gate. A native-Wayland run reached the GTK event loop and exposed the named
+  application window and chooser controls through AT-SPI; accessible chooser
+  activation succeeded, but the managed desktop portal rejected the process
+  before presenting its compositor-owned dialog, so selection/cancellation
+  remains an external interactive gate rather than a claimed pass.
+- The same continuation reran the ignored near-limit helper test in release
+  mode and passed the real sandboxed authenticated stream above 90 MiB. The
+  separate fuzz workspace format, audit, and dependency-policy gates pass. A
+  fresh no-FUSE Phase 2 Flatpak build passed its complete offline release test
+  suite, and the built app self-check plus both helper hardening checks pass.
+  Launching the interactive app from this bootstrap build environment cannot
+  close the remaining portal gate because that self-check manifest deliberately
+  carries no release application integration or D-Bus permissions.
+- Portal-broker protocol regressions reject missing and wrong-type descriptors,
+  unbounded or malformed path framing, and descriptors on cancellation. The
+  complete workspace test suite and workspace warnings-as-errors Clippy pass.
+  In a native-Wayland run, accessible chooser activation created a real GTK
+  portal window and accessible Cancel activation dismissed it; the hardened
+  main process's expected portal-settings warning no longer prevents selection
+  because the no-secret broker owns the portal request.
+- The application suite and warnings-as-errors Clippy pass after the import
+  guidance and clean-shutdown changes. A native hardened-shell launch emits no
+  portal warnings; the user-confirmed native flow creates and reopens a vault
+  and reaches image preparation through the broker.
+- A real 803×169 PNG that reproduced the user-visible rejection now probes and
+  decodes to the required 512×108 result. Dedicated landscape/portrait geometry
+  regressions, the 27-test media suite, the import suite, and warnings-as-errors
+  Clippy pass; the current app and media-helper binaries were rebuilt together.
+- The 2026-09-19 post-native-fix closure checkpoint passes workspace format,
+  warnings-as-errors Clippy, the complete workspace test suite, the exact
+  secret-canary gate, `cargo audit`, and dependency policy. The explicit
+  near-limit release helper again streams its authenticated result above 90 MiB
+  under the process ceiling. A fresh no-FUSE Flatpak build passes the complete
+  offline release suite, and the built app plus both helper self-checks pass.
+- Native user verification now completes portal selection, explicit import,
+  encrypted publication, and catalog refresh for a 1920×1080 image. The
+  follow-up authenticated tile presentation is visually confirmed. The viewer
+  decoded the authenticated original but its fixed-layout picture had no width
+  request and remained blank; it now receives an explicit bounded 640×360
+  allocation while retaining content-fit and native GSK transforms. Native
+  visual reconfirmation shows both the encrypted thumbnail and authenticated
+  full viewer rendition with the correct non-square aspect ratio.
+- Final native acceptance confirms visible zoom, pan, and rotation behavior;
+  lock synchronously removes viewer pixels and gallery thumbnails; reopening
+  restores the authenticated thumbnail and full viewer; and normal window close
+  completes without the SQLCipher private-heap shutdown warning.
+
+**GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
+
+- **Resolved — Import confirmation is not bound to one preparation.** Preparing B
+  while A's decision controls remain active can replace the serial owner's
+  unversioned pending value, after which A's visible confirmation commits B.
+  Per-preparation identities now bind prepare and commit, stale identities are
+  rejected without consuming the current pending import, and starting a new
+  prepare clears the old controls. The A-preview/B-prepare/A-confirm ordering
+  has a dedicated regression.
+- **Resolved — Revocation cannot interrupt silent or partial helper transport.** The
+  supervisor checks cancellation before a receive, but header/body polling,
+  backpressured sends, and exit waiting can retain the serial vault owner and
+  keys until the 30-second operation deadline. Transport and exit polling are
+  now cancellation-aware while retaining partial-frame state, with coverage for
+  silence, partial headers/bodies, blocked input, and Complete-without-exit
+  workers.
+- **Resolved — Some application-owned decoded pixels are not wiped.** Collected
+  animation frames, full-resolution scaling inputs, still-image decode and
+  orientation intermediates, and the PNG encoder's error path can drop ordinary
+  pixel vectors. Every decoder-returned image and collected frame is now guarded
+  immediately, and orientation, scaling, raw-frame transfer, and encoder output
+  remain under wiping ownership through early returns.
+- **Resolved — Decrypted names use non-wiping and potentially revealing owners.**
+  Gallery and import names are retained and formatted as ordinary `String`s;
+  `GalleryRecord` also derives unredacted `Debug`. Controllable Rust allocations
+  now use protected/redacted owners, transfer and formatting buffers are wiped,
+  debug output is redacted, and unavoidable GTK text copies are documented.
+- **Resolved — Image orchestration discards memory-lock degradation.** The supervisor
+  combines worker/IPC lock status, but rendition preparation does not propagate
+  it through the session security state. Transient and retained image-operation
+  degradation is now aggregated monotonically and surfaced, with a memlock
+  exhaustion regression.
+- **Resolved — A hostile helper can exceed the requested rendition edge.** Broker
+  validation permits dimensions up to the global 4096 limit even for a 512-edge
+  thumbnail. Actual dimensions are now bound to the requested edge and
+  independently oriented source geometry, with a self-consistent oversized
+  thumbnail regression.
+- **Resolved — Thumbnail failure can hide an already committed original.** Original
+  publication precedes thumbnail publication, but a derived failure reports the
+  whole import as failed without refreshing the gallery or scheduling the now-
+  missing thumbnail. Original-only success is now explicit, refreshes the
+  gallery, and queues regeneration, with fault injection at this boundary.
+- **Resolved — A one-frame APNG with a separate poster displays the poster.** Animation
+  dispatch currently depends on frame count being greater than one rather than
+  animation-container presence. APNG animation presence is now tracked and
+  authenticated independently, with a one-frame regression whose poster has
+  visibly different pixels.
+- The review found no additional stable-descriptor authority escape, helper
+  descriptor-confinement failure, revoked-session successful-result leak, or
+  missing-ciphertext catalog reference in the durable publication transitions.
+
+**Deviations and follow-up**
+
+- The named malformed/bomb corpus gaps are covered: APNG/WebP frame geometry
+  and sequence pressure, JPEG multi-scan/entropy markers, GIF extension and
+  sub-block bounds, and near-limit helper output all have dedicated regressions.
+  Animation replacement eviction and lock-time revocation likewise have
+  dedicated owner/state lifetime regressions.
+- Regeneration now has full runtime close-during-worker integration,
+  orchestration-level injected-fault, and atomic-region revocation coverage;
+  existing vault crash-process coverage exercises the same replacement
+  durability boundaries.
+- Visual portal selection/cancellation and AT-SPI inspection of the unlocked
+  gallery/import/viewer routes still require an interactive native-Wayland
+  check; this agent run verified accessible activation through portal request
+  initiation but could not select or dismiss the compositor-owned dialog.
+  Mixed-output scaling was explicitly skipped by user direction after the
+  session exposed only one active `eDP-1` output at scale 1. The fresh GPT-6
+  adversarial review is complete and all findings above are resolved. Third-
+  party decoder working allocations remain subject to
+  the documented opaque-library limitation and the helper's process resource
+  ceiling; protected IPC and broker-owned buffers report their page-lock state
+  explicitly.
+
 **Deliverables**
 
 - Bounded isolated probe/decode, import preview, duplicate decision UI,

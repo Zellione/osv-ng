@@ -5,10 +5,27 @@ use std::fmt;
 use std::rc::Rc;
 
 use gtk::{gdk, gio, glib, prelude::*};
+use zeroize::Zeroize;
 
+#[cfg(unix)]
+pub(crate) fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn open_portal_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+use crate::runtime::{GalleryChild, GallerySnapshot, ImportRequest, OpenKind, VaultSession};
 use crate::{
     Appearance, Command, CssOutcome, Density, PanelPlacement, Revocable, Route, ShellState, Theme,
-    accept_user_css, gallery_labels,
+    accept_user_css,
 };
 
 const APP_ID: &str = "io.github.osv_ng.App";
@@ -24,6 +41,149 @@ const BASE_CSS: &str = r#"
 struct CssSlots {
     appearance: gtk::CssProvider,
     user: gtk::CssProvider,
+}
+
+struct TexturePixels(osv_crypto::SecretBytes);
+
+struct FrameRegistry<T> {
+    values: RefCell<Vec<T>>,
+}
+
+impl<T> FrameRegistry<T> {
+    fn new() -> Self {
+        Self {
+            values: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn replace(&self, values: Vec<T>) {
+        *self.values.borrow_mut() = values;
+    }
+
+    fn clear(&self) {
+        self.values.borrow_mut().clear();
+    }
+}
+
+struct AnimationPlayback {
+    frames: FrameRegistry<gdk::MemoryTexture>,
+    delays: RefCell<Vec<u32>>,
+    viewer: RefCell<osv_media::ViewerState>,
+    next_frame_at: Cell<std::time::Instant>,
+}
+
+impl AnimationPlayback {
+    fn new() -> Self {
+        Self {
+            frames: FrameRegistry::new(),
+            delays: RefCell::new(Vec::new()),
+            viewer: RefCell::new(osv_media::ViewerState::new(1)),
+            next_frame_at: Cell::new(std::time::Instant::now()),
+        }
+    }
+
+    fn revoke(&self) {
+        self.frames.clear();
+        self.delays.borrow_mut().clear();
+        *self.viewer.borrow_mut() = osv_media::ViewerState::new(1);
+        self.next_frame_at.set(std::time::Instant::now());
+    }
+}
+
+type SensitiveAnimations = Rc<RefCell<Vec<Rc<AnimationPlayback>>>>;
+type SensitiveGalleries = Rc<RefCell<Vec<Rc<GalleryPresentation>>>>;
+type SensitiveImports = Rc<RefCell<Vec<Rc<ImportPresentation>>>>;
+
+#[derive(Clone, Copy)]
+enum GalleryUiEntry {
+    Folder(osv_catalog::GalleryId),
+    Image(crate::runtime::GalleryImage),
+}
+
+struct GalleryPresentation {
+    snapshot: Rc<RefCell<Option<GallerySnapshot>>>,
+    entries: Rc<RefCell<Vec<GalleryUiEntry>>>,
+    path: Rc<RefCell<Vec<osv_catalog::GalleryId>>>,
+    model: gtk::StringList,
+}
+
+struct ImportPresentation {
+    authority: Rc<RefCell<Option<gio::File>>>,
+    status: gtk::Label,
+    decisions: [gtk::Button; 3],
+}
+
+impl ImportPresentation {
+    fn revoke(&self) {
+        self.authority.borrow_mut().take();
+        self.status.set_label("");
+        for button in &self.decisions {
+            button.set_visible(false);
+            button.set_sensitive(true);
+        }
+    }
+}
+
+impl GalleryPresentation {
+    fn revoke(&self) {
+        revoke_gallery_state(&self.snapshot, &self.entries, &self.path);
+        self.model.splice(0, self.model.n_items(), &[]);
+    }
+}
+
+fn revoke_gallery_state(
+    snapshot: &RefCell<Option<GallerySnapshot>>,
+    entries: &RefCell<Vec<GalleryUiEntry>>,
+    path: &RefCell<Vec<osv_catalog::GalleryId>>,
+) {
+    snapshot.borrow_mut().take();
+    entries.borrow_mut().clear();
+    path.borrow_mut().clear();
+}
+
+fn show_gallery_level(
+    snapshot: &GallerySnapshot,
+    folder: Option<osv_catalog::GalleryId>,
+    entries: &RefCell<Vec<GalleryUiEntry>>,
+    model: &gtk::StringList,
+) {
+    let source = snapshot.level(folder);
+    let mut next = Vec::with_capacity(source.len());
+    let mut owned_labels = Vec::with_capacity(source.len());
+    for (index, child) in source.iter().enumerate() {
+        match child {
+            GalleryChild::Gallery(id) => {
+                if let Some(folder) = snapshot.folders.get(id) {
+                    next.push(GalleryUiEntry::Folder(*id));
+                    owned_labels.push(format!("Gallery — {}", folder.name.expose()));
+                }
+            }
+            GalleryChild::Image(image) => {
+                next.push(GalleryUiEntry::Image(*image));
+                owned_labels.push(format!(
+                    "Image {} — {} × {}{}",
+                    index + 1,
+                    image.width,
+                    image.height,
+                    if image.favorite { " — favorite" } else { "" }
+                ));
+            }
+        }
+    }
+    *entries.borrow_mut() = next;
+    {
+        let labels: Vec<&str> = owned_labels.iter().map(String::as_str).collect();
+        model.splice(0, model.n_items(), &labels);
+    }
+    for label in &mut owned_labels {
+        label.as_mut_str().zeroize();
+    }
+}
+
+impl AsRef<[u8]> for TexturePixels {
+    fn as_ref(&self) -> &[u8] {
+        self.0.expose()
+    }
 }
 
 impl CssSlots {
@@ -59,6 +219,10 @@ impl CssSlots {
 }
 
 pub fn run() -> glib::ExitCode {
+    // Portal requests are owned by the deliberately dumpable, no-secret broker.
+    // Prevent GDK from making incompatible portal requests from this hardened
+    // process while retaining the normal native Wayland display path.
+    gtk::disable_portals();
     let app = gtk::Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
         if let Some(window) = app.active_window() {
@@ -73,6 +237,12 @@ pub fn run() -> glib::ExitCode {
 fn build_window(app: &gtk::Application) {
     let css = CssSlots::install();
     let state = Rc::new(RefCell::new(ShellState::default()));
+    let vault_authority = Rc::new(RefCell::new(None::<gio::File>));
+    let session = Rc::new(RefCell::new(None::<VaultSession>));
+    let sensitive_pictures = Rc::new(RefCell::new(Vec::<gtk::Picture>::new()));
+    let sensitive_animations: SensitiveAnimations = Rc::new(RefCell::new(Vec::new()));
+    let sensitive_galleries: SensitiveGalleries = Rc::new(RefCell::new(Vec::new()));
+    let sensitive_imports: SensitiveImports = Rc::new(RefCell::new(Vec::new()));
     css.set_appearance(&state.borrow().appearance);
     let password = gtk::PasswordEntry::builder()
         .placeholder_text("Password")
@@ -80,10 +250,32 @@ fn build_window(app: &gtk::Application) {
         .build();
     password.update_property(&[gtk::accessible::Property::Label("Vault password")]);
     let stack = gtk::Stack::builder().hexpand(true).vexpand(true).build();
-    stack.add_named(&welcome_page(&state, &stack), Some("choose"));
-    stack.add_named(&unlock_page(&state, &stack, &password), Some("unlock"));
-    stack.add_named(&create_page(&state, &stack), Some("create"));
-    stack.add_named(&vault_page(&state, &stack, &password, &css), Some("vault"));
+    stack.add_named(
+        &welcome_page(&state, &stack, &vault_authority),
+        Some("choose"),
+    );
+    stack.add_named(
+        &unlock_page(&state, &stack, &password, &vault_authority, &session),
+        Some("unlock"),
+    );
+    stack.add_named(
+        &create_page(&state, &stack, &vault_authority, &session),
+        Some("create"),
+    );
+    stack.add_named(
+        &vault_page(
+            &state,
+            &stack,
+            &password,
+            &css,
+            &session,
+            &sensitive_pictures,
+            &sensitive_animations,
+            &sensitive_galleries,
+            &sensitive_imports,
+        ),
+        Some("vault"),
+    );
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Obscura Safe Vault")
@@ -92,20 +284,82 @@ fn build_window(app: &gtk::Application) {
         .child(&stack)
         .build();
     window.add_css_class("osv-shell");
-    install_keyboard(&window, &state, &stack, &password);
+    install_keyboard(
+        &window,
+        &state,
+        &stack,
+        &password,
+        &sensitive_pictures,
+        &sensitive_animations,
+        &sensitive_galleries,
+        &sensitive_imports,
+        &session,
+    );
+    install_clean_shutdown(&window, &session);
     window.present();
 }
 
+fn install_clean_shutdown(
+    window: &gtk::ApplicationWindow,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+) {
+    let session = Rc::clone(session);
+    let closing = Rc::new(Cell::new(false));
+    window.connect_close_request(move |window| {
+        if closing.replace(true) {
+            return glib::Propagation::Stop;
+        }
+        {
+            let borrowed = session.borrow();
+            let Some(active) = borrowed.as_ref() else {
+                return glib::Propagation::Proceed;
+            };
+            active.revoke();
+        }
+        window.set_visible(false);
+        let session = Rc::clone(&session);
+        let application = window.application();
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+            if !session
+                .borrow()
+                .as_ref()
+                .is_none_or(VaultSession::is_finished)
+            {
+                return glib::ControlFlow::Continue;
+            }
+            if let Some(finished) = session.borrow_mut().take() {
+                finished.close();
+            }
+            if let Some(application) = &application {
+                application.quit();
+            }
+            glib::ControlFlow::Break
+        });
+        glib::Propagation::Stop
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn install_keyboard(
     window: &gtk::ApplicationWindow,
     state: &Rc<RefCell<ShellState>>,
     outer: &gtk::Stack,
     password: &gtk::PasswordEntry,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
+    session: &Rc<RefCell<Option<VaultSession>>>,
 ) {
     let keys = gtk::EventControllerKey::new();
     let state = Rc::clone(state);
     let outer = outer.clone();
     let password = password.clone();
+    let sensitive_pictures = Rc::clone(sensitive_pictures);
+    let sensitive_animations = Rc::clone(sensitive_animations);
+    let sensitive_galleries = Rc::clone(sensitive_galleries);
+    let sensitive_imports = Rc::clone(sensitive_imports);
+    let session = Rc::clone(session);
     keys.connect_key_pressed(move |_, key, _, modifiers| {
         let command = [
             Command::Lock,
@@ -131,6 +385,15 @@ fn install_keyboard(
             return glib::Propagation::Proceed;
         };
         if state.borrow_mut().activate(command) {
+            if command == Command::Lock {
+                if let Some(session) = session.borrow_mut().take() {
+                    session.revoke();
+                }
+                clear_sensitive_pictures(&sensitive_pictures);
+                clear_sensitive_animations(&sensitive_animations);
+                clear_sensitive_galleries(&sensitive_galleries);
+                clear_sensitive_imports(&sensitive_imports);
+            }
             sync_route(&outer, state.borrow().route(), &password);
             glib::Propagation::Stop
         } else {
@@ -194,7 +457,11 @@ fn page(title: &str) -> gtk::Box {
     page
 }
 
-fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Widget {
+fn welcome_page(
+    state: &Rc<RefCell<ShellState>>,
+    stack: &gtk::Stack,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+) -> gtk::Widget {
     let page = page("Obscura Safe Vault");
     let choose = gtk::Button::with_mnemonic("_Choose vault folder");
     let create = gtk::Button::with_mnemonic("_Create a vault");
@@ -202,12 +469,15 @@ fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Wid
     page.append(&create);
     let state_for_choose = Rc::clone(state);
     let stack_for_choose = stack.clone();
+    let authority_for_choose = Rc::clone(authority);
     choose.connect_clicked(move |button| {
+        let authority = Rc::clone(&authority_for_choose);
         select_folder(button, "Choose a vault folder", {
             let state = Rc::clone(&state_for_choose);
             let stack = stack_for_choose.clone();
             move |outcome| match outcome {
-                PortalSelection::Selected => {
+                PortalSelection::Selected(file) => {
+                    *authority.borrow_mut() = Some(file);
                     state.borrow_mut().navigate(Route::Unlock);
                     stack.set_visible_child_name("unlock");
                 }
@@ -229,37 +499,53 @@ fn welcome_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Wid
 }
 
 enum PortalSelection {
-    Selected,
+    Selected(gio::File),
     Cancelled,
     Failed,
 }
 
 fn select_folder(
     button: &gtk::Button,
-    title: &str,
+    _title: &str,
     complete: impl FnOnce(PortalSelection) + 'static,
 ) {
-    let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
-    let parent = button.root().and_downcast::<gtk::Window>();
-    dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
-        complete(match result {
-            Ok(_) => PortalSelection::Selected,
-            Err(error) if portal_error_is_cancelled(&error) => PortalSelection::Cancelled,
-            Err(_) => PortalSelection::Failed,
-        });
+    button.set_sensitive(false);
+    let button = button.clone();
+    crate::portal::select(crate::portal::Purpose::Folder, move |outcome| {
+        button.set_sensitive(true);
+        complete(match outcome {
+            crate::portal::Outcome::Selected(selection) => {
+                PortalSelection::Selected(selection.file())
+            }
+            crate::portal::Outcome::Cancelled => PortalSelection::Cancelled,
+            crate::portal::Outcome::Failed => PortalSelection::Failed,
+        })
     });
 }
 
+#[cfg(test)]
 fn portal_error_is_cancelled(error: &glib::Error) -> bool {
     error.matches(gtk::DialogError::Dismissed)
         || error.matches(gtk::DialogError::Cancelled)
         || error.matches(gio::IOErrorEnum::Cancelled)
 }
 
+fn release_authority_on_error<T, E>(
+    result: Result<T, E>,
+    authority: &RefCell<Option<gio::File>>,
+) -> Result<T, E> {
+    if result.is_err() {
+        authority.borrow_mut().take();
+    }
+    result
+}
+
 fn unlock_page(
     state: &Rc<RefCell<ShellState>>,
     stack: &gtk::Stack,
     password: &gtk::PasswordEntry,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
 ) -> gtk::Widget {
     let page = page("Unlock vault");
     let unlock = gtk::Button::with_mnemonic("_Unlock");
@@ -268,33 +554,108 @@ fn unlock_page(
     let state = Rc::clone(state);
     let stack = stack.clone();
     let password = password.clone();
+    let authority = Rc::clone(authority);
+    let session = Rc::clone(session);
     unlock.connect_clicked(move |_| {
-        state.borrow_mut().unlock();
+        let Some(file) = authority.borrow().clone() else {
+            show_error(&stack, "Choose a vault folder before unlocking.");
+            return;
+        };
+        let Some(path) = file.path() else {
+            show_error(
+                &stack,
+                "The selected portal folder is not locally accessible.",
+            );
+            return;
+        };
+        let password_bytes = password.text().as_bytes().to_vec();
         password.set_text("");
-        sync_route(&stack, Route::Gallery, &password);
+        begin_vault_session(
+            path,
+            password_bytes,
+            OpenKind::Unlock,
+            &state,
+            &session,
+            &stack,
+            &password,
+        );
     });
     page.upcast()
 }
 
-fn create_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Widget {
+fn create_page(
+    state: &Rc<RefCell<ShellState>>,
+    stack: &gtk::Stack,
+    authority: &Rc<RefCell<Option<gio::File>>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+) -> gtk::Widget {
     let page = page("Create vault");
     let location = gtk::Button::with_mnemonic("Choose _location…");
     let back = gtk::Button::with_mnemonic("_Back");
+    let name = gtk::Entry::builder().text("Obscura Vault").build();
+    let password = gtk::PasswordEntry::builder()
+        .placeholder_text("New vault password")
+        .show_peek_icon(true)
+        .build();
+    let create = gtk::Button::with_mnemonic("_Create vault");
     let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
     page.append(&location);
+    page.append(&name);
+    page.append(&password);
+    page.append(&create);
     page.append(&back);
     page.append(&status);
+    let authority_for_location = Rc::clone(authority);
+    let status_for_location = status.clone();
     location.connect_clicked(move |button| {
-        let status = status.clone();
+        let status = status_for_location.clone();
+        let authority = Rc::clone(&authority_for_location);
         select_folder(button, "Choose where to create the vault", move |outcome| {
             status.set_label(match outcome {
-                PortalSelection::Selected => {
-                    "Location selected. Creation is ready for the vault service."
+                PortalSelection::Selected(file) => {
+                    *authority.borrow_mut() = Some(file);
+                    "Parent folder selected. Enter a name and password."
                 }
                 PortalSelection::Cancelled => "Selection cancelled.",
                 PortalSelection::Failed => "The folder chooser failed. Try again.",
             });
         });
+    });
+    let state_for_create = Rc::clone(state);
+    let stack_for_create = stack.clone();
+    let authority_for_create = Rc::clone(authority);
+    let session_for_create = Rc::clone(session);
+    let password_for_create = password.clone();
+    create.connect_clicked(move |_| {
+        let folder_name = name.text();
+        if folder_name.is_empty()
+            || folder_name.contains('/')
+            || matches!(folder_name.as_str(), "." | "..")
+        {
+            status.set_label("Choose a simple vault folder name.");
+            return;
+        }
+        let Some(parent) = authority_for_create.borrow().clone() else {
+            status.set_label("Choose a parent folder first.");
+            return;
+        };
+        let target = parent.child(folder_name.as_str());
+        let Some(path) = target.path() else {
+            status.set_label("The selected portal folder is not locally accessible.");
+            return;
+        };
+        *authority_for_create.borrow_mut() = Some(target);
+        let password_bytes = password_for_create.text().as_bytes().to_vec();
+        password_for_create.set_text("");
+        begin_vault_session(
+            path,
+            password_bytes,
+            OpenKind::Create,
+            &state_for_create,
+            &session_for_create,
+            &stack_for_create,
+            &password_for_create,
+        );
     });
     let state = Rc::clone(state);
     let stack = stack.clone();
@@ -305,18 +666,33 @@ fn create_page(state: &Rc<RefCell<ShellState>>, stack: &gtk::Stack) -> gtk::Widg
     page.upcast()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn vault_page(
     state: &Rc<RefCell<ShellState>>,
     outer: &gtk::Stack,
     password: &gtk::PasswordEntry,
     css: &Rc<CssSlots>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
 ) -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
     sidebar.add_css_class("osv-sidebar");
     let content = gtk::Stack::builder().hexpand(true).vexpand(true).build();
     content.set_widget_name("osv-vault-content");
-    content.add_named(&gallery_view(100_000), Some("gallery"));
+    content.add_named(
+        &gallery_view(
+            session,
+            sensitive_pictures,
+            sensitive_animations,
+            sensitive_galleries,
+            sensitive_imports,
+        ),
+        Some("gallery"),
+    );
     content.add_named(
         &simple_page("Search", "Search is ready for catalog integration."),
         Some("search"),
@@ -370,7 +746,19 @@ fn vault_page(
     let state_for_lock = Rc::clone(state);
     let outer_for_lock = outer.clone();
     let password_for_lock = password.clone();
+    let session_for_lock = Rc::clone(session);
+    let sensitive_pictures_for_lock = Rc::clone(sensitive_pictures);
+    let sensitive_animations_for_lock = Rc::clone(sensitive_animations);
+    let sensitive_galleries_for_lock = Rc::clone(sensitive_galleries);
+    let sensitive_imports_for_lock = Rc::clone(sensitive_imports);
     lock.connect_clicked(move |_| {
+        if let Some(session) = session_for_lock.borrow_mut().take() {
+            session.revoke();
+        }
+        clear_sensitive_pictures(&sensitive_pictures_for_lock);
+        clear_sensitive_animations(&sensitive_animations_for_lock);
+        clear_sensitive_galleries(&sensitive_galleries_for_lock);
+        clear_sensitive_imports(&sensitive_imports_for_lock);
         state_for_lock.borrow_mut().lock();
         sync_route(&outer_for_lock, Route::Choose, &password_for_lock);
     });
@@ -379,38 +767,920 @@ fn vault_page(
     root.upcast()
 }
 
-fn gallery_view(items: u32) -> gtk::Widget {
-    let labels = gallery_labels(items).expect("bounded gallery size");
-    let references: Vec<&str> = labels.iter().map(String::as_str).collect();
-    let model = gtk::StringList::new(&references);
-    let selection = gtk::SingleSelection::new(Some(model));
-    let factory = gtk::SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
-        let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
-        let label = gtk::Label::builder().wrap(true).xalign(0.0).build();
-        label.add_css_class("osv-tile");
-        item.set_child(Some(&label));
+fn begin_vault_session(
+    path: std::path::PathBuf,
+    password_bytes: Vec<u8>,
+    kind: OpenKind,
+    state: &Rc<RefCell<ShellState>>,
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    stack: &gtk::Stack,
+    password: &gtk::PasswordEntry,
+) {
+    if let Some(previous) = session.borrow_mut().take() {
+        previous.revoke();
+    }
+    *session.borrow_mut() = Some(VaultSession::begin(path, password_bytes, kind));
+    let state = Rc::clone(state);
+    let session = Rc::clone(session);
+    let stack = stack.clone();
+    let password = password.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+        let ready = session.borrow().as_ref().and_then(VaultSession::try_ready);
+        match ready {
+            None => glib::ControlFlow::Continue,
+            Some(Ok(())) => {
+                state.borrow_mut().unlock();
+                sync_route(&stack, Route::Gallery, &password);
+                glib::ControlFlow::Break
+            }
+            Some(Err(_)) => {
+                if let Some(failed) = session.borrow_mut().take() {
+                    failed.revoke();
+                }
+                show_error(
+                    &stack,
+                    "The vault could not be opened. Check the folder and credentials.",
+                );
+                glib::ControlFlow::Break
+            }
+        }
     });
-    factory.connect_bind(|_, item| {
+}
+
+fn gallery_view(
+    session: &Rc<RefCell<Option<VaultSession>>>,
+    sensitive_pictures: &Rc<RefCell<Vec<gtk::Picture>>>,
+    sensitive_animations: &SensitiveAnimations,
+    sensitive_galleries: &SensitiveGalleries,
+    sensitive_imports: &SensitiveImports,
+) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let import = gtk::Button::with_mnemonic("_Import image…");
+    let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    status.update_property(&[gtk::accessible::Property::Label("Image import status")]);
+    let security_status = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    security_status.update_property(&[gtk::accessible::Property::Label(
+        "Vault security and maintenance status",
+    )]);
+    let confirm = gtk::Button::with_mnemonic("_Import");
+    let skip = gtk::Button::with_mnemonic("_Skip duplicate");
+    let another = gtk::Button::with_mnemonic("Import _another copy");
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Contain)
+        .can_shrink(true)
+        .width_request(640)
+        .height_request(360)
+        .build();
+    picture.update_property(&[gtk::accessible::Property::Label("Imported image preview")]);
+    sensitive_pictures.borrow_mut().push(picture.clone());
+    for button in [&confirm, &skip, &another] {
+        button.set_visible(false);
+    }
+    let decisions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    decisions.append(&confirm);
+    decisions.append(&skip);
+    decisions.append(&another);
+    root.append(&import);
+    root.append(&status);
+    root.append(&security_status);
+    root.append(&decisions);
+    let viewer = gtk::Fixed::new();
+    viewer.set_size_request(640, 380);
+    viewer.put(&picture, 0.0, 0.0);
+    let animation = Rc::new(AnimationPlayback::new());
+    sensitive_animations
+        .borrow_mut()
+        .push(Rc::clone(&animation));
+    let viewer_state = Rc::clone(&animation);
+    let animation_frames = Rc::clone(&animation);
+    let frame_delays = Rc::clone(&animation);
+    let next_frame_at = Rc::clone(&animation);
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let previous = gtk::Button::with_mnemonic("_Previous");
+    let next = gtk::Button::with_mnemonic("_Next");
+    let zoom_out = gtk::Button::with_label("Zoom out");
+    let zoom_in = gtk::Button::with_label("Zoom in");
+    let rotate = gtk::Button::with_label("Rotate clockwise");
+    let play_pause = gtk::Button::with_label("Pause animation");
+    let step_frame = gtk::Button::with_label("Next frame");
+    let pan_left = gtk::Button::with_label("Pan left");
+    let pan_right = gtk::Button::with_label("Pan right");
+    let pan_up = gtk::Button::with_label("Pan up");
+    let pan_down = gtk::Button::with_label("Pan down");
+    for button in [
+        &previous,
+        &next,
+        &zoom_out,
+        &zoom_in,
+        &rotate,
+        &play_pause,
+        &step_frame,
+        &pan_left,
+        &pan_right,
+        &pan_up,
+        &pan_down,
+    ] {
+        controls.append(button);
+    }
+    root.append(&controls);
+    root.append(&viewer);
+
+    let apply_transform: Rc<dyn Fn()> = {
+        let viewer = viewer.clone();
+        let picture = picture.clone();
+        let viewer_state = Rc::clone(&viewer_state);
+        Rc::new(move || {
+            let state = *viewer_state.viewer.borrow();
+            let (pan_x, pan_y) = state.pan();
+            let transform = gtk::gsk::Transform::new()
+                .translate(&gtk::graphene::Point::new(pan_x as f32, pan_y as f32))
+                .rotate(state.rotation() as f32)
+                .scale(state.zoom() as f32, state.zoom() as f32);
+            viewer.set_child_transform(&picture, Some(&transform));
+        })
+    };
+    for (button, zoom) in [(&zoom_out, 0.8), (&zoom_in, 1.25)] {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        button.connect_clicked(move |_| {
+            state.viewer.borrow_mut().zoom_by(zoom);
+            apply();
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        rotate.connect_clicked(move |_| {
+            state.viewer.borrow_mut().rotate_clockwise();
+            apply();
+        });
+    }
+    for (button, x, y) in [
+        (&pan_left, -32.0, 0.0),
+        (&pan_right, 32.0, 0.0),
+        (&pan_up, 0.0, -32.0),
+        (&pan_down, 0.0, 32.0),
+    ] {
+        let state = Rc::clone(&viewer_state);
+        let apply = Rc::clone(&apply_transform);
+        button.connect_clicked(move |_| {
+            state.viewer.borrow_mut().pan_by(x, y);
+            apply();
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let frame_delays = Rc::clone(&frame_delays);
+        play_pause.connect_clicked(move |button| {
+            state.viewer.borrow_mut().toggle_animation();
+            let playing = state.viewer.borrow().playing();
+            button.set_label(if playing {
+                "Pause animation"
+            } else {
+                "Play animation"
+            });
+            if playing {
+                let frame = state.viewer.borrow().frame() as usize;
+                let delay = frame_delays
+                    .delays
+                    .borrow()
+                    .get(frame)
+                    .copied()
+                    .unwrap_or(10);
+                next_frame_at.next_frame_at.set(
+                    std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
+                );
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let frames = Rc::clone(&animation_frames);
+        let picture = picture.clone();
+        step_frame.connect_clicked(move |_| {
+            state.viewer.borrow_mut().step_forward();
+            let frame = state.viewer.borrow().frame() as usize;
+            if let Some(texture) = frames.frames.values.borrow().get(frame) {
+                picture.set_paintable(Some(texture));
+            }
+        });
+    }
+    {
+        let state = Rc::clone(&viewer_state);
+        let frames = Rc::clone(&animation_frames);
+        let delays = Rc::clone(&frame_delays);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let picture = picture.clone();
+        glib::timeout_add_local(std::time::Duration::from_millis(10), move || {
+            if frames.frames.values.borrow().len() > 1
+                && state.viewer.borrow().playing()
+                && std::time::Instant::now() >= next_frame_at.next_frame_at.get()
+            {
+                state.viewer.borrow_mut().advance();
+                let frame = state.viewer.borrow().frame() as usize;
+                if let Some(texture) = frames.frames.values.borrow().get(frame) {
+                    picture.set_paintable(Some(texture));
+                }
+                let delay = delays.delays.borrow().get(frame).copied().unwrap_or(10);
+                next_frame_at.next_frame_at.set(
+                    std::time::Instant::now() + std::time::Duration::from_millis(u64::from(delay)),
+                );
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    let selected_authority = Rc::new(RefCell::new(None::<gio::File>));
+    let active_preparation = Rc::new(Cell::new(None::<crate::runtime::PreparationId>));
+    sensitive_imports
+        .borrow_mut()
+        .push(Rc::new(ImportPresentation {
+            authority: Rc::clone(&selected_authority),
+            status: status.clone(),
+            decisions: [confirm.clone(), skip.clone(), another.clone()],
+        }));
+    let commit: Rc<dyn Fn(Option<osv_import::DuplicateDecision>)> = {
+        let session = Rc::clone(session);
+        let status = status.clone();
+        let selected_authority = Rc::clone(&selected_authority);
+        let active_preparation = Rc::clone(&active_preparation);
+        let confirm = confirm.clone();
+        let skip = skip.clone();
+        let another = another.clone();
+        let picture = picture.clone();
+        Rc::new(move |decision| {
+            let Some(preparation_id) = active_preparation.get() else {
+                status.set_label("Choose and inspect an image before importing.");
+                return;
+            };
+            let request = session.borrow().as_ref().map(|active| {
+                (
+                    active.generation(),
+                    active.commit_import(preparation_id, decision),
+                )
+            });
+            let Some((generation, Ok(receiver))) = request else {
+                status.set_label("The unlocked session is no longer available.");
+                return;
+            };
+            status.set_label("Encrypting and publishing image…");
+            confirm.set_sensitive(false);
+            skip.set_sensitive(false);
+            another.set_sensitive(false);
+            let status = status.clone();
+            let selected_authority = Rc::clone(&selected_authority);
+            let confirm = confirm.clone();
+            let skip = skip.clone();
+            let another = another.clone();
+            let picture = picture.clone();
+            let session = Rc::clone(&session);
+            let active_preparation = Rc::clone(&active_preparation);
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                    *selected_authority.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok(Some(imported))) => {
+                        let Ok(width) = i32::try_from(imported.width) else {
+                            status.set_label("The decoded image dimensions were rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let Ok(height) = i32::try_from(imported.height) else {
+                            status.set_label("The decoded image dimensions were rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let Ok(stride) = usize::try_from(imported.width)
+                            .ok()
+                            .and_then(|width| width.checked_mul(4))
+                            .ok_or(())
+                        else {
+                            status.set_label("The decoded image stride was rejected.");
+                            return glib::ControlFlow::Break;
+                        };
+                        let bytes = glib::Bytes::from_owned(TexturePixels(imported.pixels));
+                        let texture = gdk::MemoryTexture::new(
+                            width,
+                            height,
+                            gdk::MemoryFormat::R8g8b8a8,
+                            &bytes,
+                            stride,
+                        );
+                        picture.set_paintable(Some(&texture));
+                        status.set_label(if imported.thumbnail.is_some() {
+                            "Image imported securely."
+                        } else {
+                            "Original imported securely; thumbnail retry scheduled."
+                        });
+                    }
+                    Ok(Ok(None)) => status.set_label("Duplicate skipped."),
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("Image import stopped safely. Review the file and retry.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                *selected_authority.borrow_mut() = None;
+                if active_preparation.get() == Some(preparation_id) {
+                    active_preparation.set(None);
+                }
+                for button in [&confirm, &skip, &another] {
+                    button.set_visible(false);
+                    button.set_sensitive(true);
+                }
+                glib::ControlFlow::Break
+            });
+        })
+    };
+    {
+        let commit = Rc::clone(&commit);
+        confirm.connect_clicked(move |_| commit(None));
+    }
+    {
+        let commit = Rc::clone(&commit);
+        skip.connect_clicked(move |_| commit(Some(osv_import::DuplicateDecision::Skip)));
+    }
+    another.connect_clicked(move |_| {
+        commit(Some(osv_import::DuplicateDecision::ImportAnotherCopy));
+    });
+
+    let session_for_import = Rc::clone(session);
+    let status_for_import = status.clone();
+    import.connect_clicked(move |button| {
+        let Some(generation) = session_for_import
+            .borrow()
+            .as_ref()
+            .map(VaultSession::generation)
+        else {
+            status_for_import.set_label("Unlock a vault before importing.");
+            return;
+        };
+        let session = Rc::clone(&session_for_import);
+        let status = status_for_import.clone();
+        let selected_authority = Rc::clone(&selected_authority);
+        let active_preparation = Rc::clone(&active_preparation);
+        let confirm = confirm.clone();
+        let skip = skip.clone();
+        let another = another.clone();
+        button.set_sensitive(false);
+        let button = button.clone();
+        crate::portal::select(crate::portal::Purpose::Image, move |result| {
+            button.set_sensitive(true);
+            if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                return;
+            }
+            let selection = match result {
+                crate::portal::Outcome::Selected(selection) => selection,
+                crate::portal::Outcome::Cancelled => return,
+                crate::portal::Outcome::Failed => {
+                    status.set_label("The image chooser failed. Try again.");
+                    return;
+                }
+            };
+            let (file, source) = selection.into_parts();
+            let mut original_name = file
+                .basename()
+                .and_then(|name| name.into_string().ok())
+                .unwrap_or_else(|| "imported-image".to_owned());
+            let protected_name = osv_crypto::SecretString::new(&original_name);
+            original_name.as_mut_str().zeroize();
+            let Ok(original_name) = protected_name else {
+                status.set_label("The selected image name could not be protected in memory.");
+                return;
+            };
+            *selected_authority.borrow_mut() = Some(file);
+            active_preparation.set(None);
+            for button in [&confirm, &skip, &another] {
+                button.set_visible(false);
+            }
+            let receiver = release_authority_on_error(
+                session
+                    .borrow()
+                    .as_ref()
+                    .ok_or(crate::runtime::RuntimeError::Closed)
+                    .and_then(|session| {
+                        session.prepare_import(ImportRequest {
+                            source,
+                            original_name,
+                        })
+                    }),
+                &selected_authority,
+            );
+            let Ok((preparation_id, receiver)) = receiver else {
+                status.set_label("Unlock a vault before importing.");
+                return;
+            };
+            active_preparation.set(Some(preparation_id));
+            status.set_label("Inspecting image in the isolated worker…");
+            let status = status.clone();
+            let confirm = confirm.clone();
+            let skip = skip.clone();
+            let another = another.clone();
+            let session = Rc::clone(&session);
+            let selected_authority = Rc::clone(&selected_authority);
+            let active_preparation = Rc::clone(&active_preparation);
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                if session.borrow().as_ref().map(VaultSession::generation) != Some(generation) {
+                    *selected_authority.borrow_mut() = None;
+                    return glib::ControlFlow::Break;
+                }
+                if active_preparation.get() != Some(preparation_id) {
+                    return glib::ControlFlow::Break;
+                }
+                match receiver.try_recv() {
+                    Ok(Ok(preview)) => {
+                        status.set_label(&format!(
+                            "{} — {} × {}{}{}{}",
+                            preview.mime,
+                            preview.width,
+                            preview.height,
+                            if preview.animated {
+                                " — animated"
+                            } else {
+                                ""
+                            },
+                            if preview.duplicate {
+                                " — exact duplicate"
+                            } else {
+                                ""
+                            },
+                            if preview.duplicate {
+                                " — choose Skip or Import another copy"
+                            } else {
+                                " — choose Import to confirm"
+                            }
+                        ));
+                        confirm.set_visible(!preview.duplicate);
+                        skip.set_visible(preview.duplicate);
+                        another.set_visible(preview.duplicate);
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        active_preparation.set(None);
+                        status.set_label("The image was rejected safely.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                *selected_authority.borrow_mut() = None;
+                glib::ControlFlow::Break
+            });
+        });
+    });
+
+    let model = gtk::StringList::new(&[]);
+    let selection = gtk::SingleSelection::new(Some(model.clone()));
+    let records = Rc::new(RefCell::new(Vec::<GalleryUiEntry>::new()));
+    let snapshot = Rc::new(RefCell::new(None::<GallerySnapshot>));
+    let gallery_path = Rc::new(RefCell::new(Vec::<osv_catalog::GalleryId>::new()));
+    let presentation = Rc::new(GalleryPresentation {
+        snapshot: Rc::clone(&snapshot),
+        entries: Rc::clone(&records),
+        path: Rc::clone(&gallery_path),
+        model: model.clone(),
+    });
+    sensitive_galleries
+        .borrow_mut()
+        .push(Rc::clone(&presentation));
+    let up = gtk::Button::with_mnemonic("_Up one gallery");
+    up.set_sensitive(false);
+    root.append(&up);
+    {
+        let snapshot = Rc::clone(&snapshot);
+        let path = Rc::clone(&gallery_path);
+        let records = Rc::clone(&records);
+        let model = model.clone();
+        up.connect_clicked(move |button| {
+            path.borrow_mut().pop();
+            let folder = path.borrow().last().copied();
+            button.set_sensitive(folder.is_some());
+            if let Some(snapshot) = snapshot.borrow().as_ref() {
+                show_gallery_level(snapshot, folder, &records, &model);
+            }
+        });
+    }
+    {
+        let selection = selection.clone();
+        previous.connect_clicked(move |_| {
+            let selected = selection.selected();
+            if selected != gtk::INVALID_LIST_POSITION && selected > 0 {
+                selection.set_selected(selected - 1);
+            }
+        });
+    }
+    {
+        let selection = selection.clone();
+        next.connect_clicked(move |_| {
+            let selected = selection.selected();
+            if selected != gtk::INVALID_LIST_POSITION && selected + 1 < selection.n_items() {
+                selection.set_selected(selected + 1);
+            }
+        });
+    }
+    let factory = gtk::SignalListItemFactory::new();
+    let tile_pictures = Rc::clone(sensitive_pictures);
+    factory.connect_setup(move |_, item| {
+        let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
+        let tile = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        tile.add_css_class("osv-tile");
+        let picture = gtk::Picture::builder()
+            .content_fit(gtk::ContentFit::Contain)
+            .can_shrink(true)
+            .width_request(160)
+            .height_request(100)
+            .build();
+        picture.update_property(&[gtk::accessible::Property::Label("Encrypted thumbnail")]);
+        let label = gtk::Label::builder().wrap(true).xalign(0.0).build();
+        tile.append(&picture);
+        tile.append(&label);
+        tile_pictures.borrow_mut().push(picture);
+        item.set_child(Some(&tile));
+    });
+    let session_for_tiles = Rc::clone(session);
+    let records_for_tiles = Rc::clone(&records);
+    factory.connect_bind(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("list item");
         let Some(value) = item.item().and_downcast::<gtk::StringObject>() else {
             return;
         };
-        let Some(label) = item.child().and_downcast::<gtk::Label>() else {
+        let Some(tile) = item.child().and_downcast::<gtk::Box>() else {
             return;
         };
+        let Some(picture) = tile.first_child().and_downcast::<gtk::Picture>() else {
+            return;
+        };
+        let Some(label) = picture.next_sibling().and_downcast::<gtk::Label>() else {
+            return;
+        };
+        picture.set_paintable(gdk::Paintable::NONE);
         label.set_label(&value.string());
         item.set_accessible_label(&format!("Gallery {}", value.string()));
+        let position = item.position();
+        let Some(GalleryUiEntry::Image(record)) = records_for_tiles
+            .borrow()
+            .get(position as usize)
+            .copied()
+        else {
+            picture.set_visible(false);
+            return;
+        };
+        picture.set_visible(true);
+        if !record.has_thumbnail {
+            return;
+        }
+        let (generation, receiver) = {
+            let borrowed = session_for_tiles.borrow();
+            let Some(active) = borrowed.as_ref() else {
+                return;
+            };
+            let Ok(receiver) = active.open_thumbnail(record.media_id) else {
+                return;
+            };
+            (active.generation(), receiver)
+        };
+        let item = item.downgrade();
+        let session = Rc::clone(&session_for_tiles);
+        let records = Rc::clone(&records_for_tiles);
+        glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+            match receiver.try_recv() {
+                Ok(Ok(opened)) => {
+                    let Some(item) = item.upgrade() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let current_position = item.position();
+                    let still_current = session
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|active| active.generation() == generation)
+                        && current_position == position
+                        && matches!(
+                            records.borrow().get(current_position as usize),
+                            Some(GalleryUiEntry::Image(current)) if current.media_id == record.media_id
+                        );
+                    if !still_current {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(tile) = item.child().and_downcast::<gtk::Box>() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    let Some(picture) = tile.first_child().and_downcast::<gtk::Picture>() else {
+                        return glib::ControlFlow::Break;
+                    };
+                    if let Some(texture) = memory_texture(opened.pixels, opened.width, opened.height)
+                    {
+                        picture.set_paintable(Some(&texture));
+                    }
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return glib::ControlFlow::Continue;
+                }
+            }
+            glib::ControlFlow::Break
+        });
     });
+    {
+        let session = Rc::clone(session);
+        let records = Rc::clone(&records);
+        let snapshot = Rc::clone(&snapshot);
+        let gallery_path = Rc::clone(&gallery_path);
+        let model = model.clone();
+        let up = up.clone();
+        let picture = picture.clone();
+        let status = status.clone();
+        let viewer_state = Rc::clone(&viewer_state);
+        let apply_transform = Rc::clone(&apply_transform);
+        let animation_frames = Rc::clone(&animation_frames);
+        let frame_delays = Rc::clone(&frame_delays);
+        let next_frame_at = Rc::clone(&next_frame_at);
+        let play_pause = play_pause.clone();
+        let step_frame = step_frame.clone();
+        selection.connect_selected_notify(move |selection| {
+            let index = selection.selected();
+            let Some(entry) = records.borrow().get(index as usize).copied() else {
+                return;
+            };
+            let GalleryUiEntry::Image(record) = entry else {
+                let GalleryUiEntry::Folder(id) = entry else {
+                    unreachable!()
+                };
+                gallery_path.borrow_mut().push(id);
+                up.set_sensitive(true);
+                if let Some(snapshot) = snapshot.borrow().as_ref() {
+                    show_gallery_level(snapshot, Some(id), &records, &model);
+                }
+                return;
+            };
+            if !record.has_thumbnail {
+                status.set_label("This image thumbnail is being regenerated.");
+                return;
+            }
+            let (generation, receiver) = {
+                let borrowed = session.borrow();
+                let Some(active) = borrowed.as_ref() else {
+                    return;
+                };
+                let Ok(receiver) = active.open_viewer(record.media_id) else {
+                    return;
+                };
+                (active.generation(), receiver)
+            };
+            status.set_label("Authenticating and opening original…");
+            let session = Rc::clone(&session);
+            let picture = picture.clone();
+            let status = status.clone();
+            let viewer_state = Rc::clone(&viewer_state);
+            let apply_transform = Rc::clone(&apply_transform);
+            let animation_frames = Rc::clone(&animation_frames);
+            let frame_delays = Rc::clone(&frame_delays);
+            let next_frame_at = Rc::clone(&next_frame_at);
+            let play_pause = play_pause.clone();
+            let step_frame = step_frame.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(opened)) => {
+                        let still_current = session
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|active| active.generation() == generation);
+                        if !still_current {
+                            return glib::ControlFlow::Break;
+                        }
+                        let mut textures = Vec::with_capacity(opened.frames as usize);
+                        let mut delays = Vec::with_capacity(opened.frames as usize);
+                        let first_delay = opened.first_delay_ms;
+                        if let Some(texture) =
+                            memory_texture(opened.pixels, opened.width, opened.height)
+                        {
+                            textures.push(texture.clone());
+                            delays.push(first_delay);
+                            for frame in opened.additional_frames {
+                                let Some(frame_texture) =
+                                    memory_texture(frame.pixels, opened.width, opened.height)
+                                else {
+                                    status.set_label("An animation frame was rejected safely.");
+                                    return glib::ControlFlow::Break;
+                                };
+                                textures.push(frame_texture);
+                                delays.push(frame.delay_ms);
+                            }
+                            if textures.len() != opened.frames as usize {
+                                status.set_label("The animation frame count was rejected safely.");
+                                return glib::ControlFlow::Break;
+                            }
+                            *viewer_state.viewer.borrow_mut() =
+                                osv_media::ViewerState::new(opened.frames);
+                            picture.set_paintable(Some(&texture));
+                            animation_frames.frames.replace(textures);
+                            *frame_delays.delays.borrow_mut() = delays;
+                            let animated = opened.frames > 1;
+                            play_pause.set_sensitive(animated);
+                            step_frame.set_sensitive(animated);
+                            play_pause.set_label("Pause animation");
+                            next_frame_at.next_frame_at.set(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(u64::from(
+                                        first_delay.max(10),
+                                    )),
+                            );
+                            apply_transform();
+                            status.set_label("Original opened through the isolated viewer path.");
+                        } else {
+                            status.set_label("The decoded viewer dimensions were rejected.");
+                        }
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_label("The original could not be opened safely.");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+        });
+    }
     let grid = gtk::GridView::new(Some(selection), Some(factory));
     grid.set_min_columns(2);
     grid.set_max_columns(12);
     grid.add_css_class("osv-gallery");
-    gtk::ScrolledWindow::builder()
+    let keys = gtk::EventControllerKey::new();
+    {
+        let previous = previous.clone();
+        let next = next.clone();
+        let zoom_out = zoom_out.clone();
+        let zoom_in = zoom_in.clone();
+        let rotate = rotate.clone();
+        let play_pause = play_pause.clone();
+        let step_frame = step_frame.clone();
+        let pan_left = pan_left.clone();
+        let pan_right = pan_right.clone();
+        let pan_up = pan_up.clone();
+        let pan_down = pan_down.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            if modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK) {
+                return glib::Propagation::Proceed;
+            }
+            let button = match key {
+                gdk::Key::Page_Up => Some(&previous),
+                gdk::Key::Page_Down => Some(&next),
+                gdk::Key::plus | gdk::Key::KP_Add => Some(&zoom_in),
+                gdk::Key::minus | gdk::Key::KP_Subtract => Some(&zoom_out),
+                gdk::Key::r | gdk::Key::R => Some(&rotate),
+                gdk::Key::space => Some(&play_pause),
+                gdk::Key::period => Some(&step_frame),
+                gdk::Key::Left => Some(&pan_left),
+                gdk::Key::Right => Some(&pan_right),
+                gdk::Key::Up => Some(&pan_up),
+                gdk::Key::Down => Some(&pan_down),
+                _ => None,
+            };
+            if let Some(button) = button {
+                button.emit_clicked();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+    }
+    root.add_controller(keys);
+    let scroller = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .child(&grid)
-        .build()
-        .upcast()
+        .vexpand(true)
+        .build();
+    root.append(&scroller);
+    {
+        let session = Rc::clone(session);
+        let records = Rc::clone(&records);
+        let snapshot = Rc::clone(&snapshot);
+        let gallery_path = Rc::clone(&gallery_path);
+        let up = up.clone();
+        let model = model.clone();
+        let task_status = security_status.clone();
+        let loaded_revision = Rc::new(Cell::new(None::<(u64, u64)>));
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            let session_state = session
+                .borrow()
+                .as_ref()
+                .map(|active| (active.generation(), active.catalog_revision()));
+            if session_state.is_none() {
+                task_status.set_label("");
+                loaded_revision.set(None);
+                records.borrow_mut().clear();
+                snapshot.borrow_mut().take();
+                gallery_path.borrow_mut().clear();
+                up.set_sensitive(false);
+                model.splice(0, model.n_items(), &[]);
+                return glib::ControlFlow::Continue;
+            }
+            let maintenance = session
+                .borrow()
+                .as_ref()
+                .map(VaultSession::maintenance_status)
+                .unwrap_or_default();
+            let finished = maintenance.total > 0
+                && maintenance.completed.saturating_add(maintenance.failed) >= maintenance.total;
+            if maintenance.running {
+                task_status.set_label("Regenerating encrypted image thumbnails…");
+            } else if maintenance.failed > 0 && finished {
+                task_status.set_label("Some thumbnails could not be regenerated safely.");
+            } else if session
+                .borrow()
+                .as_ref()
+                .is_some_and(|active| active.page_locks() == osv_crypto::LockStatus::Degraded)
+            {
+                task_status
+                    .set_label("Memory locking is degraded; sensitive image data may be swapped.");
+            } else {
+                task_status.set_label("");
+            }
+            if loaded_revision.get() == session_state {
+                return glib::ControlFlow::Continue;
+            }
+            let receiver = match session.borrow().as_ref().map(VaultSession::list_gallery) {
+                Some(Ok(receiver)) => receiver,
+                _ => return glib::ControlFlow::Continue,
+            };
+            loaded_revision.set(session_state);
+            let generation = session_state.map(|state| state.0);
+            let session = Rc::clone(&session);
+            let records = Rc::clone(&records);
+            let snapshot = Rc::clone(&snapshot);
+            let gallery_path = Rc::clone(&gallery_path);
+            let up = up.clone();
+            let model = model.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(loaded)) => {
+                        let current = session.borrow().as_ref().map(VaultSession::generation);
+                        if current != generation {
+                            return glib::ControlFlow::Break;
+                        }
+                        gallery_path.borrow_mut().clear();
+                        up.set_sensitive(false);
+                        show_gallery_level(&loaded, None, &records, &model);
+                        *snapshot.borrow_mut() = Some(loaded);
+                    }
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return glib::ControlFlow::Continue;
+                    }
+                }
+                glib::ControlFlow::Break
+            });
+            glib::ControlFlow::Continue
+        });
+    }
+    root.upcast()
+}
+
+fn memory_texture(
+    pixels: osv_crypto::SecretBytes,
+    width: u32,
+    height: u32,
+) -> Option<gdk::MemoryTexture> {
+    let width_i32 = i32::try_from(width).ok()?;
+    let height_i32 = i32::try_from(height).ok()?;
+    let stride = usize::try_from(width).ok()?.checked_mul(4)?;
+    let expected = stride.checked_mul(usize::try_from(height).ok()?)?;
+    if pixels.len() != expected {
+        return None;
+    }
+    let bytes = glib::Bytes::from_owned(TexturePixels(pixels));
+    Some(gdk::MemoryTexture::new(
+        width_i32,
+        height_i32,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        stride,
+    ))
+}
+
+fn clear_sensitive_pictures(pictures: &Rc<RefCell<Vec<gtk::Picture>>>) {
+    for picture in pictures.borrow().iter() {
+        picture.set_paintable(gtk::gdk::Paintable::NONE);
+    }
+}
+
+fn clear_sensitive_animations(animations: &SensitiveAnimations) {
+    for animation in animations.borrow().iter() {
+        animation.revoke();
+    }
+}
+
+fn clear_sensitive_galleries(galleries: &SensitiveGalleries) {
+    for gallery in galleries.borrow().iter() {
+        gallery.revoke();
+    }
+}
+
+fn clear_sensitive_imports(imports: &SensitiveImports) {
+    for import in imports.borrow().iter() {
+        import.revoke();
+    }
 }
 
 fn simple_page(title: &str, detail: &str) -> gtk::Widget {
@@ -739,11 +2009,85 @@ impl fmt::Debug for CssSlots {
 mod tests {
     use super::*;
 
+    struct DropProbe(Rc<Cell<u32>>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    #[test]
+    fn animation_registry_evicts_and_lock_clear_drops_all_frame_owners() {
+        let drops = Rc::new(Cell::new(0));
+        let registry = FrameRegistry::new();
+        registry.replace(vec![
+            DropProbe(Rc::clone(&drops)),
+            DropProbe(Rc::clone(&drops)),
+        ]);
+        registry.replace(vec![DropProbe(Rc::clone(&drops))]);
+        assert_eq!(drops.get(), 2);
+        registry.clear();
+        assert_eq!(drops.get(), 3);
+        assert!(registry.values.borrow().is_empty());
+    }
+
+    #[test]
+    fn gallery_revocation_drops_names_navigation_and_entries() {
+        let id = osv_catalog::GalleryId::from_bytes([7; 16]);
+        let mut folders = std::collections::HashMap::new();
+        folders.insert(
+            id,
+            crate::runtime::GalleryFolder {
+                id,
+                name: osv_crypto::SecretString::new("sensitive name").unwrap(),
+            },
+        );
+        let snapshot = RefCell::new(Some(GallerySnapshot {
+            roots: vec![GalleryChild::Gallery(id)],
+            folders,
+            children: std::collections::HashMap::new(),
+        }));
+        let entries = RefCell::new(vec![GalleryUiEntry::Folder(id)]);
+        let path = RefCell::new(vec![id]);
+        revoke_gallery_state(&snapshot, &entries, &path);
+        assert!(snapshot.borrow().is_none());
+        assert!(entries.borrow().is_empty());
+        assert!(path.borrow().is_empty());
+    }
+
+    #[test]
+    fn animation_revocation_clears_media_derived_playback_state() {
+        let playback = AnimationPlayback::new();
+        *playback.delays.borrow_mut() = vec![20, 40];
+        *playback.viewer.borrow_mut() = osv_media::ViewerState::new(2);
+        playback.viewer.borrow_mut().advance();
+        playback.revoke();
+
+        assert!(playback.frames.values.borrow().is_empty());
+        assert!(playback.delays.borrow().is_empty());
+        assert_eq!(playback.viewer.borrow().frame(), 0);
+        assert!(!playback.viewer.borrow().playing());
+    }
+
     #[test]
     fn gtk_dialog_dismissal_is_portal_cancellation() {
         let dismissed = glib::Error::new(gtk::DialogError::Dismissed, "dismissed");
         assert!(portal_error_is_cancelled(&dismissed));
         let failed = glib::Error::new(gtk::DialogError::Failed, "failed");
         assert!(!portal_error_is_cancelled(&failed));
+    }
+
+    #[test]
+    fn failed_import_enqueue_releases_portal_authority() {
+        let authority = RefCell::new(Some(gio::File::for_path("/public/test-image.png")));
+        let result: Result<(), ()> = release_authority_on_error(Err(()), &authority);
+        assert!(result.is_err());
+        assert!(authority.borrow().is_none());
+
+        let authority = RefCell::new(Some(gio::File::for_path("/public/test-image.png")));
+        let result: Result<(), ()> = release_authority_on_error(Ok(()), &authority);
+        assert!(result.is_ok());
+        assert!(authority.borrow().is_some());
     }
 }

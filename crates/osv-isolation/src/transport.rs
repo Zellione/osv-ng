@@ -15,6 +15,7 @@ pub enum TransportError {
     MissingDescriptor,
     ExtraDescriptor,
     InvalidDescriptor,
+    Cancelled,
 }
 
 impl fmt::Display for TransportError {
@@ -25,6 +26,7 @@ impl fmt::Display for TransportError {
             Self::MissingDescriptor => "worker transport descriptor is missing",
             Self::ExtraDescriptor => "worker transport included extra descriptors",
             Self::InvalidDescriptor => "worker transport descriptor has an invalid type",
+            Self::Cancelled => "worker transport was cancelled",
         })
     }
 }
@@ -107,18 +109,38 @@ impl FramedChannel {
     }
 
     pub fn send(&mut self, frame: &Frame) -> Result<osv_crypto::LockStatus, TransportError> {
-        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+        self.send_inner(frame, None)
+    }
+
+    pub fn send_cancellable(
+        &mut self,
+        frame: &Frame,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<osv_crypto::LockStatus, TransportError> {
+        self.send_inner(frame, Some(cancelled))
+    }
+
+    fn send_inner(
+        &mut self,
+        frame: &Frame,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<osv_crypto::LockStatus, TransportError> {
+        if !matches!(
+            frame.message,
+            osv_worker_protocol::Message::Data { .. }
+                | osv_worker_protocol::Message::ResultData { .. }
+        ) {
             let mut encoded = [0_u8; HEADER_LEN + 8];
             let encoded_len = frame.encoded_len()?;
             frame.encode_into(&mut encoded[..encoded_len])?;
-            self.write_all(&encoded[..encoded_len])?;
+            self.write_all(&encoded[..encoded_len], cancelled)?;
             return Ok(osv_crypto::LockStatus::Locked);
         }
         let mut encoded = osv_crypto::SecretBytes::zeroed(frame.encoded_len()?)?;
         let lock_status = encoded.lock_status();
         self.lock_status = self.lock_status.combine(lock_status);
         frame.encode_into(encoded.expose_mut())?;
-        self.write_all(encoded.expose())?;
+        self.write_all(encoded.expose(), cancelled)?;
         Ok(lock_status)
     }
 
@@ -126,7 +148,11 @@ impl FramedChannel {
         &mut self,
         frame: &Frame,
     ) -> Result<osv_crypto::LockStatus, TransportError> {
-        if !matches!(frame.message, osv_worker_protocol::Message::Data { .. }) {
+        if !matches!(
+            frame.message,
+            osv_worker_protocol::Message::Data { .. }
+                | osv_worker_protocol::Message::ResultData { .. }
+        ) {
             let mut encoded = [0_u8; HEADER_LEN + 8];
             let encoded_len = frame.encoded_len()?;
             frame.encode_into(&mut encoded[..encoded_len])?;
@@ -150,9 +176,23 @@ impl FramedChannel {
     }
 
     pub fn receive(&mut self) -> Result<(Frame, osv_crypto::LockStatus), TransportError> {
+        self.receive_inner(None)
+    }
+
+    pub fn receive_cancellable(
+        &mut self,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(Frame, osv_crypto::LockStatus), TransportError> {
+        self.receive_inner(Some(cancelled))
+    }
+
+    fn receive_inner(
+        &mut self,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(Frame, osv_crypto::LockStatus), TransportError> {
         let mut header = osv_crypto::SecretBytes::zeroed(HEADER_LEN)?;
         self.lock_status = self.lock_status.combine(header.lock_status());
-        self.read_exact(header.expose_mut())?;
+        self.read_exact(header.expose_mut(), cancelled)?;
         let length =
             u32::from_le_bytes(header.expose()[12..16].try_into().expect("fixed slice")) as usize;
         if length > MAX_PAYLOAD_LEN {
@@ -161,7 +201,7 @@ impl FramedChannel {
         let mut encoded = osv_crypto::SecretBytes::zeroed(HEADER_LEN + length)?;
         self.lock_status = self.lock_status.combine(encoded.lock_status());
         encoded.expose_mut()[..HEADER_LEN].copy_from_slice(header.expose());
-        self.read_exact(&mut encoded.expose_mut()[HEADER_LEN..])?;
+        self.read_exact(&mut encoded.expose_mut()[HEADER_LEN..], cancelled)?;
         let frame = Frame::decode(encoded.expose())?;
         let lock_status = header
             .lock_status()
@@ -171,44 +211,59 @@ impl FramedChannel {
         Ok((frame, lock_status))
     }
 
-    fn read_exact(&mut self, mut bytes: &mut [u8]) -> io::Result<()> {
+    fn read_exact(
+        &mut self,
+        mut bytes: &mut [u8],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), TransportError> {
         while !bytes.is_empty() {
             match read_bytes(self.stream.as_raw_fd(), bytes) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
                 Ok(count) => bytes = &mut bytes[count..],
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.wait(libc::POLLIN)?
+                    self.wait(libc::POLLIN, cancelled)?
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
     }
 
-    fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    fn write_all(
+        &mut self,
+        mut bytes: &[u8],
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), TransportError> {
         while !bytes.is_empty() {
             match send_bytes(self.stream.as_raw_fd(), bytes) {
-                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
                 Ok(count) => bytes = &bytes[count..],
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.wait(libc::POLLOUT)?
+                    self.wait(libc::POLLOUT, cancelled)?
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(())
     }
 
     #[allow(unsafe_code)]
-    fn wait(&self, events: i16) -> io::Result<()> {
+    fn wait(
+        &self,
+        events: i16,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), TransportError> {
         let mut descriptor = libc::pollfd {
             fd: self.stream.as_raw_fd(),
             events,
             revents: 0,
         };
         loop {
+            if cancelled.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(TransportError::Cancelled);
+            }
             let timeout = match self.deadline {
                 None => -1,
                 Some(deadline) => {
@@ -218,16 +273,27 @@ impl FramedChannel {
                     i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX)
                 }
             };
-            let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+            let poll_timeout = if cancelled.is_some() {
+                timeout.min(10)
+            } else {
+                timeout
+            };
+            let result = unsafe { libc::poll(&mut descriptor, 1, poll_timeout) };
             if result > 0 {
                 return Ok(());
             }
             if result == 0 {
-                return Err(io::Error::from(io::ErrorKind::TimedOut));
+                if self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut).into());
+                }
+                continue;
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+                return Err(error.into());
             }
         }
     }
@@ -271,6 +337,52 @@ fn send_bytes(descriptor: RawFd, bytes: &[u8]) -> io::Result<usize> {
         Err(io::Error::last_os_error())
     } else {
         Ok(result as usize)
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_interrupts_a_backpressured_send() {
+        let (broker, _nonreading_worker) = UnixStream::pair().unwrap();
+        broker.set_nonblocking(true).unwrap();
+        let bytes = [0_u8; 4096];
+        loop {
+            match send_bytes_nonblocking(broker.as_raw_fd(), &bytes) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to saturate worker socket: {error}"),
+            }
+        }
+        let mut channel = FramedChannel::new(broker);
+        channel.set_deadline(Some(Instant::now() + Duration::from_secs(5)));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&cancelled);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            trigger.store(true, Ordering::Release);
+        });
+        let frame = Frame {
+            request_id: 1,
+            message: osv_worker_protocol::Message::Data {
+                sequence: 0,
+                bytes: osv_crypto::SecretBytes::new(b"blocked").unwrap(),
+            },
+        };
+        let started = Instant::now();
+        assert!(matches!(
+            channel.send_cancellable(&frame, &cancelled),
+            Err(TransportError::Cancelled)
+        ));
+        setter.join().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }
 

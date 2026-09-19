@@ -9,10 +9,10 @@ pub use sandbox::{
     DESCRIPTOR_ALLOWLIST, LANDLOCK, NO_NEW_PRIVS, RESOURCE_LIMITS, SECCOMP, SandboxError,
     SandboxReport, apply_worker_sandbox,
 };
-pub use supervisor::{ExitClass, Supervisor, SupervisorError, SupervisorLimits};
+pub use supervisor::{ExitClass, Supervisor, SupervisorError, SupervisorLimits, WorkerOutput};
 pub use transport::{
     FramedChannel, PlaintextBuffer, TransportError, receive_descriptor, send_descriptor,
 };
-pub use worker::{WorkerError, run_worker};
+pub use worker::{WorkerError, run_worker, run_worker_transformed, run_worker_validated};
 
 pub const WORKER_CONTROL_FD: i32 = 0;

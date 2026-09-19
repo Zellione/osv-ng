@@ -283,6 +283,7 @@ version = "0.1.0"
 name = "osv-worker-protocol"
 version = "0.1.0"
 dependencies = [
+ "osv-crypto",
  "zeroize",
 ]
 

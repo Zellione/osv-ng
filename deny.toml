@@ -31,6 +31,9 @@ skip = [
     # gtk-rs 0.11 currently bridges macro and runtime dependency generations.
     { crate = "syn@2.0.119", reason = "gtk4-macros uses syn 2 while glib-macros uses syn 3" },
     { crate = "system-deps@7.0.8", reason = "gtk4-sys uses system-deps 7 while shared sys crates use version 9" },
+    # png 0.18 currently uses 0.8 directly for streaming compression while its
+    # flate2 dependency has moved to 0.9; both are within the same decoder tree.
+    { crate = "miniz_oxide@0.8.9", reason = "unavoidable duplicate inside png 0.18.1" },
 ]
 skip-tree = []
 
