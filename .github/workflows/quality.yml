@@ -19,8 +19,10 @@ jobs:
     container: archlinux:base-devel
     timeout-minutes: 15
     env:
+      CARGO_HOME: /github/home/.cargo
       LIBRARY_PATH: /usr/local/lib
       LD_LIBRARY_PATH: /usr/local/lib
+      RUSTUP_HOME: /github/home/.rustup
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
