@@ -1667,6 +1667,9 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   revokes the vault session, and asynchronously waits for its serial owner to
   close SQLCipher before application teardown instead of racing library-global
   shutdown.
+- Import progress/preview/failure text now has a dedicated status channel;
+  maintenance and page-lock warnings can no longer overwrite the explicit
+  confirmation prompt or a rejected-image result while the user is deciding.
 
 **Verification**
 

@@ -818,6 +818,10 @@ fn gallery_view(
     let import = gtk::Button::with_mnemonic("_Import image…");
     let status = gtk::Label::builder().xalign(0.0).wrap(true).build();
     status.update_property(&[gtk::accessible::Property::Label("Image import status")]);
+    let security_status = gtk::Label::builder().xalign(0.0).wrap(true).build();
+    security_status.update_property(&[gtk::accessible::Property::Label(
+        "Vault security and maintenance status",
+    )]);
     let confirm = gtk::Button::with_mnemonic("_Import");
     let skip = gtk::Button::with_mnemonic("_Skip duplicate");
     let another = gtk::Button::with_mnemonic("Import _another copy");
@@ -837,6 +841,7 @@ fn gallery_view(
     decisions.append(&another);
     root.append(&import);
     root.append(&status);
+    root.append(&security_status);
     root.append(&decisions);
     let viewer = gtk::Fixed::new();
     viewer.set_size_request(640, 380);
@@ -1469,7 +1474,7 @@ fn gallery_view(
         let gallery_path = Rc::clone(&gallery_path);
         let up = up.clone();
         let model = model.clone();
-        let task_status = status.clone();
+        let task_status = security_status.clone();
         let loaded_revision = Rc::new(Cell::new(None::<(u64, u64)>));
         glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
             let session_state = session
@@ -1477,6 +1482,7 @@ fn gallery_view(
                 .as_ref()
                 .map(|active| (active.generation(), active.catalog_revision()));
             if session_state.is_none() {
+                task_status.set_label("");
                 loaded_revision.set(None);
                 records.borrow_mut().clear();
                 snapshot.borrow_mut().take();
@@ -1503,6 +1509,8 @@ fn gallery_view(
             {
                 task_status
                     .set_label("Memory locking is degraded; sensitive image data may be swapped.");
+            } else {
+                task_status.set_label("");
             }
             if loaded_revision.get() == session_state {
                 return glib::ControlFlow::Continue;
