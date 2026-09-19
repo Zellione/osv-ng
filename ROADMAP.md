@@ -1423,7 +1423,7 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
 
 **Goal:** Deliver the secure still/animated-image path end to end.
 
-**Status (2026-09-15): In progress**
+**Status (2026-09-19): In progress**
 
 **Delivered scope**
 
@@ -1724,6 +1724,20 @@ errors free of vault paths, catalog values, keys, and decrypted metadata.
   vault session, and proves the degradation is retained and observable through
   the same session status consumed by the production GTK warning. Import and
   application tests plus warnings-as-errors Clippy pass.
+- The 2026-09-15 post-review checkpoint passes workspace format, workspace
+  warnings-as-errors Clippy, and the complete workspace test suite, including
+  all isolation tests in the combined run. The exact secret-canary redaction
+  gate, `cargo audit`, and dependency advisories/bans/licenses/sources policy
+  gates also pass. Both P1 and all six P2 review findings are resolved.
+- The 2026-09-19 continuation checkpoint again passes workspace format,
+  warnings-as-errors Clippy, the complete workspace test suite (including the
+  combined isolation tests), the exact secret-canary redaction gate,
+  `cargo audit`, and the dependency advisories/bans/licenses/sources policy
+  gate. A native-Wayland run reached the GTK event loop and exposed the named
+  application window and chooser controls through AT-SPI; accessible chooser
+  activation succeeded, but the managed desktop portal rejected the process
+  before presenting its compositor-owned dialog, so selection/cancellation
+  remains an external interactive gate rather than a claimed pass.
 
 **GPT-6 adversarial review (2026-09-14, reviewed at `7d2d408`)**
 
